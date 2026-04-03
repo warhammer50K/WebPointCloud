@@ -5,6 +5,12 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 
 ![WebPointCloud Screenshot](docs/screenshot.png)
 
+### Demo
+
+| Drag & Drop | 3D Navigation | View Controls |
+|:-----------:|:-------------:|:-------------:|
+| ![Drag & Drop](docs/demo_dragdrop.gif) | ![3D Navigation](docs/demo_rotate.gif) | ![View Controls](docs/demo_controls.gif) |
+
 ---
 
 ## Features
