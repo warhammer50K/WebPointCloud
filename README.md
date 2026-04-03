@@ -26,7 +26,7 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 - **C2C Distance** — Cloud-to-Cloud distance between two point clouds
 
 ### General
-- **Drag & Drop** — Drop LAS/LAZ files directly into the viewer
+- **Drag & Drop** — Drop point cloud files directly into the viewer
 - **File Management** — Browse, rename, delete saved point clouds
 - **Screenshot** — Export the current view as PNG
 - **Dark / Light Theme**
@@ -43,7 +43,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open **http://localhost:5000** in your browser, then click **Load Map > Upload File** to load a `.las` or `.laz` file.
+Open **http://localhost:5000** in your browser, then drag & drop a point cloud file or click **Load Map > Upload File**.
 
 ## Supported Formats
 
@@ -51,6 +51,10 @@ Open **http://localhost:5000** in your browser, then click **Load Map > Upload F
 |--------|-----------|-------|
 | LAS | `.las` | ASPRS LAS 1.2 - 1.4 |
 | LAZ | `.laz` | Compressed LAS (via lazrs) |
+| PLY | `.ply` | ASCII and binary (little/big endian) |
+| XYZ | `.xyz` `.txt` `.csv` | Whitespace or comma delimited |
+| PCD | `.pcd` | Point Cloud Library format (ASCII and binary) |
+| PTS | `.pts` | Leica / common scanner ASCII format |
 
 ## Configuration
 

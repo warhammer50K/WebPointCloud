@@ -254,7 +254,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         dragCounter = 0;
         dropOverlay.style.display = 'none';
         const file = e.dataTransfer.files[0];
-        if (!file || !file.name.match(/\.(las|laz)$/i)) return;
+        if (!file || !file.name.match(/\.(las|laz|ply|xyz|txt|csv|pcd|pts)$/i)) return;
         $('st-main').textContent = `Loading ${file.name}...`;
         showLoading(`Loading ${file.name}...`);
         try {

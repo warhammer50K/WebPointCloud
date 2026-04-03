@@ -12,7 +12,7 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime
-from las_helpers import read_las_to_arrays, arrays_to_binary, write_las
+from pointcloud_io import read_pointcloud, arrays_to_binary, write_las, SUPPORTED_EXTENSIONS
 
 api_bp = Blueprint('api', __name__)
 
@@ -146,8 +146,8 @@ def rename_map(name):
 # ══════════════════════════════════════════════════════
 #  Point Cloud Loading
 # ══════════════════════════════════════════════════════
-@api_bp.route('/api/load_las', methods=['POST'])
-def load_las():
+@api_bp.route('/api/load_pointcloud', methods=['POST'])
+def load_pointcloud():
     tmp_path = None
     try:
         path = None
@@ -158,7 +158,9 @@ def load_las():
                 return jsonify({'error': 'Access denied'}), 403
         elif 'file' in request.files:
             f = request.files['file']
-            fd, tmp_path = tempfile.mkstemp(suffix='.las')
+            orig_name = f.filename or 'upload.las'
+            suffix = os.path.splitext(orig_name)[1].lower() or '.las'
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
             os.close(fd)
             f.save(tmp_path)
             path = tmp_path
@@ -166,16 +168,26 @@ def load_las():
         if not path or not os.path.isfile(path):
             return jsonify({'error': 'File not found'}), 404
 
-        d = read_las_to_arrays(path)
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in SUPPORTED_EXTENSIONS:
+            return jsonify({'error': f'Unsupported format: {ext}'}), 400
+
+        d = read_pointcloud(path)
         binary = arrays_to_binary(d['x'], d['y'], d['z'], d['intensity'],
                                   d['r'], d['g'], d['b'], d['n'])
         return send_file(io.BytesIO(binary), mimetype='application/octet-stream')
 
     except Exception as e:
-        return _error_response(e, 'load_las')
+        return _error_response(e, 'load_pointcloud')
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+# Backward-compatible alias
+@api_bp.route('/api/load_las', methods=['POST'])
+def load_las():
+    return load_pointcloud()
 
 
 # ══════════════════════════════════════════════════════

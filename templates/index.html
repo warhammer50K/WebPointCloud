@@ -229,10 +229,10 @@
         <!-- 3D Viewer -->
         <div id="viewer-wrap">
             <div id="viewer-info"><span id="viewer-pts">Points: 0</span> <span id="viewer-fps"></span></div>
-            <div id="no-data-msg">Drag &amp; drop a .las file or click <b>Load Map</b> to open a point cloud</div>
+            <div id="no-data-msg">Drag &amp; drop a point cloud file or click <b>Load Map</b> to open</div>
             <div id="point-info"></div>
             <div id="viewer-stats"></div>
-            <div id="drop-overlay">Drop LAS file here</div>
+            <div id="drop-overlay">Drop point cloud file here</div>
             <div id="poly-select-overlay"></div>
 
             <!-- Viewer floating toolbar -->
@@ -277,7 +277,7 @@
             <div class="ctrl-row mb-6">
                 <button class="btn primary" id="btn-upload">Upload File</button>
                 <input type="text" id="map-search" placeholder="Search saved maps..." class="flex-1">
-                <input type="file" id="file-input" accept=".las,.laz" hidden>
+                <input type="file" id="file-input" accept=".las,.laz,.ply,.xyz,.txt,.csv,.pcd,.pts" hidden>
             </div>
             <div id="map-list-wrap" class="scroll-list" style="max-height:50vh">
                 <div id="map-list"></div>

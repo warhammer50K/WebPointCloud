@@ -88,7 +88,7 @@ export function workerParseBinary(buffer) {
 }
 
 export async function loadLasFromPath(path) {
-    const resp = await fetch('/api/load_las', {
+    const resp = await fetch('/api/load_pointcloud', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path }),
@@ -105,7 +105,7 @@ export async function uploadLasFile(file, onProgress) {
         const form = new FormData();
         form.append('file', file);
         const xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/load_las');
+        xhr.open('POST', '/api/load_pointcloud');
         xhr.responseType = 'arraybuffer';
         if (onProgress) {
             xhr.upload.onprogress = e => {
