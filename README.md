@@ -45,6 +45,8 @@ python app.py
 
 Open **http://localhost:5000** in your browser, then drag & drop a point cloud file or click **Load Map > Upload File**.
 
+A sample point cloud is included at `sample/building_scan.las` (100k points) — drag it into the viewer to try it out.
+
 ## Supported Formats
 
 | Format | Extension | Notes |
