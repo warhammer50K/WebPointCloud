@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebPointCloud</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=1">
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "/static/vendor/three.module.js",
+            "three/addons/": "/static/vendor/"
+        }
+    }
+    </script>
+</head>
+<body>
+<div id="app">
+
+    <!-- ═══ Header ═══ -->
+    <header id="header">
+        <h1>WebPointCloud</h1>
+        <button id="sidebar-toggle" title="Toggle sidebar">&#9776;</button>
+        <span class="text-meta">3D Point Cloud Viewer & Analysis</span>
+        <div class="status-pills">
+            <label class="header-toggle-label"><input type="checkbox" id="ckb-dark-mode" checked>Dark</label>
+            <button id="btn-fullscreen" title="Toggle fullscreen">&#x26F6;</button>
+        </div>
+    </header>
+
+    <!-- ═══ Sidebar ═══ -->
+    <aside id="sidebar">
+
+        <!-- Load Map -->
+        <div class="btn-row">
+            <button class="btn primary btn-load-primary" id="btn-load-map">Load Map</button>
+            <button class="btn" id="btn-compare-map" title="Compare two maps">Compare</button>
+        </div>
+
+        <!-- View Options -->
+        <div class="panel">
+            <div class="accordion-header" data-accordion="view-layers">
+                <h3>View Options <span class="text-hint">keys: 1-5 G T R</span></h3>
+                <span class="accordion-arrow">&#9660;</span>
+            </div>
+            <div class="accordion-body" data-accordion-body="view-layers">
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-vmap-pts" checked><label for="ckb-vmap-pts">Points</label></div>
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-grid" checked><label for="ckb-grid">Grid</label></div>
+            <hr class="sep">
+
+            <div class="ctrl-row"><label>Color</label>
+                <select id="sel-color"><option value="intensity">Intensity</option><option value="height">Height</option><option value="rgb">RGB</option></select>
+            </div>
+            <div class="ctrl-row"><label>Gamma</label>
+                <input type="range" id="gamma-slider" min="0" max="1.0" step="0.05" value="0.6" style="flex:1">
+                <input type="number" id="gamma-spin" min="0" max="1.0" step="0.05" value="0.6" style="width:55px">
+            </div>
+            <div class="ctrl-row"><label>View</label>
+                <select id="sel-view"><option value="free">Free</option><option value="top">Top</option><option value="xy">X-Y</option><option value="xz">X-Z</option><option value="yz">Y-Z</option></select>
+            </div>
+            <div class="ctrl-row"><label>Bookmark</label>
+                <select id="sel-bookmark" class="flex-1"><option value="">-</option></select>
+                <button class="btn btn-sm" id="btn-bm-save">Save</button>
+                <button class="btn btn-sm" id="btn-bm-del">Del</button>
+            </div>
+            <div class="ctrl-row"><label>View Height</label>
+                <input type="number" id="spb-view-h" value="10" step="1" min="1" max="500">
+            </div>
+            <div class="accordion-header collapsed" data-accordion="view-clip">
+                <div class="sub-label mb-0">Clipping</div>
+                <span class="accordion-arrow">&#9660;</span>
+            </div>
+            <div class="accordion-body collapsed" data-accordion-body="view-clip">
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-clip"><label for="ckb-clip">Z Clip</label></div>
+            <div class="ctrl-row">
+                <label class="narrow">Min</label><input type="number" class="narrow" id="spb-clip-min" value="-5" step="0.5">
+                <label class="narrow">Max</label><input type="number" class="narrow" id="spb-clip-max" value="5" step="0.5">
+            </div>
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-clip-x"><label for="ckb-clip-x">X Clip</label></div>
+            <div class="ctrl-row">
+                <label class="narrow">Min</label><input type="number" class="narrow" id="spb-clip-x-min" value="-100" step="0.5">
+                <label class="narrow">Max</label><input type="number" class="narrow" id="spb-clip-x-max" value="100" step="0.5">
+            </div>
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-clip-y"><label for="ckb-clip-y">Y Clip</label></div>
+            <div class="ctrl-row">
+                <label class="narrow">Min</label><input type="number" class="narrow" id="spb-clip-y-min" value="-100" step="0.5">
+                <label class="narrow">Max</label><input type="number" class="narrow" id="spb-clip-y-max" value="100" step="0.5">
+            </div>
+            </div>
+            <hr class="sep">
+            <div class="sub-label">Point Size</div>
+            <div class="pt-size-row">
+                <input type="range" id="pt-size-slider" min="0.01" max="2" step="0.01" value="0.05">
+                <input type="number" id="pt-size-spin" min="0.01" max="2" step="0.01" value="0.05">
+            </div>
+            <div class="sub-label">Downsample</div>
+            <div class="ctrl-row">
+                <input type="range" id="ds-ratio-slider" min="0.01" max="1" step="0.01" value="1" class="flex-1">
+                <span class="text-mono-sm" id="ds-ratio-label">100%</span>
+            </div>
+            <hr class="sep">
+            <div class="accordion-header" data-accordion="view-postfilter">
+                <div class="sub-label mb-0">Post Filters</div>
+                <span class="accordion-arrow">&#9660;</span>
+            </div>
+            <div class="accordion-body" data-accordion-body="view-postfilter">
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-edl"><label for="ckb-edl">EDL (Eye-Dome Lighting)</label></div>
+            <div class="ctrl-row"><label class="narrow">Str</label>
+                <input type="range" id="edl-strength" min="0.1" max="5.0" step="0.1" value="1.0" class="flex-1">
+                <input type="number" id="edl-strength-spin" min="0.1" max="5.0" step="0.1" value="1.0" class="narrow">
+            </div>
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-ssao"><label for="ckb-ssao">SSAO</label></div>
+            <div class="ctrl-row"><label class="narrow">Rad</label>
+                <input type="range" id="ssao-radius" min="0.1" max="5.0" step="0.1" value="1.0" class="flex-1">
+                <input type="number" id="ssao-radius-spin" min="0.1" max="5.0" step="0.1" value="1.0" class="narrow">
+            </div>
+            </div>
+            <hr class="sep">
+            <div class="sub-label">Tools</div>
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-point-info"><label for="ckb-point-info">Point Info</label></div>
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-measure"><label for="ckb-measure">Measure Distance</label></div>
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-poly-select"><label for="ckb-poly-select">Polygon Select</label></div>
+            <div class="btn-row">
+                <button class="btn" id="btn-sel-delete" disabled>Delete Sel</button>
+                <button class="btn" id="btn-sel-keep" disabled>Keep Sel</button>
+                <button class="btn" id="btn-sel-clear" disabled>Clear Sel</button>
+                <button class="btn" id="btn-poly-close" disabled>Close Poly</button>
+            </div>
+            <div class="btn-row">
+                <button class="btn flex-1" id="btn-screenshot">Screenshot</button>
+            </div>
+            <div class="btn-row">
+                <button class="btn" id="btn-undo" disabled title="Undo filter (Ctrl+Z)">&#8617; Undo</button>
+                <button class="btn" id="btn-redo" disabled title="Redo filter (Ctrl+Shift+Z)">&#8618; Redo</button>
+            </div>
+            </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tab-bar">
+            <button class="tab-btn active" data-tab="tab-analysis">Analysis</button>
+            <button class="tab-btn" data-tab="tab-files">Files</button>
+        </div>
+
+        <!-- Tab: Analysis -->
+        <div class="panel tab-content active" id="tab-analysis">
+            <div class="ctrl-row"><label>Active:</label><span id="analysis-current-file" class="flex-1 text-meta">None</span></div>
+            <hr class="sep">
+
+            <!-- Statistics -->
+            <div class="sub-label">Statistics</div>
+            <div class="btn-row"><button class="btn flex-1" id="btn-analysis-stats">Compute Statistics</button></div>
+            <div id="stats-result" class="analysis-result"></div>
+            <canvas id="stats-histogram" style="width:100%;height:80px"></canvas>
+            <hr class="sep">
+
+            <!-- SOR Filter -->
+            <div class="sub-label">Statistical Outlier Removal</div>
+            <div class="ctrl-row">
+                <label class="narrow">K</label><input type="number" class="narrow" id="sor-k" value="20" min="2" max="200" step="1">
+                <label class="narrow">Std</label><input type="number" class="narrow" id="sor-std" value="2.0" min="0.1" max="10" step="0.1">
+            </div>
+            <div class="btn-row"><button class="btn flex-1" id="btn-analysis-sor">Apply SOR Filter</button></div>
+            <hr class="sep">
+
+            <!-- Cross Section -->
+            <div class="sub-label">Cross Section</div>
+            <div class="ctrl-row">
+                <label class="narrow">Axis</label>
+                <select id="section-axis"><option value="z">Z</option><option value="x">X</option><option value="y">Y</option></select>
+                <label class="narrow">Center</label><input type="number" class="narrow" id="section-center" value="0" step="0.5">
+                <label class="narrow">Thick</label><input type="number" class="narrow" id="section-thickness" value="1.0" step="0.1" min="0.01">
+            </div>
+            <div class="btn-row"><button class="btn flex-1" id="btn-analysis-section">Extract Section</button></div>
+            <hr class="sep">
+
+            <!-- Volume -->
+            <div class="sub-label">Volume Estimation</div>
+            <div class="ctrl-row">
+                <label class="narrow">Grid (m)</label><input type="number" class="narrow" id="volume-grid" value="0.5" step="0.1" min="0.01">
+            </div>
+            <div class="btn-row"><button class="btn flex-1" id="btn-analysis-volume">Compute Volume</button></div>
+            <div id="volume-result" class="analysis-result text-meta"></div>
+            <hr class="sep">
+
+            <!-- C2C Distance -->
+            <div class="sub-label">Cloud-to-Cloud Distance</div>
+            <p class="text-hint">Load Map B via Compare, then compute distances.</p>
+            <div class="btn-row"><button class="btn flex-1" id="btn-analysis-c2c">Compute C2C Distance</button></div>
+            <div id="c2c-result" class="analysis-result text-meta"></div>
+        </div>
+
+        <!-- Tab: Files -->
+        <div class="panel tab-content" id="tab-files">
+            <div class="sub-label">Saved Maps</div>
+            <div id="map-list-wrap" class="scroll-list">
+                <div class="list-empty" id="map-list-empty">No maps found</div>
+                <div id="map-list"></div>
+            </div>
+            <div class="btn-row mt-6">
+                <button class="btn flex-1" id="btn-refresh-maps">Refresh</button>
+            </div>
+        </div>
+
+        <!-- Compare Map panel -->
+        <div class="panel hidden" id="compare-panel">
+            <h3 class="metrics-header">Map Compare <span class="metrics-toggle" id="compare-close-btn" title="Close">&times;</span></h3>
+            <div class="ctrl-row"><label>Map A</label><span id="compare-a-name" class="flex-1 text-meta">-</span></div>
+            <div class="ctrl-row"><label>Map B</label><span id="compare-b-name" class="flex-1 text-meta">-</span></div>
+            <div class="ctrl-row"><label>Opacity B</label>
+                <input type="range" id="compare-opacity" min="0" max="1" step="0.05" value="0.5" class="flex-1">
+            </div>
+            <div class="ctrl-row"><label>Offset X</label><input type="number" class="narrow" id="compare-ox" value="0" step="0.1"></div>
+            <div class="ctrl-row"><label>Offset Y</label><input type="number" class="narrow" id="compare-oy" value="0" step="0.1"></div>
+            <div class="ctrl-row"><label>Offset Z</label><input type="number" class="narrow" id="compare-oz" value="0" step="0.1"></div>
+            <div class="ctrl-row"><label>Rot X (&deg;)</label><input type="number" class="narrow" id="compare-rx" value="0" step="0.5"></div>
+            <div class="ctrl-row"><label>Rot Y (&deg;)</label><input type="number" class="narrow" id="compare-ry" value="0" step="0.5"></div>
+            <div class="ctrl-row"><label>Rot Z (&deg;)</label><input type="number" class="narrow" id="compare-rz" value="0" step="0.5"></div>
+            <div class="btn-row">
+                <button class="btn primary" id="btn-compare-save">Save B</button>
+                <button class="btn danger" id="btn-compare-clear">Clear B</button>
+            </div>
+        </div>
+    </aside>
+    <div id="sidebar-resize-handle"></div>
+
+    <!-- ═══ Content area ═══ -->
+    <div id="content">
+        <!-- 3D Viewer -->
+        <div id="viewer-wrap">
+            <div id="viewer-info"><span id="viewer-pts">Points: 0</span> <span id="viewer-fps"></span></div>
+            <div id="no-data-msg">Drag &amp; drop a .las file or click <b>Load Map</b> to open a point cloud</div>
+            <div id="point-info"></div>
+            <div id="viewer-stats"></div>
+            <div id="drop-overlay">Drop LAS file here</div>
+            <div id="poly-select-overlay"></div>
+
+            <!-- Viewer floating toolbar -->
+            <div id="viewer-toolbar">
+                <button class="vt-btn" data-view="free" title="Free view">F</button>
+                <button class="vt-btn" data-view="top" title="Top view">Top</button>
+                <button class="vt-btn" data-view="xy" title="X-Y view">XY</button>
+                <button class="vt-btn" data-view="xz" title="X-Z view">XZ</button>
+                <button class="vt-btn" data-view="yz" title="Y-Z view">YZ</button>
+                <button class="vt-btn" data-action="reset" title="Reset camera">R</button>
+            </div>
+
+            <!-- ═══ Floating Info Panel (Log) ═══ -->
+            <div id="float-panel">
+                <div id="float-panel-inner">
+                    <div class="fp-header">
+                        <div class="bp-tabs">
+                            <button class="bp-tab active" data-bp="bp-log">Log</button>
+                        </div>
+                        <button id="float-panel-toggle" title="Toggle info panel">&minus;</button>
+                    </div>
+                    <div class="bp-body">
+                        <!-- Log -->
+                        <div class="bp-content active" id="bp-log">
+                            <div id="log-body"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══ File Modal ═══ -->
+<div class="modal-bg" id="modal-file">
+    <div class="modal">
+        <div class="modal-header">
+            <h2 id="modal-file-title">Load Point Cloud</h2>
+            <button class="modal-close" id="btn-modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div class="ctrl-row mb-6">
+                <button class="btn primary" id="btn-upload">Upload File</button>
+                <input type="text" id="map-search" placeholder="Search saved maps..." class="flex-1">
+                <input type="file" id="file-input" accept=".las,.laz" hidden>
+            </div>
+            <div id="map-list-wrap" class="scroll-list" style="max-height:50vh">
+                <div id="map-list"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══ Map Manage Modal ═══ -->
+<div class="modal-bg" id="modal-map-manage">
+    <div class="modal modal-sm">
+        <div class="modal-header">
+            <h2>Manage: <span id="manage-map-name"></span></h2>
+            <button class="modal-close" id="btn-manage-close">&times;</button>
+        </div>
+        <div class="modal-body">
+            <div class="ctrl-row mb-6">
+                <label>Rename</label>
+                <input type="text" id="manage-rename-input" class="flex-1">
+                <button class="btn" id="btn-manage-rename">Rename</button>
+            </div>
+            <hr class="sep">
+            <div class="btn-row">
+                <button class="btn danger flex-1" id="btn-manage-delete">Delete Map</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══ Custom Dialog (confirm / prompt) ═══ -->
+<div id="custom-dialog">
+    <div class="dialog-box">
+        <div class="dialog-msg" id="dialog-msg"></div>
+        <input type="text" class="dialog-input" id="dialog-input" style="display:none">
+        <div class="dialog-btns">
+            <button class="btn" id="dialog-cancel">Cancel</button>
+            <button class="btn primary" id="dialog-ok">OK</button>
+        </div>
+    </div>
+</div>
+
+<!-- Toast Container -->
+<div id="toast-container"></div>
+
+<!-- Loading Overlay -->
+<div id="loading-overlay">
+    <div class="loading-spinner"></div>
+    <span id="loading-text">Loading...</span>
+</div>
+
+<!-- Hidden status element for compatibility -->
+<span id="st-main" style="display:none"></span>
+
+<script type="module" src="/static/js/app.js?v=1"></script>
+</body>
+</html>
