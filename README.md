@@ -8,12 +8,15 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 ### Demo
 
 **Drag & Drop Loading**
+
 ![Drag & Drop](docs/demo_dragdrop.gif)
 
 **Post-Processing Filters (EDL / SSAO)**
+
 ![Post-Processing Filters](docs/demo_rotate.gif)
 
 **View Controls & Color Modes**
+
 ![View Controls](docs/demo_controls.gif)
 
 ---
