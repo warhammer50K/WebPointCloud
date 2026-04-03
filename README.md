@@ -81,6 +81,8 @@ A sample point cloud is included at `sample/building_scan.las` (100k points) —
 | `WPC_MAPS_DIR` | `$WPC_DATA_DIR/maps` | Point cloud storage directory |
 | `FLASK_DEBUG` | `0` | Enable Flask debug mode |
 | `FLASK_SECRET_KEY` | auto-generated | Flask session secret key |
+| `WPC_PUBLIC` | `0` | Set to `1` to disable IP whitelist (for public deployments) |
+| `WPC_MAX_UPLOAD_MB` | `5120` | Maximum upload size in MB |
 
 ## Architecture
 

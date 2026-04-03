@@ -69,12 +69,14 @@ def init_security(app, logger, rate_limiter=None):
     if rate_limiter is None:
         rate_limiter = RateLimiter()
 
+    ip_whitelist_disabled = os.environ.get('WPC_PUBLIC', '0') == '1'
+
     @app.before_request
     def _check_ip_and_rate_limit():
         if request.path.startswith('/static/'):
             return None
         client_ip = request.remote_addr
-        if not is_private(client_ip):
+        if not ip_whitelist_disabled and not is_private(client_ip):
             logger.warning(f"[Security] Blocked request from {client_ip}")
             abort(403)
         if not rate_limiter.is_allowed(client_ip):

@@ -6,7 +6,7 @@ import os
 WEB_PORT = int(os.environ.get('WEB_PORT', '5000'))
 
 # ── Upload / buffer limits ────────────────────────────
-MAX_CONTENT_LENGTH = 5 * 1024 * 1024 * 1024      # 5 GB
+MAX_CONTENT_LENGTH = int(os.environ.get('WPC_MAX_UPLOAD_MB', '5120')) * 1024 * 1024
 
 # ── Rate limiter ──────────────────────────────────────
 RATE_LIMIT_MAX = 60
