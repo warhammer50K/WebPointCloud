@@ -151,8 +151,10 @@ def load_pointcloud():
     tmp_path = None
     try:
         path = None
+        saved_path = None
         if request.is_json and 'path' in request.json:
             path = request.json['path']
+            saved_path = path
             maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
             if not os.path.realpath(path).startswith(maps_dir + os.sep):
                 return jsonify({'error': 'Access denied'}), 403
@@ -160,10 +162,14 @@ def load_pointcloud():
             f = request.files['file']
             orig_name = f.filename or 'upload.las'
             suffix = os.path.splitext(orig_name)[1].lower() or '.las'
-            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-            os.close(fd)
-            f.save(tmp_path)
-            path = tmp_path
+            # Save uploaded file to maps/_uploads/ for ICP/analysis use
+            maps_dir = current_app.config['MAPS_DIR']
+            upload_dir = os.path.join(maps_dir, '_uploads')
+            os.makedirs(upload_dir, exist_ok=True)
+            safe_name = orig_name.replace(os.sep, '_').replace('/', '_')
+            saved_path = os.path.join(upload_dir, f'{uuid.uuid4().hex[:8]}_{safe_name}')
+            f.save(saved_path)
+            path = saved_path
 
         if not path or not os.path.isfile(path):
             return jsonify({'error': 'File not found'}), 404
@@ -175,7 +181,10 @@ def load_pointcloud():
         d = read_pointcloud(path)
         binary = arrays_to_binary(d['x'], d['y'], d['z'], d['intensity'],
                                   d['r'], d['g'], d['b'], d['n'])
-        return send_file(io.BytesIO(binary), mimetype='application/octet-stream')
+        resp = send_file(io.BytesIO(binary), mimetype='application/octet-stream')
+        if saved_path:
+            resp.headers['X-Saved-Path'] = saved_path
+        return resp
 
     except Exception as e:
         return _error_response(e, 'load_pointcloud')
@@ -191,7 +200,7 @@ def load_las():
 
 
 # ══════════════════════════════════════════════════════
-#  Save Compare B (with transform)
+#  Merge & Save (Map A + transformed Map B)
 # ══════════════════════════════════════════════════════
 @api_bp.route('/api/save_compare_b', methods=['POST'])
 def save_compare_b():
@@ -199,26 +208,26 @@ def save_compare_b():
     if err:
         return err
     try:
-        import laspy
-
         data = request.json
-        path = data['path']
+        path_a = data.get('path_a', '')
+        path_b = data.get('path', '') or data.get('path_b', '')
         ox, oy, oz = data.get('ox', 0), data.get('oy', 0), data.get('oz', 0)
         rx, ry, rz = data.get('rx', 0), data.get('ry', 0), data.get('rz', 0)
 
         maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
-        if not os.path.realpath(path).startswith(maps_dir + os.sep):
-            return jsonify({'error': 'Access denied'}), 403
-        if not os.path.isfile(path):
-            return jsonify({'error': 'File not found'}), 404
+        for p in [path_a, path_b]:
+            if not p:
+                continue
+            if not os.path.realpath(p).startswith(maps_dir + os.sep):
+                return jsonify({'error': 'Access denied'}), 403
+            if not os.path.isfile(p):
+                return jsonify({'error': f'File not found: {p}'}), 404
 
-        log = current_app.config['LOGGER']
+        log = current_app.config.get('LOGGER')
 
-        las_in = laspy.read(path)
-        x = np.array(las_in.x, dtype=np.float64)
-        y = np.array(las_in.y, dtype=np.float64)
-        z = np.array(las_in.z, dtype=np.float64)
-        n = len(x)
+        # ── Read Map B and apply transform ──
+        d_b = read_pointcloud(path_b)
+        bx, by, bz = d_b['x'].astype(np.float64), d_b['y'].astype(np.float64), d_b['z'].astype(np.float64)
 
         if rx != 0 or ry != 0 or rz != 0:
             rx_r, ry_r, rz_r = np.radians(rx), np.radians(ry), np.radians(rz)
@@ -229,27 +238,52 @@ def save_compare_b():
             Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
             Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
             R = Rz @ Ry @ Rx
-            pts = R @ np.vstack([x, y, z])
-            x, y, z = pts[0], pts[1], pts[2]
+            pts = R @ np.vstack([bx, by, bz])
+            bx, by, bz = pts[0], pts[1], pts[2]
 
-        x += ox; y += oy; z += oz
+        bx += ox; by += oy; bz += oz
 
-        intensity = np.array(las_in.intensity) if hasattr(las_in, 'intensity') else None
-        has_rgb = hasattr(las_in, 'red') and hasattr(las_in, 'green') and hasattr(las_in, 'blue')
-        r_arr = np.array(las_in.red) if has_rgb else None
-        g_arr = np.array(las_in.green) if has_rgb else None
-        b_arr = np.array(las_in.blue) if has_rgb else None
+        b_intensity = d_b['intensity']
+        b_r, b_g, b_b = d_b['r'], d_b['g'], d_b['b']
+
+        # ── Read Map A ──
+        if path_a:
+            d_a = read_pointcloud(path_a)
+            ax, ay, az = d_a['x'].astype(np.float64), d_a['y'].astype(np.float64), d_a['z'].astype(np.float64)
+            a_intensity = d_a['intensity']
+            a_r, a_g, a_b = d_a['r'], d_a['g'], d_a['b']
+        else:
+            ax = ay = az = np.array([], dtype=np.float64)
+            a_intensity = a_r = a_g = a_b = np.array([], dtype=np.uint16)
+
+        # ── Merge A + B ──
+        mx = np.concatenate([ax, bx])
+        my = np.concatenate([ay, by])
+        mz = np.concatenate([az, bz])
+        m_intensity = np.concatenate([a_intensity, b_intensity])
+        m_r = np.concatenate([a_r, b_r])
+        m_g = np.concatenate([a_g, b_g])
+        m_b = np.concatenate([a_b, b_b])
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(maps_dir, f'{timestamp}_compareB')
+        save_dir = os.path.join(maps_dir, f'{timestamp}_merged')
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, 'map.las')
 
-        write_las(save_path, x, y, z, intensity=intensity,
-                  r=r_arr, g=g_arr, b=b_arr, source_las=las_in)
+        n_total = len(mx)
+        write_las(save_path, mx, my, mz, intensity=m_intensity,
+                  r=m_r, g=m_g, b=m_b)
 
-        log.info(f"[CompareB] Saved: {n} pts -> {save_path}")
-        return jsonify({'path': save_path, 'points': n, 'name': f'{timestamp}_compareB'})
+        if log:
+            log.info(f"[Merge] A={len(ax)} + B={len(bx)} = {n_total} pts -> {save_path}")
+
+        return jsonify({
+            'path': save_path,
+            'points': n_total,
+            'points_a': len(ax),
+            'points_b': len(bx),
+            'name': f'{timestamp}_merged',
+        })
 
     except Exception as e:
         return _error_response(e, 'save_compare_b')
@@ -316,14 +350,12 @@ def _load_points_from_request():
         if not path or not os.path.isfile(path):
             return None, 'File not found'
 
-        import laspy
-        las = laspy.read(path)
-        x = np.array(las.x, dtype=np.float64)
-        y = np.array(las.y, dtype=np.float64)
-        z = np.array(las.z, dtype=np.float64)
-        intensity = np.array(las.intensity, dtype=np.float64) if hasattr(las, 'intensity') else np.zeros(len(x))
+        d = read_pointcloud(path)
+        x, y, z = d['x'].astype(np.float64), d['y'].astype(np.float64), d['z'].astype(np.float64)
+        intensity = d['intensity'].astype(np.float64) if d['intensity'] is not None else np.zeros(len(x))
 
-        return {'x': x, 'y': y, 'z': z, 'intensity': intensity, 'n': len(x), 'las': las}, None
+        return {'x': x, 'y': y, 'z': z, 'intensity': intensity, 'n': len(x),
+                'r': d['r'], 'g': d['g'], 'b': d['b']}, None
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -347,11 +379,8 @@ def analysis_statistics():
         if not os.path.isfile(path):
             return jsonify({'error': 'File not found'}), 404
 
-        import laspy
-        las = laspy.read(path)
-        x = np.array(las.x, dtype=np.float64)
-        y = np.array(las.y, dtype=np.float64)
-        z = np.array(las.z, dtype=np.float64)
+        d = read_pointcloud(path)
+        x, y, z = d['x'].astype(np.float64), d['y'].astype(np.float64), d['z'].astype(np.float64)
         n = len(x)
 
         if n == 0:
@@ -410,13 +439,10 @@ def analysis_sor():
         if not os.path.isfile(path):
             return jsonify({'error': 'File not found'}), 404
 
-        import laspy
         from scipy.spatial import cKDTree
 
-        las = laspy.read(path)
-        x = np.array(las.x, dtype=np.float64)
-        y = np.array(las.y, dtype=np.float64)
-        z = np.array(las.z, dtype=np.float64)
+        pc = read_pointcloud(path)
+        x, y, z = pc['x'].astype(np.float64), pc['y'].astype(np.float64), pc['z'].astype(np.float64)
         n = len(x)
 
         if n < k + 1:
@@ -440,16 +466,13 @@ def analysis_sor():
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, 'map.las')
 
-        has_rgb = hasattr(las, 'red') and hasattr(las, 'green') and hasattr(las, 'blue')
-        intensity = np.array(las.intensity) if hasattr(las, 'intensity') else None
         write_las(
             save_path,
             x[inlier_mask], y[inlier_mask], z[inlier_mask],
-            intensity=intensity[inlier_mask] if intensity is not None else None,
-            r=np.array(las.red)[inlier_mask] if has_rgb else None,
-            g=np.array(las.green)[inlier_mask] if has_rgb else None,
-            b=np.array(las.blue)[inlier_mask] if has_rgb else None,
-            source_las=las,
+            intensity=pc['intensity'][inlier_mask] if pc['intensity'] is not None else None,
+            r=pc['r'][inlier_mask] if pc['r'] is not None else None,
+            g=pc['g'][inlier_mask] if pc['g'] is not None else None,
+            b=pc['b'][inlier_mask] if pc['b'] is not None else None,
         )
 
         log = current_app.config.get('LOGGER')
@@ -494,11 +517,8 @@ def analysis_cross_section():
         if not os.path.isfile(path):
             return jsonify({'error': 'File not found'}), 404
 
-        import laspy
-        las = laspy.read(path)
-        x = np.array(las.x, dtype=np.float64)
-        y = np.array(las.y, dtype=np.float64)
-        z = np.array(las.z, dtype=np.float64)
+        pc = read_pointcloud(path)
+        x, y, z = pc['x'].astype(np.float64), pc['y'].astype(np.float64), pc['z'].astype(np.float64)
 
         axis_data = {'x': x, 'y': y, 'z': z}[axis]
         half = thickness / 2.0
@@ -511,16 +531,13 @@ def analysis_cross_section():
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, 'map.las')
 
-        has_rgb = hasattr(las, 'red') and hasattr(las, 'green') and hasattr(las, 'blue')
-        intensity = np.array(las.intensity) if hasattr(las, 'intensity') else None
         write_las(
             save_path,
             x[mask], y[mask], z[mask],
-            intensity=intensity[mask] if intensity is not None else None,
-            r=np.array(las.red)[mask] if has_rgb else None,
-            g=np.array(las.green)[mask] if has_rgb else None,
-            b=np.array(las.blue)[mask] if has_rgb else None,
-            source_las=las,
+            intensity=pc['intensity'][mask] if pc['intensity'] is not None else None,
+            r=pc['r'][mask] if pc['r'] is not None else None,
+            g=pc['g'][mask] if pc['g'] is not None else None,
+            b=pc['b'][mask] if pc['b'] is not None else None,
         )
 
         return jsonify({
@@ -558,11 +575,8 @@ def analysis_volume():
         if not os.path.isfile(path):
             return jsonify({'error': 'File not found'}), 404
 
-        import laspy
-        las = laspy.read(path)
-        x = np.array(las.x, dtype=np.float64)
-        y = np.array(las.y, dtype=np.float64)
-        z = np.array(las.z, dtype=np.float64)
+        pc = read_pointcloud(path)
+        x, y, z = pc['x'].astype(np.float64), pc['y'].astype(np.float64), pc['z'].astype(np.float64)
         n = len(x)
 
         if n == 0:
@@ -618,14 +632,13 @@ def analysis_c2c_distance():
             if not os.path.isfile(p):
                 return jsonify({'error': f'File not found: {p}'}), 404
 
-        import laspy
         from scipy.spatial import cKDTree
 
-        las_a = laspy.read(path_a)
-        las_b = laspy.read(path_b)
+        d_a = read_pointcloud(path_a)
+        d_b = read_pointcloud(path_b)
 
-        pts_a = np.column_stack([np.array(las_a.x), np.array(las_a.y), np.array(las_a.z)])
-        pts_b = np.column_stack([np.array(las_b.x), np.array(las_b.y), np.array(las_b.z)])
+        pts_a = np.column_stack([d_a['x'], d_a['y'], d_a['z']])
+        pts_b = np.column_stack([d_b['x'], d_b['y'], d_b['z']])
 
         tree_b = cKDTree(pts_b)
         distances, _ = tree_b.query(pts_a, k=1)
@@ -663,3 +676,252 @@ def analysis_c2c_distance():
 
     except Exception as e:
         return _error_response(e, 'analysis_c2c_distance')
+
+
+# ══════════════════════════════════════════════════════
+#  Save Transformed Point Cloud
+# ══════════════════════════════════════════════════════
+
+@api_bp.route('/api/save_transformed', methods=['POST'])
+def save_transformed():
+    err = _require_json()
+    if err:
+        return err
+    try:
+        data = request.json
+        path = data.get('path', '')
+        ox, oy, oz = data.get('ox', 0), data.get('oy', 0), data.get('oz', 0)
+        rx, ry, rz = data.get('rx', 0), data.get('ry', 0), data.get('rz', 0)
+
+        maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
+        if not path or not os.path.realpath(path).startswith(maps_dir + os.sep):
+            return jsonify({'error': 'Access denied'}), 403
+        if not os.path.isfile(path):
+            return jsonify({'error': 'File not found'}), 404
+
+        d = read_pointcloud(path)
+        x, y, z = d['x'].astype(np.float64), d['y'].astype(np.float64), d['z'].astype(np.float64)
+
+        if rx != 0 or ry != 0 or rz != 0:
+            rx_r, ry_r, rz_r = np.radians(rx), np.radians(ry), np.radians(rz)
+            cx, sx = np.cos(rx_r), np.sin(rx_r)
+            cy, sy = np.cos(ry_r), np.sin(ry_r)
+            cz, sz = np.cos(rz_r), np.sin(rz_r)
+            Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+            Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+            R = Rz @ Ry @ Rx
+            pts = R @ np.vstack([x, y, z])
+            x, y, z = pts[0], pts[1], pts[2]
+
+        x += ox; y += oy; z += oz
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        save_dir = os.path.join(maps_dir, f'{timestamp}_transformed')
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, 'map.las')
+
+        n = len(x)
+        write_las(save_path, x, y, z, intensity=d['intensity'],
+                  r=d['r'], g=d['g'], b=d['b'])
+
+        log = current_app.config.get('LOGGER')
+        if log:
+            log.info(f"[Transform] {n} pts -> {save_path} "
+                     f"T=({ox},{oy},{oz}) R=({rx},{ry},{rz})")
+
+        return jsonify({'path': save_path, 'points': n, 'name': f'{timestamp}_transformed'})
+
+    except Exception as e:
+        return _error_response(e, 'save_transformed')
+
+
+# ══════════════════════════════════════════════════════
+#  ICP (Iterative Closest Point) Registration
+# ══════════════════════════════════════════════════════
+
+def _rotation_matrix_to_euler(R):
+    """Convert 3x3 rotation matrix to Euler angles (degrees) in XYZ order."""
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        rx = np.arctan2(R[2, 1], R[2, 2])
+        ry = np.arctan2(-R[2, 0], sy)
+        rz = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        rx = np.arctan2(-R[1, 2], R[1, 1])
+        ry = np.arctan2(-R[2, 0], sy)
+        rz = 0.0
+    return np.degrees(rx), np.degrees(ry), np.degrees(rz)
+
+
+def _icp(pts_a, pts_b, max_iter=50, tolerance=1e-6, max_distance=None):
+    """Point-to-point ICP. Aligns pts_b (source) to pts_a (target).
+
+    Returns (R, t, iterations, mean_dist, converged) where
+    the final transformed source = (R @ pts_b.T).T + t
+    """
+    from scipy.spatial import cKDTree
+
+    src = pts_b.copy()
+    n = len(src)
+    R_total = np.eye(3)
+    t_total = np.zeros(3)
+    prev_error = np.inf
+
+    for i in range(max_iter):
+        tree = cKDTree(pts_a)
+        distances, indices = tree.query(src, k=1)
+
+        # Filter by max correspondence distance
+        if max_distance is not None and max_distance > 0:
+            mask = distances < max_distance
+            if mask.sum() < 10:
+                break
+            matched_src = src[mask]
+            matched_tgt = pts_a[indices[mask]]
+            mean_error = float(distances[mask].mean())
+        else:
+            matched_src = src
+            matched_tgt = pts_a[indices]
+            mean_error = float(distances.mean())
+
+        # Check convergence
+        if abs(prev_error - mean_error) < tolerance:
+            return R_total, t_total, i + 1, mean_error, True
+        prev_error = mean_error
+
+        # Compute centroids
+        centroid_src = matched_src.mean(axis=0)
+        centroid_tgt = matched_tgt.mean(axis=0)
+
+        # Center the points
+        src_centered = matched_src - centroid_src
+        tgt_centered = matched_tgt - centroid_tgt
+
+        # SVD to find optimal rotation
+        H = src_centered.T @ tgt_centered
+        U, S, Vt = np.linalg.svd(H)
+        R_step = Vt.T @ U.T
+
+        # Correct reflection
+        if np.linalg.det(R_step) < 0:
+            Vt[-1, :] *= -1
+            R_step = Vt.T @ U.T
+
+        t_step = centroid_tgt - R_step @ centroid_src
+
+        # Apply step transform
+        src = (R_step @ src.T).T + t_step
+
+        # Accumulate
+        R_total = R_step @ R_total
+        t_total = R_step @ t_total + t_step
+
+    return R_total, t_total, max_iter, prev_error, False
+
+
+@api_bp.route('/api/analysis/icp', methods=['POST'])
+def analysis_icp():
+    """ICP registration: align Map B (source) to Map A (target)."""
+    try:
+        err = _require_json()
+        if err:
+            return err
+
+        data = request.json
+        path_a = data.get('path_a', '')
+        path_b = data.get('path_b', '')
+        max_iter = int(data.get('max_iterations', 50))
+        tolerance = float(data.get('tolerance', 1e-6))
+        max_distance = data.get('max_distance')
+        if max_distance is not None:
+            max_distance = float(max_distance)
+            if max_distance <= 0:
+                max_distance = None
+        downsample = float(data.get('downsample', 1.0))
+
+        # Initial pose from Compare panel sliders
+        init_t = data.get('init_translation', [0, 0, 0])
+        init_r = data.get('init_rotation', [0, 0, 0])
+
+        if not path_a or not path_b:
+            return jsonify({'error': 'Both path_a and path_b required'}), 400
+
+        maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
+        for p in [path_a, path_b]:
+            if not os.path.realpath(p).startswith(maps_dir + os.sep):
+                return jsonify({'error': 'Access denied'}), 403
+            if not os.path.isfile(p):
+                return jsonify({'error': f'File not found: {p}'}), 404
+
+        d_a = read_pointcloud(path_a)
+        d_b = read_pointcloud(path_b)
+
+        pts_a = np.column_stack([d_a['x'], d_a['y'], d_a['z']]).astype(np.float64)
+        pts_b = np.column_stack([d_b['x'], d_b['y'], d_b['z']]).astype(np.float64)
+
+        # Apply initial pose to Map B before ICP
+        i_rx, i_ry, i_rz = float(init_r[0]), float(init_r[1]), float(init_r[2])
+        i_tx, i_ty, i_tz = float(init_t[0]), float(init_t[1]), float(init_t[2])
+
+        if i_rx != 0 or i_ry != 0 or i_rz != 0:
+            rx_r, ry_r, rz_r = np.radians(i_rx), np.radians(i_ry), np.radians(i_rz)
+            cx, sx = np.cos(rx_r), np.sin(rx_r)
+            cy, sy = np.cos(ry_r), np.sin(ry_r)
+            cz, sz = np.cos(rz_r), np.sin(rz_r)
+            Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+            Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+            R_init = Rz @ Ry @ Rx
+            pts_b = (R_init @ pts_b.T).T
+        else:
+            R_init = np.eye(3)
+
+        pts_b[:, 0] += i_tx
+        pts_b[:, 1] += i_ty
+        pts_b[:, 2] += i_tz
+        t_init = np.array([i_tx, i_ty, i_tz])
+
+        # Optional downsampling for performance
+        if 0 < downsample < 1.0:
+            rng = np.random.default_rng(42)
+            idx_a = rng.choice(len(pts_a), size=int(len(pts_a) * downsample), replace=False)
+            idx_b = rng.choice(len(pts_b), size=int(len(pts_b) * downsample), replace=False)
+            pts_a_ds = pts_a[idx_a]
+            pts_b_ds = pts_b[idx_b]
+        else:
+            pts_a_ds = pts_a
+            pts_b_ds = pts_b
+
+        R_icp, t_icp, iterations, mean_dist, converged = _icp(
+            pts_a_ds, pts_b_ds, max_iter=max_iter,
+            tolerance=tolerance, max_distance=max_distance,
+        )
+
+        # Combine: final = R_icp @ (R_init @ pt + t_init) + t_icp
+        #        = (R_icp @ R_init) @ pt + (R_icp @ t_init + t_icp)
+        R_final = R_icp @ R_init
+        t_final = R_icp @ t_init + t_icp
+
+        rx, ry, rz = _rotation_matrix_to_euler(R_final)
+        t = t_final
+
+        log = current_app.config.get('LOGGER')
+        if log:
+            log.info(f"[ICP] iter={iterations} mean_dist={mean_dist:.6f} "
+                     f"converged={converged} R=({rx:.3f},{ry:.3f},{rz:.3f}) "
+                     f"T=({t[0]:.4f},{t[1]:.4f},{t[2]:.4f})")
+
+        return jsonify({
+            'rotation': [round(rx, 6), round(ry, 6), round(rz, 6)],
+            'translation': [round(float(t[0]), 6), round(float(t[1]), 6), round(float(t[2]), 6)],
+            'iterations': iterations,
+            'mean_distance': round(mean_dist, 6),
+            'converged': converged,
+            'points_a': len(pts_a),
+            'points_b': len(pts_b),
+        })
+
+    except Exception as e:
+        return _error_response(e, 'analysis_icp')

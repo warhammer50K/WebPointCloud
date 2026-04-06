@@ -101,7 +101,7 @@ export async function loadLasFromPath(path) {
 }
 
 export async function uploadLasFile(file, onProgress) {
-    const buffer = await new Promise((resolve, reject) => {
+    const { buffer, savedPath } = await new Promise((resolve, reject) => {
         const form = new FormData();
         form.append('file', file);
         const xhr = new XMLHttpRequest();
@@ -114,7 +114,7 @@ export async function uploadLasFile(file, onProgress) {
         }
         xhr.onload = () => {
             if (xhr.status >= 200 && xhr.status < 300) {
-                resolve(xhr.response);
+                resolve({ buffer: xhr.response, savedPath: xhr.getResponseHeader('X-Saved-Path') });
             } else {
                 try {
                     const text = new TextDecoder().decode(xhr.response);
@@ -128,7 +128,9 @@ export async function uploadLasFile(file, onProgress) {
         xhr.onerror = () => reject(new Error('Upload network error'));
         xhr.send(form);
     });
-    return workerParseBinary(buffer);
+    const data = await workerParseBinary(buffer);
+    data.savedPath = savedPath;
+    return data;
 }
 
 export function workerFilterPoints(positions, intensities, colors, mvpMatrix, viewportW, viewportH, polyPoints, keep) {

@@ -27,7 +27,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         if (searchInput) searchInput.value = '';
         refreshMapList();
     };
-    const closeModal = () => { modalBg.classList.remove('open'); uiState.compareMode = 'load'; $('btn-upload').style.display = ''; };
+    const closeModal = () => { modalBg.classList.remove('open'); uiState.compareMode = 'load'; $('btn-upload').style.display = ''; $('btn-upload').textContent = 'Upload File'; };
 
     // Expose closeModal on uiState for cross-module use
     uiState.closeModal = closeModal;
@@ -48,23 +48,54 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             e.target.value = '';
             return;
         }
+        const isCompare = uiState.compareMode === 'compare';
         closeModal();
-        $('st-main').textContent = `Uploading ${file.name} (${formatFileSize(file.size)})...`;
-        showLoading(`Loading ${file.name}...`);
-        try {
-            const data = await uploadLasFile(file, pct => {
-                $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
-            });
-            viewer.loadPointCloud(data);
-            legend.update(viewer.colorMode, data.bounds);
-            $('no-data-msg').style.display = 'none';
-            $('st-main').textContent = `Loaded ${data.numPoints.toLocaleString()} points`;
-            appendLog(`Loaded ${file.name} (${data.numPoints.toLocaleString()} pts)`, 'success');
-        } catch (err) {
-            $('st-main').textContent = `Error: ${err.message}`;
-            showToast(`Failed: ${err.message}`, 'error');
-        } finally {
-            hideLoading();
+
+        if (isCompare) {
+            $('st-main').textContent = `Uploading compare map: ${file.name}...`;
+            showLoading(`Loading compare map...`);
+            try {
+                const data = await uploadLasFile(file, pct => {
+                    $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
+                });
+                viewer.loadCompareCloud(data);
+                uiState.compareBPath = data.savedPath || null;
+                $('compare-panel').classList.remove('hidden');
+                $('compare-b-name').textContent = file.name;
+                const ptsA = viewer.pointCloud ? viewer.cloudData?.numPoints?.toLocaleString() || '?' : 'none';
+                const ptsB = data.numPoints.toLocaleString();
+                $('st-main').textContent = `A: ${ptsA} pts | B: ${ptsB} pts`;
+                appendLog(`Compare map uploaded: ${file.name} (${ptsB} pts)`, 'info');
+                showToast(`Map A: ${ptsA} pts + Map B: ${ptsB} pts`, 'success');
+            } catch (err) {
+                $('st-main').textContent = `Error: ${err.message}`;
+                showToast(`Failed: ${err.message}`, 'error');
+            } finally {
+                hideLoading();
+            }
+        } else {
+            $('st-main').textContent = `Uploading ${file.name} (${formatFileSize(file.size)})...`;
+            showLoading(`Loading ${file.name}...`);
+            try {
+                const data = await uploadLasFile(file, pct => {
+                    $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
+                });
+                viewer.loadPointCloud(data);
+                legend.update(viewer.colorMode, data.bounds);
+                if (data.savedPath) {
+                    const { setCurrentPath } = await import('./analysis.js');
+                    setCurrentPath(data.savedPath);
+                }
+                $('compare-a-name').textContent = file.name;
+                $('no-data-msg').style.display = 'none';
+                $('st-main').textContent = `Loaded ${data.numPoints.toLocaleString()} points`;
+                appendLog(`Loaded ${file.name} (${data.numPoints.toLocaleString()} pts)`, 'success');
+            } catch (err) {
+                $('st-main').textContent = `Error: ${err.message}`;
+                showToast(`Failed: ${err.message}`, 'error');
+            } finally {
+                hideLoading();
+            }
         }
     });
 
@@ -116,21 +147,29 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                     item.addEventListener('click', async (ev) => {
                         if (ev.target.hasAttribute('data-manage')) return;
                         const isCompare = uiState.compareMode === 'compare';
+                        console.log('[Compare] compareMode:', uiState.compareMode, 'isCompare:', isCompare);
                         closeModal();
                         const fullPath = `${mapPath}/${f}`;
 
                         if (isCompare) {
+                            console.log('[Compare] Loading Map B:', fullPath);
+                            console.log('[Compare] Map A pointCloud exists:', !!viewer.pointCloud);
                             $('st-main').textContent = `Loading compare map: ${mapName}/${f}...`;
                             showLoading(`Loading compare map...`);
                             try {
                                 const data = await loadLasFromPath(fullPath);
                                 viewer.loadCompareCloud(data);
+                                console.log('[Compare] After loadCompareCloud:',
+                                    'pointCloud in scene:', viewer.pointCloud ? viewer.scene.children.includes(viewer.pointCloud) : false,
+                                    'compareCloud in scene:', viewer.compareCloud ? viewer.scene.children.includes(viewer.compareCloud) : false);
                                 uiState.compareBPath = fullPath;
                                 $('compare-panel').classList.remove('hidden');
                                 $('compare-b-name').textContent = `${mapName}/${f}`;
-                                $('st-main').textContent = `Compare map loaded: ${data.numPoints.toLocaleString()} pts`;
-                                appendLog(`Compare map loaded: ${mapName}/${f}`, 'info');
-                                showToast(`Compare map B loaded: ${mapName}`, 'success');
+                                const ptsA = viewer.pointCloud ? viewer.cloudData?.numPoints?.toLocaleString() || '?' : 'none';
+                                const ptsB = data.numPoints.toLocaleString();
+                                $('st-main').textContent = `A: ${ptsA} pts | B: ${ptsB} pts`;
+                                appendLog(`Compare: A=${ptsA} pts, B=${ptsB} pts (${mapName}/${f})`, 'info');
+                                showToast(`Map A: ${ptsA} pts + Map B: ${ptsB} pts loaded`, 'success');
                             } catch (err) {
                                 $('st-main').textContent = `Error: ${err.message}`;
                                 showToast(`Failed: ${err.message}`, 'error');
@@ -276,6 +315,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
     $('btn-compare-map').addEventListener('click', () => {
         uiState.compareMode = 'compare';
         $('modal-file-title').textContent = 'Select Map B (Compare)';
+        $('btn-upload').textContent = 'Upload Map B';
         $('modal-file').classList.add('open');
         refreshMapList();
     });
@@ -284,6 +324,18 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         viewer.clearCompare();
     });
     $('compare-opacity').addEventListener('input', e => viewer.setCompareOpacity(parseFloat(e.target.value)));
+
+    // ── Compare color tint ──
+    const colorMap = { '': [0,0,0,0], white: [1,1,1,1], red: [1,0.27,0.27,1], blue: [0.28,0.53,1,1] };
+    document.querySelectorAll('.cp-color-dot').forEach(dot => {
+        if (dot.dataset.color === '') dot.classList.add('active');
+        dot.addEventListener('click', () => {
+            document.querySelectorAll('.cp-color-dot').forEach(d => d.classList.remove('active'));
+            dot.classList.add('active');
+            const [r, g, b, s] = colorMap[dot.dataset.color] || [0,0,0,0];
+            viewer.setCompareTint(r, g, b, s);
+        });
+    });
     const updateCompareOffset = () => {
         viewer.setCompareOffset(
             parseFloat($('compare-ox').value) || 0,
@@ -291,9 +343,8 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             parseFloat($('compare-oz').value) || 0
         );
     };
-    $('compare-ox').addEventListener('change', updateCompareOffset);
-    $('compare-oy').addEventListener('change', updateCompareOffset);
-    $('compare-oz').addEventListener('change', updateCompareOffset);
+    ['compare-ox', 'compare-oy', 'compare-oz'].forEach(id =>
+        $(id).addEventListener('input', updateCompareOffset));
     const updateCompareRotation = () => {
         viewer.setCompareRotation(
             parseFloat($('compare-rx').value) || 0,
@@ -301,12 +352,31 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             parseFloat($('compare-rz').value) || 0
         );
     };
-    $('compare-rx').addEventListener('change', updateCompareRotation);
-    $('compare-ry').addEventListener('change', updateCompareRotation);
-    $('compare-rz').addEventListener('change', updateCompareRotation);
+    ['compare-rx', 'compare-ry', 'compare-rz'].forEach(id =>
+        $(id).addEventListener('input', updateCompareRotation));
+
+    // ── Compare panel drag ──
+    {
+        const panel = $('compare-panel');
+        const header = panel.querySelector('.compare-header');
+        let dragging = false, dx = 0, dy = 0;
+        header.addEventListener('pointerdown', e => {
+            dragging = true; dx = e.clientX - panel.offsetLeft; dy = e.clientY - panel.offsetTop;
+            header.setPointerCapture(e.pointerId);
+        });
+        header.addEventListener('pointermove', e => {
+            if (!dragging) return;
+            panel.style.left = (e.clientX - dx) + 'px';
+            panel.style.top = (e.clientY - dy) + 'px';
+        });
+        header.addEventListener('pointerup', () => { dragging = false; });
+    }
     $('btn-compare-save').addEventListener('click', async () => {
         const btn = $('btn-compare-save');
-        if (!uiState.compareBPath) {
+        const { getCurrentPath } = await import('./analysis.js');
+        const pathA = getCurrentPath();
+        const pathB = uiState.compareBPath;
+        if (!pathB) {
             showToast('No compare map loaded', 'error');
             return;
         }
@@ -318,16 +388,16 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         const rz = parseFloat($('compare-rz').value) || 0;
         await withLoading(btn, async () => {
             try {
-                showLoading('Saving compare map B...');
+                showLoading('Merging Map A + B...');
                 const resp = await fetch('/api/save_compare_b', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: uiState.compareBPath, ox, oy, oz, rx, ry, rz }),
+                    body: JSON.stringify({ path_a: pathA || '', path_b: pathB, ox, oy, oz, rx, ry, rz }),
                 });
                 const result = await resp.json();
                 if (!resp.ok) throw new Error(result.error || 'Save failed');
-                showToast(`Saved ${result.points.toLocaleString()} pts -> ${result.name}`, 'success');
-                appendLog(`Compare B saved: ${result.name} (${result.points.toLocaleString()} pts)`, 'success');
+                showToast(`Merged: A(${(result.points_a||0).toLocaleString()}) + B(${(result.points_b||0).toLocaleString()}) = ${result.points.toLocaleString()} pts`, 'success');
+                appendLog(`Merged -> ${result.name} (${result.points.toLocaleString()} pts)`, 'success');
             } catch (err) {
                 showToast(`Save failed: ${err.message}`, 'error');
             } finally {
@@ -335,6 +405,83 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             }
         });
     });
+    // ── ICP Align ──
+    const icpDsSlider = $('icp-downsample');
+    const icpDsLabel = $('icp-ds-label');
+    if (icpDsSlider && icpDsLabel) {
+        icpDsSlider.addEventListener('input', () => {
+            icpDsLabel.textContent = Math.round(parseFloat(icpDsSlider.value) * 100) + '%';
+        });
+    }
+    $('btn-icp-align').addEventListener('click', async () => {
+        const { getCurrentPath } = await import('./analysis.js');
+        const pathA = getCurrentPath();
+        const pathB = uiState.compareBPath;
+        if (!pathA || !pathB) {
+            showToast('Load both Map A and Map B first', 'warn');
+            return;
+        }
+        const maxIter = parseInt($('icp-max-iter').value) || 50;
+        const tolerance = parseFloat($('icp-tolerance').value) || 1e-6;
+        const maxDist = parseFloat($('icp-max-dist').value) || 0;
+        const downsample = parseFloat($('icp-downsample').value) || 1.0;
+
+        // Current compare panel values as initial pose
+        const initOx = parseFloat($('compare-ox').value) || 0;
+        const initOy = parseFloat($('compare-oy').value) || 0;
+        const initOz = parseFloat($('compare-oz').value) || 0;
+        const initRx = parseFloat($('compare-rx').value) || 0;
+        const initRy = parseFloat($('compare-ry').value) || 0;
+        const initRz = parseFloat($('compare-rz').value) || 0;
+
+        showLoading('Running ICP alignment...');
+        try {
+            const res = await fetch('/api/analysis/icp', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    path_a: pathA,
+                    path_b: pathB,
+                    max_iterations: maxIter,
+                    tolerance,
+                    max_distance: maxDist > 0 ? maxDist : null,
+                    downsample,
+                    init_translation: [initOx, initOy, initOz],
+                    init_rotation: [initRx, initRy, initRz],
+                }),
+            });
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.error || 'ICP failed');
+
+            const [rx, ry, rz] = result.rotation;
+            const [tx, ty, tz] = result.translation;
+
+            // Update UI inputs
+            $('compare-rx').value = rx.toFixed(3);
+            $('compare-ry').value = ry.toFixed(3);
+            $('compare-rz').value = rz.toFixed(3);
+            $('compare-ox').value = tx.toFixed(4);
+            $('compare-oy').value = ty.toFixed(4);
+            $('compare-oz').value = tz.toFixed(4);
+
+            // Apply transform to compare cloud
+            viewer.setCompareRotation(rx, ry, rz);
+            viewer.setCompareOffset(tx, ty, tz);
+
+            // Show result info
+            const info = `ICP: ${result.iterations} iters, mean dist=${result.mean_distance.toFixed(4)}m` +
+                (result.converged ? ' (converged)' : ' (not converged)');
+            const icpResult = $('icp-result');
+            if (icpResult) icpResult.textContent = info;
+            appendLog(info, result.converged ? 'success' : 'warn');
+            showToast(info, result.converged ? 'success' : 'warn');
+        } catch (err) {
+            showToast(`ICP error: ${err.message}`, 'error');
+        } finally {
+            hideLoading();
+        }
+    });
+
     $('btn-compare-clear').addEventListener('click', () => {
         viewer.clearCompare();
         uiState.compareBPath = null;

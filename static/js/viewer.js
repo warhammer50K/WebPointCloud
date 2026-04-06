@@ -319,7 +319,9 @@ export class Viewer {
                 uMinVal:    { value: 0.0 },
                 uMaxVal:    { value: 1.0 },
                 uGamma:     { value: this.gamma },
-                uOpacity:   { value: 1.0 },
+                uOpacity:      { value: 1.0 },
+                uTintColor:    { value: new THREE.Vector3(1, 1, 1) },
+                uTintStrength: { value: 0.0 },
             },
             vertexShader: VERT,
             fragmentShader: FRAG,
@@ -1498,6 +1500,28 @@ export class Viewer {
     /* ── Undo/Redo (delegation) ── */
     undoFilter() { _undoFilter(this); }
     redoFilter() { _redoFilter(this); }
+
+    /* ── Cloud Transform ── */
+    setCloudOffset(x, y, z) {
+        if (this.pointCloud) { this.pointCloud.position.set(x, y, z); this._dirty = true; }
+    }
+    setCloudRotation(rx, ry, rz) {
+        if (this.pointCloud) {
+            const d = Math.PI / 180;
+            this.pointCloud.rotation.set(rx * d, ry * d, rz * d);
+            this._dirty = true;
+        }
+    }
+
+    /* ── Compare Tint ── */
+    setCompareTint(r, g, b, strength) {
+        if (this.compareCloud) {
+            const u = this.compareCloud.material.uniforms;
+            u.uTintColor.value.set(r, g, b);
+            u.uTintStrength.value = strength;
+            this._dirty = true;
+        }
+    }
 
     /* ── Compare Map (delegation) ── */
     loadCompareCloud(data) { _loadCompareCloud(this, data); }

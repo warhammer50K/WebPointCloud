@@ -136,6 +136,26 @@
             </div>
         </div>
 
+        <!-- Transform -->
+        <div class="panel">
+            <div class="accordion-header collapsed" data-accordion="transform">
+                <h3>Transform</h3>
+                <span class="accordion-arrow">&#9660;</span>
+            </div>
+            <div class="accordion-body collapsed" data-accordion-body="transform">
+                <div class="ctrl-row"><label class="narrow">X</label><input type="range" id="tf-x" min="-50" max="50" step="0.1" value="0" class="flex-1"><input type="number" id="tf-x-val" class="narrow" value="0" step="0.1"></div>
+                <div class="ctrl-row"><label class="narrow">Y</label><input type="range" id="tf-y" min="-50" max="50" step="0.1" value="0" class="flex-1"><input type="number" id="tf-y-val" class="narrow" value="0" step="0.1"></div>
+                <div class="ctrl-row"><label class="narrow">Z</label><input type="range" id="tf-z" min="-50" max="50" step="0.1" value="0" class="flex-1"><input type="number" id="tf-z-val" class="narrow" value="0" step="0.1"></div>
+                <div class="ctrl-row"><label class="narrow">Rx</label><input type="range" id="tf-rx" min="-180" max="180" step="0.5" value="0" class="flex-1"><input type="number" id="tf-rx-val" class="narrow" value="0" step="0.5"></div>
+                <div class="ctrl-row"><label class="narrow">Ry</label><input type="range" id="tf-ry" min="-180" max="180" step="0.5" value="0" class="flex-1"><input type="number" id="tf-ry-val" class="narrow" value="0" step="0.5"></div>
+                <div class="ctrl-row"><label class="narrow">Rz</label><input type="range" id="tf-rz" min="-180" max="180" step="0.5" value="0" class="flex-1"><input type="number" id="tf-rz-val" class="narrow" value="0" step="0.5"></div>
+                <div class="btn-row mt-6">
+                    <button class="btn flex-1" id="btn-tf-reset">Reset</button>
+                    <button class="btn primary flex-1" id="btn-tf-apply">Apply &amp; Save</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Tabs -->
         <div class="tab-bar">
             <button class="tab-btn active" data-tab="tab-analysis">Analysis</button>
@@ -193,34 +213,15 @@
         <!-- Tab: Files -->
         <div class="panel tab-content" id="tab-files">
             <div class="sub-label">Saved Maps</div>
-            <div id="map-list-wrap" class="scroll-list">
+            <div class="scroll-list" id="sidebar-map-list-wrap">
                 <div class="list-empty" id="map-list-empty">No maps found</div>
-                <div id="map-list"></div>
+                <div id="sidebar-map-list"></div>
             </div>
             <div class="btn-row mt-6">
                 <button class="btn flex-1" id="btn-refresh-maps">Refresh</button>
             </div>
         </div>
 
-        <!-- Compare Map panel -->
-        <div class="panel hidden" id="compare-panel">
-            <h3 class="metrics-header">Map Compare <span class="metrics-toggle" id="compare-close-btn" title="Close">&times;</span></h3>
-            <div class="ctrl-row"><label>Map A</label><span id="compare-a-name" class="flex-1 text-meta">-</span></div>
-            <div class="ctrl-row"><label>Map B</label><span id="compare-b-name" class="flex-1 text-meta">-</span></div>
-            <div class="ctrl-row"><label>Opacity B</label>
-                <input type="range" id="compare-opacity" min="0" max="1" step="0.05" value="0.5" class="flex-1">
-            </div>
-            <div class="ctrl-row"><label>Offset X</label><input type="number" class="narrow" id="compare-ox" value="0" step="0.1"></div>
-            <div class="ctrl-row"><label>Offset Y</label><input type="number" class="narrow" id="compare-oy" value="0" step="0.1"></div>
-            <div class="ctrl-row"><label>Offset Z</label><input type="number" class="narrow" id="compare-oz" value="0" step="0.1"></div>
-            <div class="ctrl-row"><label>Rot X (&deg;)</label><input type="number" class="narrow" id="compare-rx" value="0" step="0.5"></div>
-            <div class="ctrl-row"><label>Rot Y (&deg;)</label><input type="number" class="narrow" id="compare-ry" value="0" step="0.5"></div>
-            <div class="ctrl-row"><label>Rot Z (&deg;)</label><input type="number" class="narrow" id="compare-rz" value="0" step="0.5"></div>
-            <div class="btn-row">
-                <button class="btn primary" id="btn-compare-save">Save B</button>
-                <button class="btn danger" id="btn-compare-clear">Clear B</button>
-            </div>
-        </div>
     </aside>
     <div id="sidebar-resize-handle"></div>
 
@@ -234,6 +235,56 @@
             <div id="viewer-stats"></div>
             <div id="drop-overlay">Drop point cloud file here</div>
             <div id="poly-select-overlay"></div>
+
+            <!-- ═══ Compare floating panel ═══ -->
+            <div id="compare-panel" class="hidden">
+                <div class="compare-header">
+                    <span>Map Compare</span>
+                    <button id="compare-close-btn" title="Close">&times;</button>
+                </div>
+                <div class="compare-body">
+                    <div class="cp-row"><label>A</label><span id="compare-a-name" class="cp-val">-</span></div>
+                    <div class="cp-row"><label>B</label><span id="compare-b-name" class="cp-val">-</span></div>
+                    <div class="cp-row"><label>Color B</label>
+                        <span class="cp-color-dot" data-color="" title="Original"></span>
+                        <span class="cp-color-dot" data-color="white" title="White" style="background:#fff"></span>
+                        <span class="cp-color-dot" data-color="red" title="Red" style="background:#f44"></span>
+                        <span class="cp-color-dot" data-color="blue" title="Blue" style="background:#48f"></span>
+                    </div>
+                    <div class="cp-row"><label>Opacity</label><input type="range" id="compare-opacity" min="0" max="1" step="0.05" value="0.5"></div>
+                    <hr class="cp-sep">
+                    <div class="cp-row"><label>X</label><input type="number" class="cp-num" id="compare-ox" value="0" step="0.1"></div>
+                    <div class="cp-row"><label>Y</label><input type="number" class="cp-num" id="compare-oy" value="0" step="0.1"></div>
+                    <div class="cp-row"><label>Z</label><input type="number" class="cp-num" id="compare-oz" value="0" step="0.1"></div>
+                    <div class="cp-row"><label>Rx</label><input type="number" class="cp-num" id="compare-rx" value="0" step="0.5"></div>
+                    <div class="cp-row"><label>Ry</label><input type="number" class="cp-num" id="compare-ry" value="0" step="0.5"></div>
+                    <div class="cp-row"><label>Rz</label><input type="number" class="cp-num" id="compare-rz" value="0" step="0.5"></div>
+                    <hr class="cp-sep">
+                    <details class="cp-details">
+                        <summary>ICP Parameters</summary>
+                        <div class="cp-row"><label>Iter</label><input type="number" class="cp-num" id="icp-max-iter" value="50" min="1" max="500"></div>
+                        <div class="cp-row"><label>Tol</label><input type="number" class="cp-num" id="icp-tolerance" value="0.000001" step="0.000001"></div>
+                        <div class="cp-row"><label>MaxD</label><input type="number" class="cp-num" id="icp-max-dist" value="1.0" step="0.1" title="0 = no limit"></div>
+                        <div class="cp-row"><label>DS</label><input type="range" id="icp-downsample" min="0.01" max="1" step="0.01" value="1"><span id="icp-ds-label" class="cp-val">100%</span></div>
+                    </details>
+                    <button class="btn cp-btn" id="btn-icp-align">ICP Align</button>
+                    <div id="icp-result" class="cp-result"></div>
+                    <hr class="cp-sep">
+                    <div class="cp-actions">
+                        <button class="btn cp-btn primary" id="btn-compare-save">Merge A+B</button>
+                        <button class="btn cp-btn danger" id="btn-compare-clear">Clear B</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Legend panel -->
+            <div id="legend-panel">
+                <div id="legend-title">Height (m)</div>
+                <div id="legend-body">
+                    <canvas id="legend-canvas" width="20" height="150"></canvas>
+                    <div id="legend-labels"></div>
+                </div>
+            </div>
 
             <!-- Viewer floating toolbar -->
             <div id="viewer-toolbar">
@@ -315,6 +366,26 @@
         <div class="dialog-btns">
             <button class="btn" id="dialog-cancel">Cancel</button>
             <button class="btn primary" id="dialog-ok">OK</button>
+        </div>
+    </div>
+</div>
+
+<!-- Keyboard Shortcuts Modal -->
+<div class="modal-bg" id="modal-shortcuts">
+    <div class="modal modal-sm">
+        <div class="modal-header">
+            <h2>Keyboard Shortcuts</h2>
+            <button class="modal-close" id="btn-shortcuts-close">&times;</button>
+        </div>
+        <div class="modal-body" style="font-size:13px">
+            <table style="width:100%;border-collapse:collapse">
+                <tr><td><kbd>1-5</kbd></td><td>Switch view (Free / Top / XY / XZ / YZ)</td></tr>
+                <tr><td><kbd>G</kbd></td><td>Toggle grid</td></tr>
+                <tr><td><kbd>R</kbd></td><td>Reset camera</td></tr>
+                <tr><td><kbd>B</kbd></td><td>Quick save bookmark</td></tr>
+                <tr><td><kbd>?</kbd> / <kbd>H</kbd></td><td>Show this help</td></tr>
+                <tr><td><kbd>Esc</kbd></td><td>Close modal</td></tr>
+            </table>
         </div>
     </div>
 </div>

@@ -3,7 +3,8 @@
    Clipping, Bookmarks, Post filters, Downsample
    ═══════════════════════════════════════════════════════ */
 import { $, safeGetItem, safeSetItem } from './utils.js';
-import { showToast, customPrompt } from './ui-notifications.js';
+import { showToast, customPrompt, showLoading, hideLoading } from './ui-notifications.js';
+import { appendLog } from './ui-panels.js';
 
 /**
  * @param {import('./viewer.js').Viewer} viewer
@@ -176,6 +177,68 @@ export function initViewControls(viewer, legend, deps, uiState) {
         clipCheckboxes.forEach(id => {
             const el = $(id);
             if (el) { el.addEventListener('change', updateClipIndicator); }
+        });
+    }
+
+    // ── Transform panel ──
+    {
+        const axes = ['tf-x', 'tf-y', 'tf-z', 'tf-rx', 'tf-ry', 'tf-rz'];
+        // Sync slider ↔ spin
+        axes.forEach(id => {
+            const slider = $(id);
+            const spin = $(`${id}-val`);
+            if (!slider || !spin) return;
+            slider.addEventListener('input', () => { spin.value = slider.value; applyTf(); });
+            spin.addEventListener('input', () => { slider.value = spin.value; applyTf(); });
+        });
+
+        function applyTf() {
+            viewer.setCloudOffset(
+                parseFloat($('tf-x').value) || 0,
+                parseFloat($('tf-y').value) || 0,
+                parseFloat($('tf-z').value) || 0
+            );
+            viewer.setCloudRotation(
+                parseFloat($('tf-rx').value) || 0,
+                parseFloat($('tf-ry').value) || 0,
+                parseFloat($('tf-rz').value) || 0
+            );
+        }
+
+        $('btn-tf-reset').addEventListener('click', () => {
+            axes.forEach(id => { $(id).value = 0; $(`${id}-val`).value = 0; });
+            applyTf();
+        });
+
+        $('btn-tf-apply').addEventListener('click', async () => {
+            const { getCurrentPath } = await import('./analysis.js');
+            const path = getCurrentPath();
+            if (!path) { showToast('Load a point cloud first', 'warn'); return; }
+            const ox = parseFloat($('tf-x').value) || 0;
+            const oy = parseFloat($('tf-y').value) || 0;
+            const oz = parseFloat($('tf-z').value) || 0;
+            const rx = parseFloat($('tf-rx').value) || 0;
+            const ry = parseFloat($('tf-ry').value) || 0;
+            const rz = parseFloat($('tf-rz').value) || 0;
+            if (ox === 0 && oy === 0 && oz === 0 && rx === 0 && ry === 0 && rz === 0) {
+                showToast('No transform to apply', 'warn'); return;
+            }
+            showLoading('Saving transformed cloud...');
+            try {
+                const resp = await fetch('/api/save_transformed', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path, ox, oy, oz, rx, ry, rz }),
+                });
+                const result = await resp.json();
+                if (!resp.ok) throw new Error(result.error || 'Save failed');
+                showToast(`Saved: ${result.points.toLocaleString()} pts -> ${result.name}`, 'success');
+                appendLog(`Transform saved: ${result.name} (${result.points.toLocaleString()} pts)`, 'success');
+            } catch (err) {
+                showToast(`Save failed: ${err.message}`, 'error');
+            } finally {
+                hideLoading();
+            }
         });
     }
 }

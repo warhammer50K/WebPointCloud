@@ -19,6 +19,10 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 
 ![View Controls](docs/demo_controls.gif)
 
+**ICP Registration**
+
+![ICP Registration](docs/demo_icp.gif)
+
 ---
 
 ## Features
@@ -29,6 +33,7 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 - **Post-Processing** — Eye-Dome Lighting (EDL), Screen-Space Ambient Occlusion (SSAO)
 - **Measurement Tools** — Distance measurement, polygon selection, point info
 - **Map Comparison** — Overlay two point clouds with transform controls (offset + rotation)
+- **ICP Registration** — Iterative Closest Point alignment with initial pose support
 - **Clipping Planes** — X/Y/Z axis clipping
 - **Camera Bookmarks** — Save and restore camera positions
 

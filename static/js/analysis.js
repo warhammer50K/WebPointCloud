@@ -16,6 +16,8 @@ export function setCurrentPath(path) {
     }
 }
 
+export function getCurrentPath() { return _currentPath; }
+
 export function initAnalysis(viewer, deps, uiState) {
     _viewer = viewer;
 

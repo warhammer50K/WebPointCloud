@@ -56,6 +56,8 @@ void main() {
 
 export const FRAG = `
 uniform float uOpacity;
+uniform vec3  uTintColor;
+uniform float uTintStrength;
 varying vec3 vColor;
 #include <clipping_planes_pars_fragment>
 void main() {
@@ -64,7 +66,8 @@ void main() {
     float r2 = dot(c, c);
     if (r2 > 0.25) discard;
     float alpha = uOpacity * smoothstep(0.25, 0.1, r2);
-    gl_FragColor = vec4(vColor, alpha);
+    vec3 col = mix(vColor, uTintColor, uTintStrength);
+    gl_FragColor = vec4(col, alpha);
 }
 `;
 
