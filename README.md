@@ -34,6 +34,7 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 - **Measurement Tools** — Distance measurement, polygon selection, point info
 - **Map Comparison** — Overlay two point clouds with transform controls (offset + rotation)
 - **ICP Registration** — Iterative Closest Point alignment with initial pose support
+- **Large Coordinate Support** — UTM / survey coordinates handled with automatic float64 centering to prevent precision loss
 - **Clipping Planes** — X/Y/Z axis clipping
 - **Camera Bookmarks** — Save and restore camera positions
 
@@ -76,6 +77,21 @@ A sample point cloud is included at `sample/building_scan.las` (100k points) —
 | XYZ | `.xyz` `.txt` `.csv` | Whitespace or comma delimited |
 | PCD | `.pcd` | Point Cloud Library format (ASCII and binary) |
 | PTS | `.pts` | Leica / common scanner ASCII format |
+
+### Large Coordinate / UTM Handling
+
+Point clouds from surveying or GIS workflows often use UTM or other projected coordinate systems with large absolute values (e.g., X=712345, Y=7034567). Storing these directly in float32 causes visible precision loss (jitter, staircase artifacts).
+
+WebPointCloud handles this automatically:
+
+1. **Read in float64** — raw coordinates are loaded at full double precision
+2. **Compute center offset** — bounding-box midpoint is extracted as a float64 offset `(ox, oy, oz)`
+3. **Center & convert** — coordinates are centered (`x - ox`) in float64, then cast to float32 for GPU rendering
+4. **Reconstruct on display** — point info, legend, and analysis results add the offset back to show original coordinates
+
+When two clouds are loaded for comparison, the offset difference is applied automatically so they align correctly in the scene even if they come from different UTM zones or reference frames.
+
+No configuration is required — just load the file and coordinates are preserved to sub-millimeter precision regardless of their absolute magnitude.
 
 ## Configuration
 
