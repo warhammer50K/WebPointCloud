@@ -81,7 +81,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                     $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
                 });
                 viewer.loadPointCloud(data);
-                legend.update(viewer.colorMode, data.bounds);
+                legend.update(viewer.colorMode, data.bounds, data.offset ? data.offset[2] : 0);
                 if (data.savedPath) {
                     const { setCurrentPath } = await import('./analysis.js');
                     setCurrentPath(data.savedPath);
@@ -184,7 +184,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                         try {
                             const data = await loadLasFromPath(fullPath);
                             viewer.loadPointCloud(data);
-                            legend.update(viewer.colorMode, data.bounds);
+                            legend.update(viewer.colorMode, data.bounds, data.offset ? data.offset[2] : 0);
                             $('compare-a-name').textContent = `${mapName}/${f}`;
                             // Set current path for analysis
                             const { setCurrentPath } = await import('./analysis.js');
@@ -299,7 +299,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         try {
             const data = await uploadLasFile(file);
             viewer.loadPointCloud(data);
-            legend.update(viewer.colorMode, data.bounds);
+            legend.update(viewer.colorMode, data.bounds, data.offset ? data.offset[2] : 0);
             $('no-data-msg').style.display = 'none';
             $('st-main').textContent = `Loaded ${data.numPoints.toLocaleString()} points`;
             appendLog(`Loaded ${file.name} (${data.numPoints.toLocaleString()} pts)`, 'success');

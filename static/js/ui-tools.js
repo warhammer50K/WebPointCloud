@@ -29,7 +29,7 @@ export function initToolControls(viewer, legend, deps, uiState) {
             const result = await viewer.applyPolyFilter(false);
             if (result) {
                 showToast(`Deleted selection. Remaining: ${result.total.toLocaleString()} pts`, 'info');
-                legend.update(viewer.colorMode, viewer.bounds);
+                legend.update(viewer.colorMode, viewer.bounds, viewer.coordOffset ? viewer.coordOffset[2] : 0);
             }
         } catch (e) { showToast(`Filter error: ${e.message}`, 'error'); }
         finally { hideLoading(); }
@@ -40,7 +40,7 @@ export function initToolControls(viewer, legend, deps, uiState) {
             const result = await viewer.applyPolyFilter(true);
             if (result) {
                 showToast(`Kept selection. Remaining: ${result.total.toLocaleString()} pts`, 'info');
-                legend.update(viewer.colorMode, viewer.bounds);
+                legend.update(viewer.colorMode, viewer.bounds, viewer.coordOffset ? viewer.coordOffset[2] : 0);
             }
         } catch (e) { showToast(`Filter error: ${e.message}`, 'error'); }
         finally { hideLoading(); }

@@ -43,14 +43,39 @@ def read_pointcloud(path):
 def arrays_to_binary(x, y, z, intensity, r, g, b, n):
     """Pack point cloud arrays into binary format for the web viewer.
 
-    Format: header (n, stride=7) + bounds (8 floats) + data (n*7 floats)
+    Coordinates are centered by subtracting the bounding-box midpoint in
+    float64 *before* converting to float32, avoiding precision loss with
+    large UTM-style coordinates.
+
+    Format: header(8) + offset(24, 3×float64) + bounds(32, 8×float32) + data(n×7 float32)
     """
-    data = np.column_stack([x, y, z, intensity, r, g, b]).astype(np.float32)
-    bounds = np.array([
-        x.min(), x.max(), y.min(), y.max(), z.min(), z.max(), 0.0, 1.0
-    ], dtype=np.float32)
+    x64 = np.asarray(x, dtype=np.float64)
+    y64 = np.asarray(y, dtype=np.float64)
+    z64 = np.asarray(z, dtype=np.float64)
+
+    if n > 0:
+        ox = (float(x64.min()) + float(x64.max())) / 2.0
+        oy = (float(y64.min()) + float(y64.max())) / 2.0
+        oz = (float(z64.min()) + float(z64.max())) / 2.0
+    else:
+        ox = oy = oz = 0.0
+
+    xc = (x64 - ox).astype(np.float32)
+    yc = (y64 - oy).astype(np.float32)
+    zc = (z64 - oz).astype(np.float32)
+
+    if n > 0:
+        data = np.column_stack([xc, yc, zc, intensity, r, g, b]).astype(np.float32)
+        bounds = np.array([
+            xc.min(), xc.max(), yc.min(), yc.max(), zc.min(), zc.max(), 0.0, 1.0
+        ], dtype=np.float32)
+    else:
+        data = np.empty((0, 7), dtype=np.float32)
+        bounds = np.zeros(8, dtype=np.float32)
+
     header = struct.pack('<II', n, 7)
-    return header + bounds.tobytes() + data.tobytes()
+    offset = struct.pack('<ddd', ox, oy, oz)
+    return header + offset + bounds.tobytes() + data.tobytes()
 
 
 # ══════════════════════════════════════════════════════
@@ -62,9 +87,9 @@ def _read_las(path):
     las = laspy.read(path)
     n = len(las.points)
 
-    x = np.array(las.x, dtype=np.float32)
-    y = np.array(las.y, dtype=np.float32)
-    z = np.array(las.z, dtype=np.float32)
+    x = np.array(las.x, dtype=np.float64)
+    y = np.array(las.y, dtype=np.float64)
+    z = np.array(las.z, dtype=np.float64)
 
     if hasattr(las, 'intensity'):
         intensity = np.array(las.intensity, dtype=np.float32)
@@ -200,15 +225,15 @@ def _read_ply(path):
             raise ValueError(f'Unsupported PLY format: {fmt}')
 
     # Extract fields by name
-    def _col(names):
+    def _col(names, dtype=np.float32):
         for name in names:
             if name in prop_names:
-                return data[:, prop_names.index(name)].astype(np.float32)
+                return data[:, prop_names.index(name)].astype(dtype)
         return None
 
-    x = _col(['x'])
-    y = _col(['y'])
-    z = _col(['z'])
+    x = _col(['x'], np.float64)
+    y = _col(['y'], np.float64)
+    z = _col(['z'], np.float64)
     if x is None or y is None or z is None:
         raise ValueError('PLY file missing x, y, or z vertex properties')
 
@@ -292,7 +317,7 @@ def _read_xyz(path):
 
     # Pad short rows
     max_cols = max(len(r) for r in rows)
-    data = np.array([r + [0.0] * (max_cols - len(r)) for r in rows], dtype=np.float32)
+    data = np.array([r + [0.0] * (max_cols - len(r)) for r in rows], dtype=np.float64)
     n = len(data)
 
     x = data[:, 0]
@@ -302,11 +327,13 @@ def _read_xyz(path):
     cols = data.shape[1]
     if cols >= 7:
         # x y z intensity r g b
-        intensity = data[:, 3]
+        intensity = data[:, 3].astype(np.float32)
         imax = intensity.max()
         if imax > 0:
             intensity /= imax
-        r, g, b = data[:, 4], data[:, 5], data[:, 6]
+        r = data[:, 4].astype(np.float32)
+        g = data[:, 5].astype(np.float32)
+        b = data[:, 6].astype(np.float32)
         rmax = max(r.max(), 1)
         if rmax > 1.0:
             r /= 255.0; g /= 255.0; b /= 255.0
@@ -314,14 +341,16 @@ def _read_xyz(path):
     elif cols >= 6:
         # x y z r g b
         intensity = np.zeros(n, dtype=np.float32)
-        r, g, b = data[:, 3], data[:, 4], data[:, 5]
+        r = data[:, 3].astype(np.float32)
+        g = data[:, 4].astype(np.float32)
+        b = data[:, 5].astype(np.float32)
         rmax = max(r.max(), 1)
         if rmax > 1.0:
             r /= 255.0; g /= 255.0; b /= 255.0
         has_rgb = True
     elif cols >= 4:
         # x y z intensity
-        intensity = data[:, 3]
+        intensity = data[:, 3].astype(np.float32)
         imax = intensity.max()
         if imax > 0:
             intensity /= imax
@@ -418,17 +447,17 @@ def _read_pcd(path):
             raise ValueError(f'Unsupported PCD data mode: {data_mode}')
 
     # Map fields
-    def _col(names):
+    def _col(names, dtype=np.float32):
         for name in names:
             if name in fields:
                 idx = fields.index(name)
                 if idx < raw.shape[1]:
-                    return raw[:, idx].astype(np.float32)
+                    return raw[:, idx].astype(dtype)
         return None
 
-    x = _col(['x'])
-    y = _col(['y'])
-    z = _col(['z'])
+    x = _col(['x'], np.float64)
+    y = _col(['y'], np.float64)
+    z = _col(['z'], np.float64)
     if x is None or y is None or z is None:
         raise ValueError('PCD file missing x, y, or z fields')
 
@@ -513,7 +542,7 @@ def _read_pts(path):
         return _empty_result()
 
     max_cols = max(len(r) for r in rows)
-    data = np.array([r + [0.0] * (max_cols - len(r)) for r in rows], dtype=np.float32)
+    data = np.array([r + [0.0] * (max_cols - len(r)) for r in rows], dtype=np.float64)
     n = len(data)
 
     x = data[:, 0]
@@ -523,17 +552,19 @@ def _read_pts(path):
 
     if cols >= 7:
         # x y z intensity r g b
-        intensity = data[:, 3]
+        intensity = data[:, 3].astype(np.float32)
         imax = intensity.max()
         if imax > 0:
             intensity /= imax
-        r, g, b = data[:, 4], data[:, 5], data[:, 6]
+        r = data[:, 4].astype(np.float32)
+        g = data[:, 5].astype(np.float32)
+        b = data[:, 6].astype(np.float32)
         rmax = max(r.max(), 1)
         if rmax > 1.0:
             r /= 255.0; g /= 255.0; b /= 255.0
         has_rgb = True
     elif cols >= 4:
-        intensity = data[:, 3]
+        intensity = data[:, 3].astype(np.float32)
         imax = intensity.max()
         if imax > 0:
             intensity /= imax
@@ -562,9 +593,9 @@ def _read_pts(path):
 
 def _empty_result():
     return {
-        'x': np.array([], dtype=np.float32),
-        'y': np.array([], dtype=np.float32),
-        'z': np.array([], dtype=np.float32),
+        'x': np.array([], dtype=np.float64),
+        'y': np.array([], dtype=np.float64),
+        'z': np.array([], dtype=np.float64),
         'intensity': np.array([], dtype=np.float32),
         'r': np.array([], dtype=np.float32),
         'g': np.array([], dtype=np.float32),

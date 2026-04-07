@@ -36,7 +36,7 @@ export function initViewControls(viewer, legend, deps, uiState) {
     // ── Color mode ──
     $('sel-color').addEventListener('change', e => {
         viewer.setColorMode(e.target.value);
-        legend.update(e.target.value, viewer.bounds);
+        legend.update(e.target.value, viewer.bounds, viewer.coordOffset ? viewer.coordOffset[2] : 0);
     });
 
     // ── Gamma ──

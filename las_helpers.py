@@ -14,9 +14,9 @@ def read_las_to_arrays(path):
     las = laspy.read(path)
     n = len(las.points)
 
-    x = np.array(las.x, dtype=np.float32)
-    y = np.array(las.y, dtype=np.float32)
-    z = np.array(las.z, dtype=np.float32)
+    x = np.array(las.x, dtype=np.float64)
+    y = np.array(las.y, dtype=np.float64)
+    z = np.array(las.z, dtype=np.float64)
 
     if hasattr(las, 'intensity'):
         intensity = np.array(las.intensity, dtype=np.float32)
@@ -53,14 +53,39 @@ def read_las_to_arrays(path):
 def arrays_to_binary(x, y, z, intensity, r, g, b, n):
     """Pack point cloud arrays into binary format for the web viewer.
 
-    Format: header (n, stride=7) + bounds (8 floats) + data (n*7 floats)
+    Coordinates are centered by subtracting the bounding-box midpoint in
+    float64 *before* converting to float32, avoiding precision loss with
+    large UTM-style coordinates.
+
+    Format: header(8) + offset(24, 3×float64) + bounds(32, 8×float32) + data(n×7 float32)
     """
-    data = np.column_stack([x, y, z, intensity, r, g, b]).astype(np.float32)
-    bounds = np.array([
-        x.min(), x.max(), y.min(), y.max(), z.min(), z.max(), 0.0, 1.0
-    ], dtype=np.float32)
+    x64 = np.asarray(x, dtype=np.float64)
+    y64 = np.asarray(y, dtype=np.float64)
+    z64 = np.asarray(z, dtype=np.float64)
+
+    if n > 0:
+        ox = (float(x64.min()) + float(x64.max())) / 2.0
+        oy = (float(y64.min()) + float(y64.max())) / 2.0
+        oz = (float(z64.min()) + float(z64.max())) / 2.0
+    else:
+        ox = oy = oz = 0.0
+
+    xc = (x64 - ox).astype(np.float32)
+    yc = (y64 - oy).astype(np.float32)
+    zc = (z64 - oz).astype(np.float32)
+
+    if n > 0:
+        data = np.column_stack([xc, yc, zc, intensity, r, g, b]).astype(np.float32)
+        bounds = np.array([
+            xc.min(), xc.max(), yc.min(), yc.max(), zc.min(), zc.max(), 0.0, 1.0
+        ], dtype=np.float32)
+    else:
+        data = np.empty((0, 7), dtype=np.float32)
+        bounds = np.zeros(8, dtype=np.float32)
+
     header = struct.pack('<II', n, 7)
-    return header + bounds.tobytes() + data.tobytes()
+    offset = struct.pack('<ddd', ox, oy, oz)
+    return header + offset + bounds.tobytes() + data.tobytes()
 
 
 def write_las(path, x, y, z, intensity=None, r=None, g=None, b=None,

@@ -192,7 +192,10 @@ export function initPointInfo(viewer) {
         if (hits.length === 0) { infoEl.style.display = 'none'; return; }
         const hit = hits[0];
         const pt = hit.point;
-        let info = `X: ${pt.x.toFixed(3)}  Y: ${pt.y.toFixed(3)}  Z: ${pt.z.toFixed(3)}`;
+        const _ox = viewer.coordOffset ? viewer.coordOffset[0] : 0;
+        const _oy = viewer.coordOffset ? viewer.coordOffset[1] : 0;
+        const _oz = viewer.coordOffset ? viewer.coordOffset[2] : 0;
+        let info = `X: ${(pt.x+_ox).toFixed(3)}  Y: ${(pt.y+_oy).toFixed(3)}  Z: ${(pt.z+_oz).toFixed(3)}`;
         const intAttr = hit.object?.geometry?.getAttribute('intensity');
         if (intAttr && hit.index != null) info += `  I: ${intAttr.getX(hit.index).toFixed(3)}`;
         infoEl.style.display = 'block';
@@ -233,7 +236,10 @@ export function initPointInfo(viewer) {
         if (hits.length === 0) return;
         const hit = hits[0];
         const pt = hit.point;
-        let info = `X: ${pt.x.toFixed(3)}  Y: ${pt.y.toFixed(3)}  Z: ${pt.z.toFixed(3)}`;
+        const _ox2 = viewer.coordOffset ? viewer.coordOffset[0] : 0;
+        const _oy2 = viewer.coordOffset ? viewer.coordOffset[1] : 0;
+        const _oz2 = viewer.coordOffset ? viewer.coordOffset[2] : 0;
+        let info = `X: ${(pt.x+_ox2).toFixed(3)}  Y: ${(pt.y+_oy2).toFixed(3)}  Z: ${(pt.z+_oz2).toFixed(3)}`;
         const intAttr = hit.object?.geometry?.getAttribute('intensity');
         if (intAttr && hit.index != null) info += `  I: ${intAttr.getX(hit.index).toFixed(3)}`;
         infoEl.style.display = 'block';

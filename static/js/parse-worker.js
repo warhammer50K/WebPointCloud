@@ -16,7 +16,7 @@ function computeBounds(positions, n) {
     return { xMin, xMax, yMin, yMax, zMin, zMax, iMin: 0, iMax: 1 };
 }
 
-function parseRealtime(n, buffer) {
+function parseRealtime(n, buffer, offset) {
     const expectedBytes = n * 7 * 4;
     if (buffer.byteLength < expectedBytes) {
         n = Math.floor(buffer.byteLength / (7 * 4));
@@ -36,7 +36,7 @@ function parseRealtime(n, buffer) {
         colors[i*3 + 2]    = raw[b + 6];
     }
     const bounds = computeBounds(positions, n);
-    return { positions, intensities, colors, bounds, numPoints: n };
+    return { positions, intensities, colors, bounds, numPoints: n, offset: offset || null };
 }
 
 function parseBinary(buffer) {
@@ -44,8 +44,15 @@ function parseBinary(buffer) {
     let numPoints = view.getUint32(0, true);
     const fpp = view.getUint32(4, true);
 
-    const bo = 8;
-    const dataOffset = bo + 32;
+    // Coordinate offset (3× float64 = 24 bytes at offset 8)
+    const offset = new Float64Array([
+        view.getFloat64(8, true),
+        view.getFloat64(16, true),
+        view.getFloat64(24, true),
+    ]);
+
+    const bo = 32;                // bounds start after header(8) + offset(24)
+    const dataOffset = bo + 32;   // data starts after bounds(32)
     const availableFloats = (buffer.byteLength - dataOffset) / 4;
     if (numPoints * fpp > availableFloats) {
         numPoints = Math.floor(availableFloats / fpp);
@@ -74,7 +81,7 @@ function parseBinary(buffer) {
         colors[i * 3 + 1]    = raw[b + 5];
         colors[i * 3 + 2]    = raw[b + 6];
     }
-    return { positions, intensities, colors, bounds, numPoints };
+    return { positions, intensities, colors, bounds, numPoints, offset };
 }
 
 /* ── Point-in-polygon (ray casting) ── */
@@ -165,7 +172,7 @@ self.onmessage = function(e) {
     try {
         if (type === 'realtime') {
             const buf = compressed ? zlibDecompress(buffer) : buffer;
-            result = parseRealtime(n, buf);
+            result = parseRealtime(n, buf, e.data.offset || null);
         } else if (type === 'filter') {
             result = filterPoints(e.data);
         } else {
@@ -178,5 +185,6 @@ self.onmessage = function(e) {
     // send via Transferable — zero copy cost
     const transferables = [result.positions.buffer, result.intensities.buffer];
     if (result.colors) transferables.push(result.colors.buffer);
+    if (result.offset) transferables.push(result.offset.buffer);
     self.postMessage({ id, ...result }, transferables);
 };

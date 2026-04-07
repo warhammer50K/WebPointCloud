@@ -52,6 +52,7 @@ export class Viewer {
         this._fullCloudData = null;   // original data (for restoring after downsampling)
         this._dsRatio = 1.0;          // current downsampling ratio (1.0 = original)
         this.bounds = null;
+        this.coordOffset = null;      // Float64Array([ox,oy,oz]) — add back for original coords
         this.pointCloud = null;
         this.pointSize = 0.05;
         this.colorMode = 'intensity';
@@ -363,6 +364,7 @@ export class Viewer {
         const display = this._downsampleData(data, this._dsRatio);
         this.cloudData = display;
         this.bounds = data.bounds;
+        this.coordOffset = data.offset || null;
 
         // B-3: reset undo/redo stacks on map switch (prevent memory leak)
         this._undoStack.length = 0;
@@ -462,7 +464,7 @@ export class Viewer {
                 colors[o3 + 2] = data.colors[i3 + 2];
             }
         }
-        return { positions, intensities, colors, numPoints: outN, bounds: data.bounds };
+        return { positions, intensities, colors, numPoints: outN, bounds: data.bounds, offset: data.offset };
     }
 
     setDownsampleRatio(ratio) {
@@ -1053,8 +1055,11 @@ export class Viewer {
         const connected = this._constraintEdgesAll.filter(
             e => e.id0 === kfIdx || e.id1 === kfIdx
         );
+        const _ox = this.coordOffset ? this.coordOffset[0] : 0;
+        const _oy = this.coordOffset ? this.coordOffset[1] : 0;
+        const _oz = this.coordOffset ? this.coordOffset[2] : 0;
         let html = `<b>KF #${kfIdx}</b><br>` +
-            `x: ${pos.x.toFixed(2)}  y: ${pos.y.toFixed(2)}  z: ${pos.z.toFixed(2)}`;
+            `x: ${(pos.x+_ox).toFixed(2)}  y: ${(pos.y+_oy).toFixed(2)}  z: ${(pos.z+_oz).toFixed(2)}`;
         if (connected.length > 0) {
             html += `<br><b>LC (${connected.length})</b>`;
             for (const lc of connected.slice(0, 8)) {
@@ -1332,11 +1337,14 @@ export class Viewer {
         if (this.rawCloud) total += dc(this.rawCloud.geometry);
         if (this.curCloud) total += dc(this.curCloud.geometry);
         for (const c of this.kfrmClouds) total += dc(c.geometry);
+        const ox = this.coordOffset ? this.coordOffset[0] : 0;
+        const oy = this.coordOffset ? this.coordOffset[1] : 0;
+        const oz = this.coordOffset ? this.coordOffset[2] : 0;
         el.textContent =
             `Total: ${total.toLocaleString()} pts\n` +
-            `X: [${b.xMin.toFixed(1)} ~ ${b.xMax.toFixed(1)}] ${(b.xMax-b.xMin).toFixed(1)}m\n` +
-            `Y: [${b.yMin.toFixed(1)} ~ ${b.yMax.toFixed(1)}] ${(b.yMax-b.yMin).toFixed(1)}m\n` +
-            `Z: [${b.zMin.toFixed(1)} ~ ${b.zMax.toFixed(1)}] ${(b.zMax-b.zMin).toFixed(1)}m\n` +
+            `X: [${(b.xMin+ox).toFixed(1)} ~ ${(b.xMax+ox).toFixed(1)}] ${(b.xMax-b.xMin).toFixed(1)}m\n` +
+            `Y: [${(b.yMin+oy).toFixed(1)} ~ ${(b.yMax+oy).toFixed(1)}] ${(b.yMax-b.yMin).toFixed(1)}m\n` +
+            `Z: [${(b.zMin+oz).toFixed(1)} ~ ${(b.zMax+oz).toFixed(1)}] ${(b.zMax-b.zMin).toFixed(1)}m\n` +
             `Keyframes: ${this.kfrmClouds.length}`;
         el.style.display = 'block';
         if (!this.clipEnabled) {
@@ -1543,19 +1551,20 @@ export class Legend {
         this.titleEl = document.getElementById('legend-title');
     }
 
-    update(mode, bounds) {
+    update(mode, bounds, zOffset) {
         if (mode === 'rgb') {
             this.panel.classList.remove('visible');
             return;
         }
         this.panel.classList.add('visible');
 
+        const oz = zOffset || 0;
         let min, max, title;
         if (mode === 'intensity') {
             min = 0; max = 1; title = 'Intensity';
         } else {
-            min = bounds ? bounds.zMin : 0;
-            max = bounds ? bounds.zMax : 1;
+            min = bounds ? bounds.zMin + oz : 0;
+            max = bounds ? bounds.zMax + oz : 1;
             title = 'Height (m)';
         }
         this.titleEl.textContent = title;
