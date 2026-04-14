@@ -119,6 +119,153 @@ void main() {
 }
 `;
 
+/* ═══════════════════════════════════════════════════════
+   Gaussian Splatting Shaders
+   ═══════════════════════════════════════════════════════ */
+
+export const GAUSSIAN_VERT = `
+precision highp float;
+
+// Quad vertex position (base geometry: 4 vertices of a unit quad)
+// position is the standard Three.js attribute: (-1,-1,0), (1,-1,0), (1,1,0), (-1,1,0)
+
+// Per-instance attributes
+attribute vec3  splatCenter;
+attribute vec3  splatScale;
+attribute vec4  splatRotation;  // quaternion (w, x, y, z)
+attribute vec3  splatColor;
+attribute float splatOpacity;
+
+uniform vec2 uViewport;
+uniform vec2 uFocal;
+
+varying vec4 vColor;
+varying vec2 vPosition;   // position within the quad for gaussian falloff
+varying vec3 vConic;       // inverse 2D covariance (upper triangle: a, b, c)
+
+mat3 quatToMat3(vec4 q) {
+    float w = q.x, x = q.y, y = q.z, z = q.w;
+    return mat3(
+        1.0 - 2.0*(y*y + z*z),  2.0*(x*y + w*z),        2.0*(x*z - w*y),
+        2.0*(x*y - w*z),        1.0 - 2.0*(x*x + z*z),  2.0*(y*z + w*x),
+        2.0*(x*z + w*y),        2.0*(y*z - w*x),         1.0 - 2.0*(x*x + y*y)
+    );
+}
+
+void main() {
+    // Transform center to view space
+    vec4 viewCenter = modelViewMatrix * vec4(splatCenter, 1.0);
+    vec4 clipCenter = projectionMatrix * viewCenter;
+
+    // Skip if behind camera
+    if (clipCenter.w <= 0.0) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
+    // Build rotation matrix from quaternion
+    mat3 R = quatToMat3(splatRotation);
+
+    // Build 3D covariance: Cov3D = R * S * S^T * R^T
+    // where S = diag(scaleX, scaleY, scaleZ)
+    mat3 S = mat3(
+        splatScale.x, 0.0, 0.0,
+        0.0, splatScale.y, 0.0,
+        0.0, 0.0, splatScale.z
+    );
+    mat3 M = R * S;
+    mat3 Sigma = M * transpose(M);
+
+    // Upper-left 3x3 of modelViewMatrix (view rotation)
+    mat3 W = mat3(modelViewMatrix);
+
+    // View-space covariance
+    mat3 Sigma_view = W * Sigma * transpose(W);
+
+    // Jacobian of perspective projection
+    float fx = uFocal.x;
+    float fy = uFocal.y;
+    float tz = viewCenter.z;
+    float tz2 = tz * tz;
+
+    // J = [[fx/tz, 0, -fx*tx/tz2], [0, fy/tz, -fy*ty/tz2]]
+    // Cov2D = J * Sigma_view * J^T  (2x2 result)
+    float tx = viewCenter.x;
+    float ty = viewCenter.y;
+
+    // Compute J * Sigma_view manually for the 2x3 × 3x3 multiplication
+    // then multiply by J^T (3x2) to get 2x2
+    vec3 j0 = vec3(fx / tz, 0.0, -fx * tx / tz2);
+    vec3 j1 = vec3(0.0, fy / tz, -fy * ty / tz2);
+
+    // row0 = j0 * Sigma_view
+    vec3 r0 = Sigma_view * j0;
+    vec3 r1 = Sigma_view * j1;
+
+    // 2x2 covariance
+    float cov_a = dot(j0, r0);  // top-left
+    float cov_b = dot(j0, r1);  // off-diagonal
+    float cov_d = dot(j1, r1);  // bottom-right
+
+    // Low-pass filter to avoid aliasing (add small screen-space variance)
+    cov_a += 0.3;
+    cov_d += 0.3;
+
+    // Compute eigenvalues for bounding ellipse radius
+    float mid = 0.5 * (cov_a + cov_d);
+    float disc = max(0.1, mid * mid - (cov_a * cov_d - cov_b * cov_b));
+    float lambda1 = mid + sqrt(disc);
+    float lambda2 = mid - sqrt(disc);
+    float maxRadius = ceil(3.0 * sqrt(max(lambda1, lambda2)));
+    maxRadius = min(maxRadius, 1024.0);
+
+    // Compute inverse (conic) of 2D covariance
+    float det = cov_a * cov_d - cov_b * cov_b;
+    if (det <= 0.0) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+    float invDet = 1.0 / det;
+    vConic = vec3(cov_d * invDet, -cov_b * invDet, cov_a * invDet);
+
+    // Scale quad to cover the gaussian's footprint in pixels
+    vec2 quadPos = position.xy * maxRadius;  // pixel offset
+    vPosition = quadPos;
+
+    // Convert pixel offset to clip-space offset
+    vec2 ndcOffset = quadPos * 2.0 / uViewport;
+
+    gl_Position = clipCenter / clipCenter.w + vec4(ndcOffset, 0.0, 0.0);
+    gl_Position.z = clipCenter.z / clipCenter.w;
+    gl_Position.w = 1.0;
+
+    vColor = vec4(splatColor, splatOpacity);
+}
+`;
+
+export const GAUSSIAN_FRAG = `
+precision highp float;
+
+varying vec4 vColor;
+varying vec2 vPosition;
+varying vec3 vConic;
+
+void main() {
+    // Gaussian falloff using the conic (inverse covariance)
+    float power = -0.5 * (vConic.x * vPosition.x * vPosition.x
+                         + 2.0 * vConic.y * vPosition.x * vPosition.y
+                         + vConic.z * vPosition.y * vPosition.y);
+
+    if (power > 0.0) discard;
+
+    float alpha = min(0.99, vColor.a * exp(power));
+    if (alpha < 1.0 / 255.0) discard;
+
+    // Premultiplied alpha output
+    gl_FragColor = vec4(vColor.rgb * alpha, alpha);
+}
+`;
+
 export const POST_VERT = `
 varying vec2 vUv;
 void main() {

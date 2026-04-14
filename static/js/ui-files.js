@@ -80,7 +80,11 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                 const data = await uploadLasFile(file, pct => {
                     $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
                 });
-                viewer.loadPointCloud(data);
+                if (data.type === 'gaussian') {
+                    viewer.loadGaussianSplat(data);
+                } else {
+                    viewer.loadPointCloud(data);
+                }
                 legend.update(viewer.colorMode, data.bounds, data.offset ? data.offset[2] : 0);
                 if (data.savedPath) {
                     const { setCurrentPath } = await import('./analysis.js');
@@ -88,8 +92,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                 }
                 $('compare-a-name').textContent = file.name;
                 $('no-data-msg').style.display = 'none';
-                $('st-main').textContent = `Loaded ${data.numPoints.toLocaleString()} points`;
-                appendLog(`Loaded ${file.name} (${data.numPoints.toLocaleString()} pts)`, 'success');
+                const label = data.type === 'gaussian' ? 'gaussians' : 'points';
+                $('st-main').textContent = `Loaded ${data.numPoints.toLocaleString()} ${label}`;
+                appendLog(`Loaded ${file.name} (${data.numPoints.toLocaleString()} ${label})`, 'success');
             } catch (err) {
                 $('st-main').textContent = `Error: ${err.message}`;
                 showToast(`Failed: ${err.message}`, 'error');
@@ -183,14 +188,19 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                         showLoading(`Loading ${mapName}/${f}...`);
                         try {
                             const data = await loadLasFromPath(fullPath);
-                            viewer.loadPointCloud(data);
+                            if (data.type === 'gaussian') {
+                                viewer.loadGaussianSplat(data);
+                            } else {
+                                viewer.loadPointCloud(data);
+                            }
                             legend.update(viewer.colorMode, data.bounds, data.offset ? data.offset[2] : 0);
                             $('compare-a-name').textContent = `${mapName}/${f}`;
                             // Set current path for analysis
                             const { setCurrentPath } = await import('./analysis.js');
                             setCurrentPath(fullPath);
                             $('no-data-msg').style.display = 'none';
-                            appendLog(`Map loaded: ${mapName}/${f} (${data.numPoints.toLocaleString()} pts)`, 'success');
+                            const label = data.type === 'gaussian' ? 'gaussians' : 'pts';
+                            appendLog(`Map loaded: ${mapName}/${f} (${data.numPoints.toLocaleString()} ${label})`, 'success');
                         } catch (err) {
                             $('st-main').textContent = `Error: ${err.message}`;
                             showToast(`Failed: ${err.message}`, 'error');
@@ -293,15 +303,20 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         dragCounter = 0;
         dropOverlay.style.display = 'none';
         const file = e.dataTransfer.files[0];
-        if (!file || !file.name.match(/\.(las|laz|ply|xyz|txt|csv|pcd|pts)$/i)) return;
+        if (!file || !file.name.match(/\.(las|laz|ply|xyz|txt|csv|pcd|pts|splat)$/i)) return;
         $('st-main').textContent = `Loading ${file.name}...`;
         showLoading(`Loading ${file.name}...`);
         try {
             const data = await uploadLasFile(file);
-            viewer.loadPointCloud(data);
+            if (data.type === 'gaussian') {
+                viewer.loadGaussianSplat(data);
+            } else {
+                viewer.loadPointCloud(data);
+            }
             legend.update(viewer.colorMode, data.bounds, data.offset ? data.offset[2] : 0);
             $('no-data-msg').style.display = 'none';
-            $('st-main').textContent = `Loaded ${data.numPoints.toLocaleString()} points`;
+            const label = data.type === 'gaussian' ? 'gaussians' : 'points';
+            $('st-main').textContent = `Loaded ${data.numPoints.toLocaleString()} ${label}`;
             appendLog(`Loaded ${file.name} (${data.numPoints.toLocaleString()} pts)`, 'success');
         } catch (err) {
             $('st-main').textContent = `Error: ${err.message}`;

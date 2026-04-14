@@ -39,10 +39,73 @@ function parseRealtime(n, buffer, offset) {
     return { positions, intensities, colors, bounds, numPoints: n, offset: offset || null };
 }
 
+function parseGaussianBinary(buffer) {
+    const view = new DataView(buffer);
+    let numPoints = view.getUint32(0, true);
+    const fpp = view.getUint32(4, true); // 14
+
+    const offset = new Float64Array([
+        view.getFloat64(8, true),
+        view.getFloat64(16, true),
+        view.getFloat64(24, true),
+    ]);
+
+    const bo = 32;
+    const dataOffset = bo + 32;
+    const availableFloats = (buffer.byteLength - dataOffset) / 4;
+    if (numPoints * fpp > availableFloats) {
+        numPoints = Math.floor(availableFloats / fpp);
+    }
+
+    const bounds = {
+        xMin: view.getFloat32(bo, true),      xMax: view.getFloat32(bo + 4, true),
+        yMin: view.getFloat32(bo + 8, true),   yMax: view.getFloat32(bo + 12, true),
+        zMin: view.getFloat32(bo + 16, true),  zMax: view.getFloat32(bo + 20, true),
+        iMin: 0, iMax: 1,
+    };
+
+    const raw = new Float32Array(buffer, dataOffset, numPoints * fpp);
+    const positions  = new Float32Array(numPoints * 3);
+    const colors     = new Float32Array(numPoints * 3);
+    const scales     = new Float32Array(numPoints * 3);
+    const rotations  = new Float32Array(numPoints * 4);
+    const opacities  = new Float32Array(numPoints);
+
+    for (let i = 0; i < numPoints; i++) {
+        const b = i * 14;
+        // x, y, z
+        positions[i * 3]     = raw[b];
+        positions[i * 3 + 1] = raw[b + 1];
+        positions[i * 3 + 2] = raw[b + 2];
+        // r, g, b
+        colors[i * 3]        = raw[b + 3];
+        colors[i * 3 + 1]    = raw[b + 4];
+        colors[i * 3 + 2]    = raw[b + 5];
+        // scaleX, scaleY, scaleZ
+        scales[i * 3]        = raw[b + 6];
+        scales[i * 3 + 1]    = raw[b + 7];
+        scales[i * 3 + 2]    = raw[b + 8];
+        // rot0, rot1, rot2, rot3
+        rotations[i * 4]     = raw[b + 9];
+        rotations[i * 4 + 1] = raw[b + 10];
+        rotations[i * 4 + 2] = raw[b + 11];
+        rotations[i * 4 + 3] = raw[b + 12];
+        // opacity
+        opacities[i]         = raw[b + 13];
+    }
+
+    return { type: 'gaussian', positions, colors, scales, rotations, opacities, bounds, numPoints, offset };
+}
+
 function parseBinary(buffer) {
     const view = new DataView(buffer);
     let numPoints = view.getUint32(0, true);
     const fpp = view.getUint32(4, true);
+
+    // Detect gaussian splat data (fpp=14)
+    if (fpp === 14) {
+        return parseGaussianBinary(buffer);
+    }
 
     // Coordinate offset (3× float64 = 24 bytes at offset 8)
     const offset = new Float64Array([
@@ -183,8 +246,12 @@ self.onmessage = function(e) {
         return;
     }
     // send via Transferable — zero copy cost
-    const transferables = [result.positions.buffer, result.intensities.buffer];
+    const transferables = [result.positions.buffer];
+    if (result.intensities) transferables.push(result.intensities.buffer);
     if (result.colors) transferables.push(result.colors.buffer);
+    if (result.scales) transferables.push(result.scales.buffer);
+    if (result.rotations) transferables.push(result.rotations.buffer);
+    if (result.opacities) transferables.push(result.opacities.buffer);
     if (result.offset) transferables.push(result.offset.buffer);
     self.postMessage({ id, ...result }, transferables);
 };

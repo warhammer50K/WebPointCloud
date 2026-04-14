@@ -12,7 +12,7 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime
-from pointcloud_io import read_pointcloud, arrays_to_binary, write_las, SUPPORTED_EXTENSIONS
+from pointcloud_io import read_pointcloud, arrays_to_binary, gaussians_to_binary, write_las, SUPPORTED_EXTENSIONS
 
 api_bp = Blueprint('api', __name__)
 
@@ -179,8 +179,15 @@ def load_pointcloud():
             return jsonify({'error': f'Unsupported format: {ext}'}), 400
 
         d = read_pointcloud(path)
-        binary = arrays_to_binary(d['x'], d['y'], d['z'], d['intensity'],
-                                  d['r'], d['g'], d['b'], d['n'])
+        if d.get('type') == 'gaussian':
+            binary = gaussians_to_binary(
+                d['x'], d['y'], d['z'], d['r'], d['g'], d['b'],
+                d['scale_x'], d['scale_y'], d['scale_z'],
+                d['rot_0'], d['rot_1'], d['rot_2'], d['rot_3'],
+                d['opacity'], d['n'])
+        else:
+            binary = arrays_to_binary(d['x'], d['y'], d['z'], d['intensity'],
+                                      d['r'], d['g'], d['b'], d['n'])
         resp = send_file(io.BytesIO(binary), mimetype='application/octet-stream')
         if saved_path:
             resp.headers['X-Saved-Path'] = saved_path

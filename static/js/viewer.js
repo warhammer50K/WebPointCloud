@@ -3,7 +3,8 @@
    ═══════════════════════════════════════════════════════ */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG } from './shaders.js';
+import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG, GAUSSIAN_VERT, GAUSSIAN_FRAG } from './shaders.js';
+import { GaussianSplat } from './gaussian-splat.js';
 
 import {
     initMeasureInput, addMeasurePoint as _addMeasurePoint,
@@ -54,6 +55,7 @@ export class Viewer {
         this.bounds = null;
         this.coordOffset = null;      // Float64Array([ox,oy,oz]) — add back for original coords
         this.pointCloud = null;
+        this.gaussianSplat = null;
         this.pointSize = 0.05;
         this.colorMode = 'intensity';
         this.gamma = 0.6;
@@ -217,7 +219,10 @@ export class Viewer {
 
         // Render-on-demand
         this._dirty = true;
-        this.controls.addEventListener('change', () => { this._dirty = true; });
+        this.controls.addEventListener('change', () => {
+            this._dirty = true;
+            if (this.gaussianSplat) this.gaussianSplat.requestSort();
+        });
 
         const ro = new ResizeObserver(() => this._onResize());
         ro.observe(container);
@@ -269,6 +274,7 @@ export class Viewer {
 
 
         this.controls.update();
+        if (this.gaussianSplat) this.gaussianSplat.update();
         if (this._dirty) {
             const usePost = this.edlEnabled || this.ssaoEnabled;
             if (!usePost) {
@@ -359,6 +365,9 @@ export class Viewer {
         if (this._webglFailed) {
             return;
         }
+        // Clear gaussian splat if present (they don't coexist)
+        this.clearGaussianSplat();
+
         this._fullCloudData = data;   // keep original
         this._dsRatio = 1.0;
         const display = this._downsampleData(data, this._dsRatio);
@@ -408,6 +417,56 @@ export class Viewer {
         this._fitCamera();
         this.updateStats();
         this._dirty = true;
+    }
+
+    /* ── Load / replace gaussian splat ── */
+    loadGaussianSplat(data) {
+        if (this._webglFailed) return;
+
+        // Clear existing point cloud (they don't coexist)
+        if (this.pointCloud) {
+            this.scene.remove(this.pointCloud);
+            this.pointCloud.geometry.dispose();
+            this.pointCloud.material.dispose();
+            this.pointCloud = null;
+        }
+        this.cloudData = null;
+        this._fullCloudData = null;
+
+        // Create or reuse GaussianSplat instance
+        if (!this.gaussianSplat) {
+            this.gaussianSplat = new GaussianSplat(this);
+        }
+        this.gaussianSplat.load(data);
+
+        this.bounds = data.bounds;
+        this.coordOffset = data.offset || null;
+
+        document.getElementById('no-data-msg').style.display = 'none';
+        const ptsEl = document.getElementById('viewer-pts');
+        if (ptsEl) ptsEl.textContent = `Gaussians: ${data.numPoints.toLocaleString()}`;
+
+        // Reset clipping
+        this.resetClipping();
+
+        // Adjust camera far plane
+        if (data.bounds) {
+            const b = data.bounds;
+            const maxExtent = Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin);
+            this.camera.far = Math.max(10000, maxExtent * 3);
+            this.camera.updateProjectionMatrix();
+        }
+
+        this._fitCamera();
+        this._dirty = true;
+    }
+
+    clearGaussianSplat() {
+        if (this.gaussianSplat) {
+            this.gaussianSplat.dispose();
+            this.gaussianSplat = null;
+            this._dirty = true;
+        }
     }
 
     setColorMode(mode) {

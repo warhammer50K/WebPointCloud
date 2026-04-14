@@ -23,6 +23,10 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 
 ![ICP Registration](docs/demo_icp.gif)
 
+**3D Gaussian Splatting Viewer**
+
+![3DGS Viewer](docs/demo_3dgs.gif)
+
 ---
 
 ## Features
@@ -34,6 +38,7 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 - **Measurement Tools** — Distance measurement, polygon selection, point info
 - **Map Comparison** — Overlay two point clouds with transform controls (offset + rotation)
 - **ICP Registration** — Iterative Closest Point alignment with initial pose support
+- **3D Gaussian Splatting** — View 3DGS `.ply` and `.splat` files with real-time depth-sorted splatting (auto-detected)
 - **Large Coordinate Support** — UTM / survey coordinates handled with automatic float64 centering to prevent precision loss
 - **Clipping Planes** — X/Y/Z axis clipping
 - **Camera Bookmarks** — Save and restore camera positions
@@ -77,6 +82,8 @@ A sample point cloud is included at `sample/building_scan.las` (100k points) —
 | XYZ | `.xyz` `.txt` `.csv` | Whitespace or comma delimited |
 | PCD | `.pcd` | Point Cloud Library format (ASCII and binary) |
 | PTS | `.pts` | Leica / common scanner ASCII format |
+| 3DGS PLY | `.ply` | 3D Gaussian Splatting (auto-detected) |
+| Splat | `.splat` | Compact 3DGS binary format |
 
 ### Large Coordinate / UTM Handling
 

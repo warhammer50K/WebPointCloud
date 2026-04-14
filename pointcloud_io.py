@@ -9,7 +9,7 @@ import os
 #  Unified reader
 # ══════════════════════════════════════════════════════
 
-SUPPORTED_EXTENSIONS = {'.las', '.laz', '.ply', '.xyz', '.txt', '.csv', '.pcd', '.pts'}
+SUPPORTED_EXTENSIONS = {'.las', '.laz', '.ply', '.xyz', '.txt', '.csv', '.pcd', '.pts', '.splat'}
 
 
 def read_pointcloud(path):
@@ -32,6 +32,8 @@ def read_pointcloud(path):
         return _read_pcd(path)
     elif ext == '.pts':
         return _read_pts(path)
+    elif ext == '.splat':
+        return _read_splat(path)
     else:
         raise ValueError(f'Unsupported format: {ext}')
 
@@ -74,6 +76,54 @@ def arrays_to_binary(x, y, z, intensity, r, g, b, n):
         bounds = np.zeros(8, dtype=np.float32)
 
     header = struct.pack('<II', n, 7)
+    offset = struct.pack('<ddd', ox, oy, oz)
+    return header + offset + bounds.tobytes() + data.tobytes()
+
+
+def gaussians_to_binary(x, y, z, r, g, b, sx, sy, sz, r0, r1, r2, r3, opacity, n):
+    """Pack gaussian splat arrays into binary format for the web viewer.
+
+    Format: header(8) + offset(24) + bounds(32) + data(n×14 float32)
+    Uses fpp=14 to distinguish from point cloud data (fpp=7).
+    """
+    x64 = np.asarray(x, dtype=np.float64)
+    y64 = np.asarray(y, dtype=np.float64)
+    z64 = np.asarray(z, dtype=np.float64)
+
+    if n > 0:
+        ox = (float(x64.min()) + float(x64.max())) / 2.0
+        oy = (float(y64.min()) + float(y64.max())) / 2.0
+        oz = (float(z64.min()) + float(z64.max())) / 2.0
+    else:
+        ox = oy = oz = 0.0
+
+    xc = (x64 - ox).astype(np.float32)
+    yc = (y64 - oy).astype(np.float32)
+    zc = (z64 - oz).astype(np.float32)
+
+    if n > 0:
+        data = np.column_stack([
+            xc, yc, zc,
+            np.asarray(r, dtype=np.float32),
+            np.asarray(g, dtype=np.float32),
+            np.asarray(b, dtype=np.float32),
+            np.asarray(sx, dtype=np.float32),
+            np.asarray(sy, dtype=np.float32),
+            np.asarray(sz, dtype=np.float32),
+            np.asarray(r0, dtype=np.float32),
+            np.asarray(r1, dtype=np.float32),
+            np.asarray(r2, dtype=np.float32),
+            np.asarray(r3, dtype=np.float32),
+            np.asarray(opacity, dtype=np.float32),
+        ]).astype(np.float32)
+        bounds = np.array([
+            xc.min(), xc.max(), yc.min(), yc.max(), zc.min(), zc.max(), 0.0, 1.0
+        ], dtype=np.float32)
+    else:
+        data = np.empty((0, 14), dtype=np.float32)
+        bounds = np.zeros(8, dtype=np.float32)
+
+    header = struct.pack('<II', n, 14)
     offset = struct.pack('<ddd', ox, oy, oz)
     return header + offset + bounds.tobytes() + data.tobytes()
 
@@ -224,6 +274,11 @@ def _read_ply(path):
         else:
             raise ValueError(f'Unsupported PLY format: {fmt}')
 
+    # Detect 3DGS PLY by checking for gaussian-specific properties
+    _3dgs_required = {'f_dc_0', 'opacity', 'scale_0', 'rot_0'}
+    if _3dgs_required.issubset(set(prop_names)):
+        return _parse_gaussian_ply_data(data, prop_names, n)
+
     # Extract fields by name
     def _col(names, dtype=np.float32):
         for name in names:
@@ -263,6 +318,159 @@ def _read_ply(path):
         'intensity': intensity,
         'r': r, 'g': g, 'b': b,
         'n': n, 'has_rgb': has_rgb,
+    }
+
+
+def _parse_gaussian_ply_data(data, prop_names, n):
+    """Extract gaussian splat parameters from parsed PLY vertex data."""
+    def _col(name, dtype=np.float32):
+        if name in prop_names:
+            return data[:, prop_names.index(name)].astype(dtype)
+        return None
+
+    x = _col('x', np.float64)
+    y = _col('y', np.float64)
+    z = _col('z', np.float64)
+    if x is None or y is None or z is None:
+        raise ValueError('3DGS PLY file missing x, y, or z vertex properties')
+
+    # SH DC → RGB: color = 0.5 + C0 * f_dc
+    C0 = 0.28209479177387814
+    f_dc_0 = _col('f_dc_0')
+    f_dc_1 = _col('f_dc_1')
+    f_dc_2 = _col('f_dc_2')
+    if f_dc_0 is not None and f_dc_1 is not None and f_dc_2 is not None:
+        r = np.clip(0.5 + C0 * f_dc_0, 0, 1).astype(np.float32)
+        g = np.clip(0.5 + C0 * f_dc_1, 0, 1).astype(np.float32)
+        b = np.clip(0.5 + C0 * f_dc_2, 0, 1).astype(np.float32)
+    else:
+        r = np.full(n, 0.5, dtype=np.float32)
+        g = np.full(n, 0.5, dtype=np.float32)
+        b = np.full(n, 0.5, dtype=np.float32)
+
+    # Opacity: sigmoid(raw), clamp to avoid overflow in exp
+    opacity_raw = np.clip(_col('opacity'), -20, 20)
+    opacity = (1.0 / (1.0 + np.exp(-opacity_raw))).astype(np.float32)
+
+    # Scale: exp(raw), clamp to avoid float32 overflow (exp(89) → inf)
+    scale_x = np.exp(np.clip(_col('scale_0'), -15, 15)).astype(np.float32)
+    scale_y = np.exp(np.clip(_col('scale_1'), -15, 15)).astype(np.float32)
+    scale_z = np.exp(np.clip(_col('scale_2'), -15, 15)).astype(np.float32)
+
+    # Rotation quaternion: normalize
+    rot_0 = _col('rot_0')
+    rot_1 = _col('rot_1')
+    rot_2 = _col('rot_2')
+    rot_3 = _col('rot_3')
+    qnorm = np.sqrt(rot_0**2 + rot_1**2 + rot_2**2 + rot_3**2)
+    qnorm = np.maximum(qnorm, 1e-10)
+    rot_0 = (rot_0 / qnorm).astype(np.float32)
+    rot_1 = (rot_1 / qnorm).astype(np.float32)
+    rot_2 = (rot_2 / qnorm).astype(np.float32)
+    rot_3 = (rot_3 / qnorm).astype(np.float32)
+
+    # Filter out near-transparent gaussians (opacity < 0.01) for performance
+    mask = opacity >= 0.01
+    if not mask.all():
+        x, y, z = x[mask], y[mask], z[mask]
+        r, g, b = r[mask], g[mask], b[mask]
+        scale_x, scale_y, scale_z = scale_x[mask], scale_y[mask], scale_z[mask]
+        rot_0, rot_1, rot_2, rot_3 = rot_0[mask], rot_1[mask], rot_2[mask], rot_3[mask]
+        opacity = opacity[mask]
+        n = int(mask.sum())
+
+    return {
+        'type': 'gaussian',
+        'x': x, 'y': y, 'z': z,
+        'r': r, 'g': g, 'b': b,
+        'scale_x': scale_x, 'scale_y': scale_y, 'scale_z': scale_z,
+        'rot_0': rot_0, 'rot_1': rot_1, 'rot_2': rot_2, 'rot_3': rot_3,
+        'opacity': opacity,
+        'n': n,
+    }
+
+
+# ══════════════════════════════════════════════════════
+#  .splat (compact 3DGS binary format, 32 bytes/splat)
+# ══════════════════════════════════════════════════════
+
+def _read_splat(path):
+    """Read .splat binary files (32 bytes per gaussian).
+
+    Format per splat:
+        position:  3 × float32 (12 bytes)
+        scale:     3 × float32 (12 bytes)
+        color:     4 × uint8   (4 bytes, RGBA)
+        rotation:  4 × uint8   (4 bytes, quaternion packed as (v-128)/128)
+    """
+    raw = np.fromfile(path, dtype=np.uint8)
+    n = len(raw) // 32
+    if n == 0:
+        return _empty_gaussian_result()
+
+    raw = raw[:n * 32]
+    buf = raw.tobytes()
+
+    # Use strided reads for the interleaved format
+    dt = np.dtype([
+        ('pos', '<f4', 3),
+        ('scale', '<f4', 3),
+        ('rgba', 'u1', 4),
+        ('rot', 'u1', 4),
+    ])
+    structured = np.frombuffer(buf, dtype=dt, count=n)
+
+    x = structured['pos'][:, 0].astype(np.float64)
+    y = structured['pos'][:, 1].astype(np.float64)
+    z = structured['pos'][:, 2].astype(np.float64)
+
+    scale_x = structured['scale'][:, 0].astype(np.float32)
+    scale_y = structured['scale'][:, 1].astype(np.float32)
+    scale_z = structured['scale'][:, 2].astype(np.float32)
+
+    r = structured['rgba'][:, 0].astype(np.float32) / 255.0
+    g = structured['rgba'][:, 1].astype(np.float32) / 255.0
+    b = structured['rgba'][:, 2].astype(np.float32) / 255.0
+    opacity = structured['rgba'][:, 3].astype(np.float32) / 255.0
+
+    # Rotation: convert from uint8 [0,255] → float [-1,1]
+    rot_0 = (structured['rot'][:, 0].astype(np.float32) - 128.0) / 128.0
+    rot_1 = (structured['rot'][:, 1].astype(np.float32) - 128.0) / 128.0
+    rot_2 = (structured['rot'][:, 2].astype(np.float32) - 128.0) / 128.0
+    rot_3 = (structured['rot'][:, 3].astype(np.float32) - 128.0) / 128.0
+    qnorm = np.sqrt(rot_0**2 + rot_1**2 + rot_2**2 + rot_3**2)
+    qnorm = np.maximum(qnorm, 1e-10)
+    rot_0 /= qnorm; rot_1 /= qnorm; rot_2 /= qnorm; rot_3 /= qnorm
+
+    return {
+        'type': 'gaussian',
+        'x': x, 'y': y, 'z': z,
+        'r': r, 'g': g, 'b': b,
+        'scale_x': scale_x, 'scale_y': scale_y, 'scale_z': scale_z,
+        'rot_0': rot_0, 'rot_1': rot_1, 'rot_2': rot_2, 'rot_3': rot_3,
+        'opacity': opacity,
+        'n': n,
+    }
+
+
+def _empty_gaussian_result():
+    return {
+        'type': 'gaussian',
+        'x': np.array([], dtype=np.float64),
+        'y': np.array([], dtype=np.float64),
+        'z': np.array([], dtype=np.float64),
+        'r': np.array([], dtype=np.float32),
+        'g': np.array([], dtype=np.float32),
+        'b': np.array([], dtype=np.float32),
+        'scale_x': np.array([], dtype=np.float32),
+        'scale_y': np.array([], dtype=np.float32),
+        'scale_z': np.array([], dtype=np.float32),
+        'rot_0': np.array([], dtype=np.float32),
+        'rot_1': np.array([], dtype=np.float32),
+        'rot_2': np.array([], dtype=np.float32),
+        'rot_3': np.array([], dtype=np.float32),
+        'opacity': np.array([], dtype=np.float32),
+        'n': 0,
     }
 
 
