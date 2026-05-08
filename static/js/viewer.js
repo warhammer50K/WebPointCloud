@@ -92,20 +92,19 @@ export class Viewer {
         this.controls.dampingFactor = 0.12;
         this.controls.enableZoom = true;
 
-        const _zoomStep = 0.08;
+        const _zoomFactor = 0.9;
         this.renderer.domElement.addEventListener('wheel', (e) => {
             e.preventDefault();
             e.stopImmediatePropagation();
-            const dir = new THREE.Vector3().subVectors(this.controls.target, this.camera.position);
-            const dist = dir.length();
-            dir.normalize();
-            if (e.deltaY < 0) {
-                if (dist < 0.1) return;
-                this.camera.position.addScaledVector(dir, dist * _zoomStep);
-            } else if (e.deltaY > 0) {
-                const step = Math.max(dist * _zoomStep, 0.1);
-                this.camera.position.addScaledVector(dir, -step);
+            const offset = new THREE.Vector3().subVectors(this.camera.position, this.controls.target);
+            const dist = offset.length();
+            if (dist < 1e-6) {
+                return;
             }
+            const factor = e.deltaY < 0 ? _zoomFactor : 1 / _zoomFactor;
+            const newDist = Math.max(dist * factor, 1e-4);
+            offset.setLength(newDist);
+            this.camera.position.copy(this.controls.target).add(offset);
             this._dirty = true;
         }, { passive: false, capture: true });
 
