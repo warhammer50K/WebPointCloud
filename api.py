@@ -13,6 +13,7 @@ import threading
 import uuid
 from datetime import datetime
 from pointcloud_io import read_pointcloud, arrays_to_binary, gaussians_to_binary, write_las, SUPPORTED_EXTENSIONS
+import copc_io
 
 api_bp = Blueprint('api', __name__)
 
@@ -69,18 +70,26 @@ def list_maps():
         for d in sorted(os.listdir(maps_dir)):
             p = os.path.join(maps_dir, d)
             if os.path.isdir(p):
-                las_files = glob.glob(os.path.join(p, '*.las'))
+                # Include LAZ/COPC alongside LAS so COPC maps appear in the list.
+                las_files = sorted(glob.glob(os.path.join(p, '*.las'))
+                                   + glob.glob(os.path.join(p, '*.laz')))
                 las_info = []
                 for lf in las_files:
                     info = {'name': os.path.basename(lf)}
                     try:
-                        sz = os.path.getsize(lf)
-                        info['size'] = sz
-                        with open(lf, 'rb') as fh:
-                            fh.seek(107)
-                            info['num_points'] = struct.unpack('<I', fh.read(4))[0]
+                        info['size'] = os.path.getsize(lf)
+                        if lf.lower().endswith('.las'):
+                            # Fast path: LAS 1.2 legacy point count at byte 107.
+                            with open(lf, 'rb') as fh:
+                                fh.seek(107)
+                                info['num_points'] = struct.unpack('<I', fh.read(4))[0]
+                        else:
+                            # LAZ/COPC (often LAS 1.4): read header via laspy.
+                            import laspy
+                            with laspy.open(lf) as fh:
+                                info['num_points'] = int(fh.header.point_count)
                     except Exception:
-                        info['size'] = 0
+                        info.setdefault('size', 0)
                         info['num_points'] = 0
                     las_info.append(info)
                 try:
@@ -178,6 +187,14 @@ def load_pointcloud():
         if ext not in SUPPORTED_EXTENSIONS:
             return jsonify({'error': f'Unsupported format: {ext}'}), 400
 
+        # COPC: stream via octree LOD (JSON meta) instead of a whole-cloud binary.
+        # The frontend distinguishes by Content-Type and switches into copc mode.
+        if copc_io.is_copc(path):
+            resp = jsonify(copc_io.copc_meta(path))
+            if saved_path:
+                resp.headers['X-Saved-Path'] = saved_path
+            return resp
+
         d = read_pointcloud(path)
         if d.get('type') == 'gaussian':
             binary = gaussians_to_binary(
@@ -204,6 +221,64 @@ def load_pointcloud():
 @api_bp.route('/api/load_las', methods=['POST'])
 def load_las():
     return load_pointcloud()
+
+
+# ══════════════════════════════════════════════════════
+#  COPC octree LOD streaming
+# ══════════════════════════════════════════════════════
+def _copc_guard(path):
+    """Validate *path* is inside MAPS_DIR and is a COPC file. Returns an error
+    (response, status) tuple on failure, else None."""
+    if not path:
+        return jsonify({'error': 'path required'}), 400
+    maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
+    if not os.path.realpath(path).startswith(maps_dir + os.sep):
+        return jsonify({'error': 'Access denied'}), 403
+    if not os.path.isfile(path):
+        return jsonify({'error': 'File not found'}), 404
+    return None
+
+
+@api_bp.route('/api/copc/meta', methods=['GET'])
+def copc_meta():
+    path = request.args.get('path', '')
+    err = _copc_guard(path)
+    if err:
+        return err
+    try:
+        return jsonify(copc_io.copc_meta(path))
+    except Exception as e:
+        return _error_response(e, 'copc_meta')
+
+
+@api_bp.route('/api/copc/hierarchy', methods=['GET'])
+def copc_hierarchy():
+    path = request.args.get('path', '')
+    err = _copc_guard(path)
+    if err:
+        return err
+    try:
+        max_depth = int(request.args.get('max_depth', 32))
+        return jsonify(copc_io.copc_hierarchy(path, max_depth=max_depth))
+    except Exception as e:
+        return _error_response(e, 'copc_hierarchy')
+
+
+@api_bp.route('/api/copc/nodes', methods=['POST'])
+def copc_nodes():
+    err = _require_json()
+    if err:
+        return err
+    path = request.json.get('path', '')
+    guard = _copc_guard(path)
+    if guard:
+        return guard
+    try:
+        keys = request.json.get('keys', []) or []
+        binary = copc_io.copc_nodes_binary(path, keys)
+        return send_file(io.BytesIO(binary), mimetype='application/octet-stream')
+    except Exception as e:
+        return _error_response(e, 'copc_nodes')
 
 
 # ══════════════════════════════════════════════════════

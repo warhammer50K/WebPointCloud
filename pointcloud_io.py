@@ -42,12 +42,18 @@ def read_pointcloud(path):
 #  Binary packing (for web viewer)
 # ══════════════════════════════════════════════════════
 
-def arrays_to_binary(x, y, z, intensity, r, g, b, n):
+def arrays_to_binary(x, y, z, intensity, r, g, b, n, offset=None):
     """Pack point cloud arrays into binary format for the web viewer.
 
     Coordinates are centered by subtracting the bounding-box midpoint in
     float64 *before* converting to float32, avoiding precision loss with
     large UTM-style coordinates.
+
+    When ``offset`` (a 3-tuple/array) is given, that fixed origin is used for
+    centering instead of this payload's own midpoint. COPC node streaming
+    relies on this so every node shares one coordinate frame (the octree
+    center) and the per-node geometries align seamlessly; recomputing a
+    per-node midpoint would scatter nodes in space.
 
     Format: header(8) + offset(24, 3×float64) + bounds(32, 8×float32) + data(n×7 float32)
     """
@@ -55,7 +61,9 @@ def arrays_to_binary(x, y, z, intensity, r, g, b, n):
     y64 = np.asarray(y, dtype=np.float64)
     z64 = np.asarray(z, dtype=np.float64)
 
-    if n > 0:
+    if offset is not None:
+        ox, oy, oz = float(offset[0]), float(offset[1]), float(offset[2])
+    elif n > 0:
         ox = (float(x64.min()) + float(x64.max())) / 2.0
         oy = (float(y64.min()) + float(y64.max())) / 2.0
         oz = (float(z64.min()) + float(z64.max())) / 2.0

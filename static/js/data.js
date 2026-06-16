@@ -97,11 +97,17 @@ export async function loadLasFromPath(path) {
         const err = await resp.json();
         throw new Error(err.error || 'Failed to load');
     }
+    // COPC maps respond with JSON meta and stream via the octree LOD path.
+    const ct = resp.headers.get('Content-Type') || '';
+    if (ct.includes('application/json')) {
+        const meta = await resp.json();
+        return { mode: 'copc', meta, path };
+    }
     return workerParseBinary(await resp.arrayBuffer());
 }
 
 export async function uploadLasFile(file, onProgress) {
-    const { buffer, savedPath } = await new Promise((resolve, reject) => {
+    const { buffer, savedPath, copcMeta } = await new Promise((resolve, reject) => {
         const form = new FormData();
         form.append('file', file);
         const xhr = new XMLHttpRequest();
@@ -114,7 +120,15 @@ export async function uploadLasFile(file, onProgress) {
         }
         xhr.onload = () => {
             if (xhr.status >= 200 && xhr.status < 300) {
-                resolve({ buffer: xhr.response, savedPath: xhr.getResponseHeader('X-Saved-Path') });
+                const ct = xhr.getResponseHeader('Content-Type') || '';
+                const savedPath = xhr.getResponseHeader('X-Saved-Path');
+                // COPC: server returns JSON meta instead of a point binary.
+                if (ct.includes('application/json')) {
+                    const meta = JSON.parse(new TextDecoder().decode(xhr.response));
+                    resolve({ copcMeta: meta, savedPath });
+                } else {
+                    resolve({ buffer: xhr.response, savedPath });
+                }
             } else {
                 try {
                     const text = new TextDecoder().decode(xhr.response);
@@ -128,6 +142,9 @@ export async function uploadLasFile(file, onProgress) {
         xhr.onerror = () => reject(new Error('Upload network error'));
         xhr.send(form);
     });
+    if (copcMeta) {
+        return { mode: 'copc', meta: copcMeta, path: savedPath, savedPath };
+    }
     const data = await workerParseBinary(buffer);
     data.savedPath = savedPath;
     return data;

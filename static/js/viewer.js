@@ -5,6 +5,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG, GAUSSIAN_VERT, GAUSSIAN_FRAG } from './shaders.js';
 import { GaussianSplat } from './gaussian-splat.js';
+import { CopcLodManager } from './copc-lod.js';
 
 import {
     initMeasureInput, addMeasurePoint as _addMeasurePoint,
@@ -56,6 +57,7 @@ export class Viewer {
         this.coordOffset = null;      // Float64Array([ox,oy,oz]) — add back for original coords
         this.pointCloud = null;
         this.gaussianSplat = null;
+        this.copcManager = null;      // COPC octree LOD streaming (when active)
         this.pointSize = 0.05;
         this.colorMode = 'intensity';
         this.gamma = 0.6;
@@ -274,6 +276,7 @@ export class Viewer {
 
         this.controls.update();
         if (this.gaussianSplat) this.gaussianSplat.update();
+        if (this.copcManager) this.copcManager.maybeUpdate();
         if (this._dirty) {
             const usePost = this.edlEnabled || this.ssaoEnabled;
             if (!usePost) {
@@ -364,8 +367,9 @@ export class Viewer {
         if (this._webglFailed) {
             return;
         }
-        // Clear gaussian splat if present (they don't coexist)
+        // Clear gaussian splat / COPC stream if present (modes don't coexist)
         this.clearGaussianSplat();
+        this.clearCopc();
 
         this._fullCloudData = data;   // keep original
         this._dsRatio = 1.0;
@@ -418,11 +422,65 @@ export class Viewer {
         this._dirty = true;
     }
 
+    /* ── Load a COPC map as a streaming octree LOD ── */
+    loadCopc(meta, path) {
+        if (this._webglFailed) return;
+
+        // Modes don't coexist — tear down point cloud / gaussian / prior COPC.
+        this.clearGaussianSplat();
+        this.clearCopc();
+        if (this.pointCloud) {
+            this.scene.remove(this.pointCloud);
+            this.pointCloud.geometry.dispose();
+            this.pointCloud.material.dispose();
+            this.pointCloud = null;
+        }
+        this.cloudData = null;
+        this._fullCloudData = null;
+        this._undoStack.length = 0;
+        this._redoStack.length = 0;
+
+        // Centered bounds (real-world minus the octree center) so this matches
+        // the per-node geometry frame used by clipping / height coloring / fit.
+        const c = meta.coordOffset;
+        this.bounds = {
+            xMin: meta.mins[0] - c[0], xMax: meta.maxs[0] - c[0],
+            yMin: meta.mins[1] - c[1], yMax: meta.maxs[1] - c[1],
+            zMin: meta.mins[2] - c[2], zMax: meta.maxs[2] - c[2],
+            iMin: 0, iMax: 1,
+        };
+        this.coordOffset = new Float64Array(c);
+
+        this.resetClipping();
+        const b = this.bounds;
+        const maxExtent = Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin);
+        this.camera.far = Math.max(10000, maxExtent * 3);
+        this.camera.updateProjectionMatrix();
+
+        document.getElementById('no-data-msg').style.display = 'none';
+        const ptsEl = document.getElementById('viewer-pts');
+        if (ptsEl) ptsEl.textContent = `Points: 0`;
+
+        this.copcManager = new CopcLodManager(this, meta, path);
+        this._fitCamera();
+        this.updateStats();
+        this._dirty = true;
+    }
+
+    clearCopc() {
+        if (this.copcManager) {
+            this.copcManager.dispose();
+            this.copcManager = null;
+            this._dirty = true;
+        }
+    }
+
     /* ── Load / replace gaussian splat ── */
     loadGaussianSplat(data) {
         if (this._webglFailed) return;
 
-        // Clear existing point cloud (they don't coexist)
+        // Clear existing point cloud / COPC stream (they don't coexist)
+        this.clearCopc();
         if (this.pointCloud) {
             this.scene.remove(this.pointCloud);
             this.pointCloud.geometry.dispose();
