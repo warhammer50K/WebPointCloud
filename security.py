@@ -79,6 +79,12 @@ def init_security(app, logger, rate_limiter=None):
         if not ip_whitelist_disabled and not is_private(client_ip):
             logger.warning(f"[Security] Blocked request from {client_ip}")
             abort(403)
+        # COPC octree streaming and conversion polling are inherently
+        # high-frequency (many node fetches per camera move, sub-second status
+        # polls), so they would trip a per-IP rate limit. Exempt them; the IP
+        # whitelist check above still applies.
+        if request.path.startswith('/api/copc/'):
+            return None
         if not rate_limiter.is_allowed(client_ip):
             logger.warning(f"[Security] Rate limit exceeded for {client_ip}")
             abort(429)
