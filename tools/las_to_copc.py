@@ -60,6 +60,53 @@ def _compress_node(args):
     return key, bytes(comp), int(len(idx))
 
 
+# ── Octree subsample (the build bottleneck), parallelizable by subtree ──
+# Top-down voxel-grid subsampling. Hoisted to module level so fork workers can
+# run whole subtrees. P / params are shared via copy-on-write fork globals.
+_B_P = None          # float32 (N,3) coords (inherited by fork)
+_B_HALFSIZE = None
+_B_CUBE_MIN = None   # np.float64 (3,)
+_B_GRID = None
+_B_MAXDEPTH = None
+
+
+def _subsample_into(out, d, kx, ky, kz, idx, P, halfsize, cube_min, grid, max_depth):
+    node_size = (2.0 * halfsize) / (2 ** d)
+    nmin = cube_min + np.array([kx, ky, kz], dtype=np.float64) * node_size
+    if d >= max_depth:
+        out[(d, kx, ky, kz)] = idx
+        return
+    step = node_size / grid
+    loc = np.floor((P[idx] - nmin) / step).astype(np.int64)
+    np.clip(loc, 0, grid - 1, out=loc)
+    cell = (loc[:, 0] * grid + loc[:, 1]) * grid + loc[:, 2]
+    order = np.argsort(cell, kind="stable")
+    sc = cell[order]
+    first = np.ones(len(order), dtype=bool)
+    first[1:] = sc[1:] != sc[:-1]
+    out[(d, kx, ky, kz)] = idx[order[first]]
+    rest = idx[order[~first]]
+    if len(rest) == 0:
+        return
+    mid = nmin + node_size / 2.0
+    ge = P[rest] >= mid
+    for ox in (0, 1):
+        for oy in (0, 1):
+            for oz in (0, 1):
+                m = (ge[:, 0] == bool(ox)) & (ge[:, 1] == bool(oy)) & (ge[:, 2] == bool(oz))
+                if m.any():
+                    _subsample_into(out, d + 1, 2 * kx + ox, 2 * ky + oy, 2 * kz + oz,
+                                    rest[m], P, halfsize, cube_min, grid, max_depth)
+
+
+def _subtree_worker(task):
+    d, kx, ky, kz, idx = task
+    local = {}
+    _subsample_into(local, d, kx, ky, kz, idx, _B_P, _B_HALFSIZE, _B_CUBE_MIN,
+                    _B_GRID, _B_MAXDEPTH)
+    return local
+
+
 def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     # progress(done, total, phase) — phase ∈ {'reading','building','writing'}.
     # Reading/subsampling can't report incremental %, so they emit phase labels;
@@ -114,7 +161,10 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     records = packed_las.points.array  # structured packed PDRF records
     del inten
 
-    P = np.column_stack([x, y, z])  # subsample coords; x/y/z now redundant
+    # float32 coords for subsample — halves memory bandwidth on fancy-indexing /
+    # sort. Precision: centered coords are within ±halfsize, so float32 (~7 sig
+    # digits) keeps sub-mm accuracy, finer than the deepest grid step.
+    P = np.column_stack([x, y, z]).astype(np.float32)
     del x, y, z
 
     scale = copc.Vector3(SCALE, SCALE, SCALE)
@@ -133,57 +183,69 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     # node_pts[(d,x,y,z)] = int index array kept AT that node
     node_pts = {}
 
-    build_done = [0]
-    build_pct = [0]
-
-    def _build_progress(added):
-        build_done[0] += added
-        if progress is None:
-            return
-        pct = int(build_done[0] / n * 100)
-        if pct > build_pct[0]:
-            build_pct[0] = pct
-            progress(build_done[0], n, 'building')
-
-    def subsample(d, kx, ky, kz, idx):
-        node_size = (2.0 * halfsize) / (2 ** d)
-        nmin = cube_min + np.array([kx, ky, kz], dtype=np.float64) * node_size
-        if d >= max_depth:
-            node_pts[(d, kx, ky, kz)] = idx
-            _build_progress(len(idx))
-            return
-        step = node_size / grid
-        loc = np.floor((P[idx] - nmin) / step).astype(np.int64)
-        np.clip(loc, 0, grid - 1, out=loc)
-        cell = (loc[:, 0] * grid + loc[:, 1]) * grid + loc[:, 2]
-        order = np.argsort(cell, kind="stable")
-        sc = cell[order]
-        first = np.ones(len(order), dtype=bool)
-        first[1:] = sc[1:] != sc[:-1]
-        keep = idx[order[first]]
-        rest = idx[order[~first]]
-        node_pts[(d, kx, ky, kz)] = keep
-        _build_progress(len(keep))
-        if len(rest) == 0:
-            return
-        mid = nmin + node_size / 2.0
-        ge = P[rest] >= mid
-        for ox in (0, 1):
-            for oy in (0, 1):
-                for oz in (0, 1):
-                    m = (ge[:, 0] == bool(ox)) & (ge[:, 1] == bool(oy)) & (ge[:, 2] == bool(oz))
-                    if m.any():
-                        subsample(d + 1, 2 * kx + ox, 2 * ky + oy, 2 * kz + oz, rest[m])
-
     sys.setrecursionlimit(10000)
     if progress is not None:
         progress(0, 1, 'building')
     t_prep = time.monotonic()        # read + packed prep done
-    subsample(0, 0, 0, 0, np.arange(n))
+
+    nproc = min(MAX_WRITE_PROCS, os.cpu_count() or 1)
+    SPLIT_DEPTH = 4   # process top levels here, fan out subtrees to workers
+
+    if nproc > 1 and n >= PARALLEL_MIN_POINTS:
+        # Process the top levels serially, collecting subtree roots as tasks.
+        tasks = []
+
+        def split(d, kx, ky, kz, idx):
+            if d >= SPLIT_DEPTH:
+                tasks.append((d, kx, ky, kz, idx))
+                return
+            node_size = (2.0 * halfsize) / (2 ** d)
+            nmin = cube_min + np.array([kx, ky, kz], dtype=np.float64) * node_size
+            step = node_size / grid
+            loc = np.floor((P[idx] - nmin) / step).astype(np.int64)
+            np.clip(loc, 0, grid - 1, out=loc)
+            cell = (loc[:, 0] * grid + loc[:, 1]) * grid + loc[:, 2]
+            order = np.argsort(cell, kind="stable")
+            sc = cell[order]
+            first = np.ones(len(order), dtype=bool)
+            first[1:] = sc[1:] != sc[:-1]
+            node_pts[(d, kx, ky, kz)] = idx[order[first]]
+            rest = idx[order[~first]]
+            if len(rest) == 0:
+                return
+            mid = nmin + node_size / 2.0
+            ge = P[rest] >= mid
+            for ox in (0, 1):
+                for oy in (0, 1):
+                    for oz in (0, 1):
+                        m = (ge[:, 0] == bool(ox)) & (ge[:, 1] == bool(oy)) & (ge[:, 2] == bool(oz))
+                        if m.any():
+                            split(d + 1, 2 * kx + ox, 2 * ky + oy, 2 * kz + oz, rest[m])
+
+        split(0, 0, 0, 0, np.arange(n))
+
+        global _B_P, _B_HALFSIZE, _B_CUBE_MIN, _B_GRID, _B_MAXDEPTH
+        _B_P, _B_HALFSIZE, _B_CUBE_MIN = P, halfsize, cube_min
+        _B_GRID, _B_MAXDEPTH = grid, max_depth
+        bdone = sum(len(v) for v in node_pts.values())
+        try:
+            with mp.Pool(nproc) as pool:
+                for local in pool.imap_unordered(_subtree_worker, tasks, chunksize=1):
+                    node_pts.update(local)
+                    bdone += sum(len(v) for v in local.values())
+                    if progress is not None:
+                        progress(bdone, n, 'building')
+        finally:
+            _B_P = _B_HALFSIZE = _B_CUBE_MIN = _B_GRID = _B_MAXDEPTH = None
+    else:
+        _subsample_into(node_pts, 0, 0, 0, 0, np.arange(n), P, halfsize,
+                        cube_min, grid, max_depth)
+        if progress is not None:
+            progress(n, n, 'building')
+
     t_build = time.monotonic()
 
     items = [(k, idx) for k, idx in node_pts.items() if len(idx) > 0]
-    nproc = min(MAX_WRITE_PROCS, os.cpu_count() or 1)
     done = 0
 
     if nproc > 1 and n >= PARALLEL_MIN_POINTS:
