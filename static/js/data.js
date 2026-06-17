@@ -87,6 +87,21 @@ export function workerParseBinary(buffer) {
     });
 }
 
+/** Parse a COPC multi-blob (many nodes) into one merged buffer in the worker. */
+export function workerParseMultiblob(buffer) {
+    if (_workerNotSupported) return Promise.reject(new Error('Web Worker API not supported'));
+    return new Promise((resolve, reject) => {
+        const id = ++_workerId;
+        const timeout = setTimeout(() => {
+            _workerCallbacks.delete(id);
+            reject(new Error('Worker request timed out'));
+            _createWorker();
+        }, 15000);
+        _workerCallbacks.set(id, { resolve, reject, timeout });
+        parseWorker.postMessage({ id, type: 'copc-multiblob', buffer }, [buffer]);
+    });
+}
+
 export async function loadLasFromPath(path) {
     const resp = await fetch('/api/load_pointcloud', {
         method: 'POST',

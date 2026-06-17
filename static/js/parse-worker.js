@@ -147,6 +147,51 @@ function parseBinary(buffer) {
     return { positions, intensities, colors, bounds, numPoints, offset };
 }
 
+/* ── COPC multi-blob: merge many node payloads into ONE geometry buffer ──
+   so the client renders a whole chunk of nodes in a single draw call.
+   Input: [numBlobs] then per blob [keyLen][key][payloadLen][payload],
+   where payload is the standard fpp=7 binary. Returns merged arrays plus the
+   node key/count boundaries (for per-node unload bookkeeping). */
+function parseMultiblob(buffer) {
+    const view = new DataView(buffer);
+    let off = 0;
+    const num = view.getUint32(off, true); off += 4;
+
+    const blobs = [];
+    let totalN = 0;
+    for (let i = 0; i < num; i++) {
+        const keyLen = view.getUint32(off, true); off += 4;
+        const key = new TextDecoder().decode(new Uint8Array(buffer, off, keyLen));
+        off += keyLen;
+        const plen = view.getUint32(off, true); off += 4;
+        const n = view.getUint32(off, true);   // payload header: numPoints
+        blobs.push({ key, dataOff: off + 64, n }); // header(8)+offset(24)+bounds(32)
+        off += plen;
+        totalN += n;
+    }
+
+    const positions = new Float32Array(totalN * 3);
+    const intensities = new Float32Array(totalN);
+    const colors = new Float32Array(totalN * 3);
+    const nodeKeys = [];
+    const nodeCounts = [];
+    let w = 0;
+    for (const b of blobs) {
+        // slice → fresh, aligned buffer (payload start may be unaligned).
+        const raw = new Float32Array(buffer.slice(b.dataOff, b.dataOff + b.n * 7 * 4));
+        for (let i = 0; i < b.n; i++) {
+            const s = i * 7, o = w * 3;
+            positions[o] = raw[s]; positions[o + 1] = raw[s + 1]; positions[o + 2] = raw[s + 2];
+            intensities[w] = raw[s + 3];
+            colors[o] = raw[s + 4]; colors[o + 1] = raw[s + 5]; colors[o + 2] = raw[s + 6];
+            w++;
+        }
+        nodeKeys.push(b.key);
+        nodeCounts.push(b.n);
+    }
+    return { positions, intensities, colors, numPoints: totalN, nodeKeys, nodeCounts };
+}
+
 /* ── Point-in-polygon (ray casting) ── */
 function isPointInPoly2D(px, py, poly) {
     let inside = false;
@@ -238,6 +283,8 @@ self.onmessage = function(e) {
             result = parseRealtime(n, buf, e.data.offset || null);
         } else if (type === 'filter') {
             result = filterPoints(e.data);
+        } else if (type === 'copc-multiblob') {
+            result = parseMultiblob(buffer);
         } else {
             result = parseBinary(buffer);
         }

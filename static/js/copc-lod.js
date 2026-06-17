@@ -1,21 +1,24 @@
 /* ═══════════════════════════════════════════════════════
    COPC Octree LOD streaming manager
    — owns one COPC map's streaming lifecycle: fetch the octree
-     hierarchy, pick a view-dependent cut through the octree
-     (frustum cull + screen-space error), and stream only the
-     nodes on that cut as per-node THREE.Points sharing one
-     material.
+     hierarchy, pick a view-dependent cut (frustum cull + screen-
+     space error), and stream the nodes on that cut.
 
-   COPC/EPT stores each point at exactly one level, so the
-   visible set is the cut PLUS all its ancestors (root = coarse
-   overview, deeper = added detail) — they accumulate without
-   duplicates.
+   Nodes are fetched and rendered in CHUNKS: each request's nodes
+   are merged into ONE BufferGeometry / THREE.Points, so a big map
+   (tens of thousands of small nodes) costs a few hundred draw
+   calls instead of thousands. Per-node bookkeeping is kept so a
+   chunk is unloaded once none of its nodes are wanted.
+
+   COPC/EPT stores each point at exactly one level, so the visible
+   set is the cut PLUS its ancestors (coarse overview + added
+   detail) — they accumulate without duplicates.
    ═══════════════════════════════════════════════════════ */
 import * as THREE from 'three';
-import { workerParseBinary } from './data.js';
+import { workerParseMultiblob } from './data.js';
 
-const NODES_PER_REQUEST = 24;          // nodes batched into one multi-blob request
-const REQUEST_CONCURRENCY = 4;         // concurrent batch requests
+const NODES_PER_REQUEST = 24;          // nodes merged into one chunk / request
+const REQUEST_CONCURRENCY = 4;         // concurrent chunk requests
 const UPDATE_INTERVAL_MS = 100;        // ~10 Hz LOD re-selection
 const DEFAULT_SSE_THRESHOLD = 4.0;     // pixels: descend while node error exceeds this
 
@@ -24,22 +27,24 @@ export class CopcLodManager {
         this.viewer = viewer;
         this.meta = meta;
         this.path = path;
-        this.coordOffset = meta.coordOffset;          // [ox,oy,oz], shared by all nodes
-        this.rootSpacing = meta.root.spacing;         // point spacing at level 0
+        this.coordOffset = meta.coordOffset;
+        this.rootSpacing = meta.root.spacing;
         this.sseThreshold = DEFAULT_SSE_THRESHOLD;
         this.pointBudget = meta.pointBudget || 5_000_000;
         this._disposed = false;
 
         this.nodeByKey = new Map();                   // key -> {key,level,pointCount,box}
         this.rootKeys = [];                           // level-0 node keys
-        this.loaded = new Map();                      // key -> THREE.Points
-        this.loading = new Set();                     // keys with an in-flight fetch
+        this.chunks = new Map();                      // chunkId -> {points, keys:Set, pointCount}
+        this.nodeToChunk = new Map();                 // node key -> chunkId (loaded)
+        this.loading = new Set();                     // node keys with an in-flight fetch
         this.desired = new Set();                     // current cut
         this.loadedPointCount = 0;
         this._pending = 0;                            // nodes queued/in-flight (progress)
+        this._chunkSeq = 0;
 
-        // One material shared by every node so color-mode / point-size / gamma /
-        // EDL / SSAO controls update all nodes uniformly.
+        // One material shared by every chunk so color-mode / point-size / gamma /
+        // EDL / SSAO controls update everything uniformly.
         this.material = viewer._makeMaterial();
 
         this.lodGroup = new THREE.Group();            // positions pre-centered → no transform
@@ -64,7 +69,6 @@ export class CopcLodManager {
             const { nodes } = await resp.json();
             const [ox, oy, oz] = this.coordOffset;
             for (const n of nodes) {
-                // Pre-center each node's bbox into the viewer coordinate frame.
                 const box = new THREE.Box3(
                     new THREE.Vector3(n.mins[0] - ox, n.mins[1] - oy, n.mins[2] - oz),
                     new THREE.Vector3(n.maxs[0] - ox, n.maxs[1] - oy, n.maxs[2] - oz));
@@ -74,13 +78,12 @@ export class CopcLodManager {
                 if (n.level === 0) this.rootKeys.push(n.key);
             }
             this._forceUpdate = true;
-            this.maybeUpdate();                        // first view-dependent selection
+            this.maybeUpdate();
         } catch (err) {
             console.error('[COPC] init failed:', err);
         }
     }
 
-    /* Child keys (octree: level+1, 2*coord{+0,+1}) that actually exist. */
     _childKeys(key) {
         const [l, x, y, z] = key.split('-').map(Number);
         const out = [];
@@ -95,7 +98,6 @@ export class CopcLodManager {
         return out;
     }
 
-    /* Render-loop hook (throttled): pick the view-dependent cut. */
     maybeUpdate() {
         if (this._disposed || this.rootKeys.length === 0) return;
         const now = performance.now();
@@ -117,13 +119,11 @@ export class CopcLodManager {
         const fovRad = camera.fov * Math.PI / 180;
         const projFactor = viewportH / (2 * Math.tan(fovRad / 2));
 
-        // Collect in-frustum candidate nodes on the SSE cut, with a screen-size
-        // priority (bigger on screen = more important to keep under budget).
+        // Collect in-frustum candidates on the SSE cut, priority = screen size.
         const candidates = [];
         const visit = (key) => {
             const node = this.nodeByKey.get(key);
             if (!node || !this._frustum.intersectsBox(node.box)) return;
-            // Geometric error ≈ point spacing at this node's level.
             const nodeErr = this.rootSpacing / Math.pow(2, node.level);
             const closest = node.box.clampPoint(camPos, this._tmpVec);
             const dist = Math.max(camPos.distanceTo(closest), 1e-3);
@@ -137,7 +137,6 @@ export class CopcLodManager {
         };
         for (const rk of this.rootKeys) visit(rk);
 
-        // Budget: keep the largest-on-screen nodes first, up to pointBudget.
         candidates.sort((a, b) => b.screenSize - a.screenSize);
         const desired = new Set();
         let used = 0;
@@ -146,22 +145,25 @@ export class CopcLodManager {
             desired.add(c.key);
             used += c.pointCount;
         }
+        this.desired = desired;
 
-        // Unload nodes that fell off the cut / budget (LRU = drop smallest-on-screen).
-        for (const key of [...this.loaded.keys()]) {
-            if (!desired.has(key)) this._unloadNode(key);
+        // Unload a chunk once none of its nodes are wanted anymore.
+        for (const [chunkId, chunk] of this.chunks) {
+            let anyWanted = false;
+            for (const k of chunk.keys) {
+                if (desired.has(k)) { anyWanted = true; break; }
+            }
+            if (!anyWanted) this._unloadChunk(chunkId);
         }
-        // Load newly-desired nodes.
+
+        // Load wanted nodes not already loaded/loading.
         const toLoad = [];
         for (const key of desired) {
-            if (!this.loaded.has(key) && !this.loading.has(key)) toLoad.push(key);
+            if (!this.nodeToChunk.has(key) && !this.loading.has(key)) toLoad.push(key);
         }
-        this.desired = desired;
         if (toLoad.length) this._loadKeys(toLoad);
     }
 
-    /* Fetch node keys in batched multi-blob requests (many nodes per round-trip),
-       bounded concurrency. */
     async _loadKeys(keys) {
         for (const k of keys) this.loading.add(k);
         this._pending += keys.length;
@@ -196,55 +198,55 @@ export class CopcLodManager {
             if (!this._disposed) console.warn('[COPC] chunk fetch failed', err);
             return;
         } finally {
-            // These keys are no longer in flight regardless of outcome.
             for (const k of keys) this.loading.delete(k);
             this._pending = Math.max(0, this._pending - keys.length);
         }
         if (this._disposed || !buf) return;
 
-        // Split the multi-blob: [numBlobs] then per blob [keyLen][key][payloadLen][payload].
-        const view = new DataView(buf);
-        let off = 0;
-        const num = view.getUint32(off, true); off += 4;
-        for (let i = 0; i < num; i++) {
-            const keyLen = view.getUint32(off, true); off += 4;
-            const key = new TextDecoder().decode(new Uint8Array(buf, off, keyLen)); off += keyLen;
-            const plen = view.getUint32(off, true); off += 4;
-            const payload = buf.slice(off, off + plen); off += plen;
+        const merged = await workerParseMultiblob(buf);
+        if (this._disposed || !merged || merged.numPoints === 0) return;
 
-            // Selection may have moved on while this was in flight.
-            if (this._disposed || !this.desired.has(key) || this.loaded.has(key)) continue;
-            const data = await workerParseBinary(payload);
-            if (this._disposed || !data || data.numPoints === 0) continue;
-            if (!this.desired.has(key) || this.loaded.has(key)) continue;
+        // Drop nodes that are already loaded (raced) or no longer wanted; if any
+        // remain that aren't in this merged set we just render what we got — the
+        // next _select will fill gaps. Keep only keys still relevant.
+        const keepKeys = merged.nodeKeys.filter(
+            k => this.desired.has(k) && !this.nodeToChunk.has(k));
+        if (keepKeys.length === 0) return;
 
-            const geom = this.viewer._buildGeometry(data);
-            const pts = new THREE.Points(geom, this.material);
-            pts.frustumCulled = false;
-            pts.userData.copcKey = key;
-            this.lodGroup.add(pts);
-            this.loaded.set(key, pts);
-            this.loadedPointCount += data.numPoints;
-            this.viewer._dirty = true;
-        }
+        const geom = this.viewer._buildGeometry(merged);
+        const points = new THREE.Points(geom, this.material);
+        points.frustumCulled = false;
+        const chunkId = ++this._chunkSeq;
+        points.userData.chunkId = chunkId;
+        this.lodGroup.add(points);
+
+        // Record every node carried by this chunk (even ones not in keepKeys —
+        // they're rendered anyway, and tracking them avoids a duplicate refetch).
+        const keySet = new Set(merged.nodeKeys);
+        this.chunks.set(chunkId, { points, keys: keySet, pointCount: merged.numPoints });
+        for (const k of merged.nodeKeys) this.nodeToChunk.set(k, chunkId);
+        this.loadedPointCount += merged.numPoints;
+
         this._syncMaterial();
         this._updateHud();
+        this.viewer._dirty = true;
     }
 
-    _unloadNode(key) {
-        const pts = this.loaded.get(key);
-        if (!pts) return;
-        this.lodGroup.remove(pts);
-        pts.geometry.dispose();
-        const n = this.nodeByKey.get(key);
-        if (n) this.loadedPointCount -= n.pointCount;
-        this.loaded.delete(key);
+    _unloadChunk(chunkId) {
+        const chunk = this.chunks.get(chunkId);
+        if (!chunk) return;
+        this.lodGroup.remove(chunk.points);
+        chunk.points.geometry.dispose();
+        for (const k of chunk.keys) {
+            if (this.nodeToChunk.get(k) === chunkId) this.nodeToChunk.delete(k);
+        }
+        this.loadedPointCount -= chunk.pointCount;
+        this.chunks.delete(chunkId);
         this._updateHud();
         this.viewer._dirty = true;
     }
 
     _syncMaterial() {
-        // _syncColorUniforms reads cloud.material.uniforms; pass a thin wrapper.
         this.viewer._syncColorUniforms({ material: this.material });
     }
 
@@ -259,11 +261,12 @@ export class CopcLodManager {
 
     dispose() {
         this._disposed = true;
-        for (const pts of this.loaded.values()) {
-            this.lodGroup.remove(pts);
-            pts.geometry.dispose();
+        for (const chunk of this.chunks.values()) {
+            this.lodGroup.remove(chunk.points);
+            chunk.points.geometry.dispose();
         }
-        this.loaded.clear();
+        this.chunks.clear();
+        this.nodeToChunk.clear();
         this.loading.clear();
         this.loadedPointCount = 0;
         this._pending = 0;
