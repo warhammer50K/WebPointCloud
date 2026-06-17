@@ -135,22 +135,34 @@ def copc_meta(path):
     }
 
 
+def _get_octree(entry):
+    """Build (once, cached on the reader entry) the full key→OctreeNode map.
+
+    load_octree_for_query walks the whole hierarchy and lazily pulls child pages
+    from disk — costly (seconds on big files). Caching it makes every later node
+    fetch and hierarchy request essentially free."""
+    octree = entry.get('octree')
+    if octree is None:
+        from laspy.copc import load_octree_for_query
+        reader = entry['reader']
+        nodes = load_octree_for_query(
+            reader.source, reader.copc_info, reader.root_page,
+            query_bounds=None, level_range=range(0, 32),
+        )
+        octree = {_node_key_str(nd.key): nd for nd in nodes}
+        entry['octree'] = octree
+    return octree
+
+
 def copc_hierarchy(path, max_depth=32):
     """Serialize the octree node list reachable up to *max_depth* levels.
 
     Returns {"nodes": [{key, level, pointCount, mins, maxs}, ...]} with bounds in
-    real-world (UTM) coordinates. For large files the client can later request a
-    sub-tree by passing a smaller depth / sub-root (incremental expansion)."""
-    from laspy.copc import load_octree_for_query
-
-    reader = open_copc(path)['reader']
-    nodes = load_octree_for_query(
-        reader.source, reader.copc_info, reader.root_page,
-        query_bounds=None, level_range=range(0, int(max_depth)),
-    )
+    real-world (UTM) coordinates."""
+    octree = _get_octree(open_copc(path))
     out = []
-    for nd in nodes:
-        if nd.point_count <= 0:
+    for nd in octree.values():
+        if nd.point_count <= 0 or nd.key.level >= int(max_depth):
             continue
         b = nd.bounds
         out.append({
@@ -195,27 +207,13 @@ def _pack_node_points(pts, entry, center):
     )
 
 
-def _resolve_nodes(reader, keys):
-    """Map node key strings to OctreeNodes (single hierarchy walk)."""
-    from laspy.copc import load_octree_for_query
-    want = list(dict.fromkeys(keys))                # dedupe, preserve order
-    if not want:
-        return [], {}
-    max_level = max(int(k.split('-')[0]) for k in want) + 1
-    all_nodes = load_octree_for_query(
-        reader.source, reader.copc_info, reader.root_page,
-        query_bounds=None, level_range=range(0, max_level),
-    )
-    by_key = {_node_key_str(nd.key): nd for nd in all_nodes}
-    return want, by_key
-
-
 def copc_nodes_binary(path, keys):
     """Points for the requested node *keys* as one combined viewer binary."""
     entry = open_copc(path)
     reader = entry['reader']
-    want, by_key = _resolve_nodes(reader, keys)
-    sel = [by_key[k] for k in want if k in by_key]
+    octree = _get_octree(entry)
+    want = list(dict.fromkeys(keys))
+    sel = [octree[k] for k in want if k in octree]
     if not sel:
         return arrays_to_binary([], [], [], [], [], [], [], 0,
                                 offset=[0.0, 0.0, 0.0])
@@ -234,12 +232,16 @@ def copc_nodes_multiblob(path, keys):
     entry = open_copc(path)
     reader = entry['reader']
     center = reader.copc_info.center
-    want, by_key = _resolve_nodes(reader, keys)
+    octree = _get_octree(entry)
+    want = list(dict.fromkeys(keys))
 
+    # Fetch each node separately: the batched read reorders points by disk
+    # offset, losing the per-node boundary. With the octree cached, each fetch is
+    # just a chunk decompress (the expensive hierarchy walk is gone).
     parts = []
     count = 0
     for k in want:
-        nd = by_key.get(k)
+        nd = octree.get(k)
         if nd is None:
             continue
         pts = reader._fetch_and_decompress_points_of_nodes([nd])
