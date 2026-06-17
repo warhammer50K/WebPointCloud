@@ -175,6 +175,15 @@ def load_pointcloud():
             maps_dir = current_app.config['MAPS_DIR']
             upload_dir = os.path.join(maps_dir, '_uploads')
             os.makedirs(upload_dir, exist_ok=True)
+            # Fail clearly (not a generic 500 mid-write) if the disk can't hold it.
+            need = request.content_length or 0
+            free = shutil.disk_usage(upload_dir).free
+            if need and free < need + (1 << 30):  # +1GB headroom
+                return jsonify({'error':
+                    f'Disk full: need ~{need / 1e9:.1f}GB but only '
+                    f'{free / 1e9:.1f}GB free. Free up space, or place the file '
+                    f'in the maps directory and load it from the list (no upload).'
+                }), 507
             safe_name = orig_name.replace(os.sep, '_').replace('/', '_')
             saved_path = os.path.join(upload_dir, f'{uuid.uuid4().hex[:8]}_{safe_name}')
             f.save(saved_path)
