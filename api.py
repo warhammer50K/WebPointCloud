@@ -187,14 +187,19 @@ def load_pointcloud():
         if ext not in SUPPORTED_EXTENSIONS:
             return jsonify({'error': f'Unsupported format: {ext}'}), 400
 
-        # Auto-convert large non-COPC LAS/LAZ to COPC so they stream via octree
-        # LOD. On any failure we fall back to the legacy whole-cloud path.
+        # Large non-COPC LAS/LAZ: convert to COPC in the background and return a
+        # job id immediately so the client can show conversion progress. Small
+        # files fall through to the legacy whole-cloud path.
         if ext in ('.las', '.laz') and not copc_io.is_copc(path):
-            converted = _maybe_convert_to_copc(path)
-            if converted:
-                path = converted
-                saved_path = converted
-                ext = '.laz'
+            import config
+            threshold = getattr(config, 'COPC_STREAM_MIN_POINTS', 2_000_000)
+            if _point_count(path) >= threshold:
+                job_id = _start_convert_job(path, current_app.config.get('LOGGER'))
+                resp = jsonify({'mode': 'converting', 'job': job_id})
+                resp.status_code = 202
+                if saved_path:
+                    resp.headers['X-Saved-Path'] = saved_path
+                return resp
 
         # COPC: stream via octree LOD (JSON meta) instead of a whole-cloud binary.
         # The frontend distinguishes by Content-Type and switches into copc mode.
@@ -235,28 +240,48 @@ def load_las():
 # ══════════════════════════════════════════════════════
 #  COPC octree LOD streaming
 # ══════════════════════════════════════════════════════
-def _maybe_convert_to_copc(path):
-    """Convert *path* to COPC if it has at least COPC_STREAM_MIN_POINTS points.
+# ── Background COPC conversion jobs ──
+_convert_jobs = {}                       # job_id -> {status, percent, copc_path, error}
+_convert_jobs_lock = threading.Lock()
 
-    Returns the new .copc.laz path, or None to keep the legacy whole-cloud path
-    (file too small, or conversion unavailable/failed)."""
-    import config
-    threshold = getattr(config, 'COPC_STREAM_MIN_POINTS', 2_000_000)
+
+def _point_count(path):
     try:
         import laspy
         with laspy.open(path) as f:
-            n = int(f.header.point_count)
+            return int(f.header.point_count)
     except Exception:
-        return None
-    if n < threshold:
-        return None
-    try:
-        return copc_io.ensure_copc(path)
-    except Exception as e:
-        logger = current_app.config.get('LOGGER')
-        if logger:
-            logger.warning(f"COPC auto-convert failed for {path}: {e}")
-        return None
+        return 0
+
+
+def _start_convert_job(src_path, logger=None):
+    """Kick off COPC conversion in a background thread; return its job id.
+
+    Progress is reported during the copclib build; the client polls
+    /api/copc/convert_status."""
+    job_id = uuid.uuid4().hex[:12]
+    with _convert_jobs_lock:
+        _convert_jobs[job_id] = {'status': 'running', 'percent': 0}
+
+    def run():
+        try:
+            def prog(done, total):
+                pct = int(done / total * 100) if total else 0
+                with _convert_jobs_lock:
+                    if job_id in _convert_jobs:
+                        _convert_jobs[job_id]['percent'] = pct
+            copc_path = copc_io.ensure_copc(src_path, progress=prog)
+            with _convert_jobs_lock:
+                _convert_jobs[job_id].update(
+                    status='done', percent=100, copc_path=copc_path)
+        except Exception as e:
+            if logger:
+                logger.warning(f"COPC convert job {job_id} failed: {e}")
+            with _convert_jobs_lock:
+                _convert_jobs[job_id].update(status='error', error=str(e))
+
+    threading.Thread(target=run, daemon=True).start()
+    return job_id
 
 
 def _copc_guard(path):
@@ -282,6 +307,25 @@ def copc_meta():
         return jsonify(copc_io.copc_meta(path))
     except Exception as e:
         return _error_response(e, 'copc_meta')
+
+
+@api_bp.route('/api/copc/convert_status', methods=['GET'])
+def copc_convert_status():
+    job = request.args.get('job', '')
+    with _convert_jobs_lock:
+        j = dict(_convert_jobs.get(job, {}))
+    if not j:
+        return jsonify({'error': 'unknown job'}), 404
+    if j['status'] == 'done':
+        try:
+            return jsonify({'status': 'done', 'percent': 100,
+                            'meta': copc_io.copc_meta(j['copc_path']),
+                            'path': j['copc_path']})
+        except Exception as e:
+            return _error_response(e, 'copc_convert_status')
+    if j['status'] == 'error':
+        return jsonify({'status': 'error', 'error': j.get('error', 'conversion failed')})
+    return jsonify({'status': 'running', 'percent': j.get('percent', 0)})
 
 
 @api_bp.route('/api/copc/hierarchy', methods=['GET'])

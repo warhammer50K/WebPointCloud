@@ -6,13 +6,21 @@
 import { $, formatFileSize, formatDate, formatPoints } from './utils.js';
 import { showToast, customConfirm, showLoading, hideLoading, withLoading } from './ui-notifications.js';
 import { appendLog } from './ui-panels.js';
+import { pollConvert } from './data.js';
 
 /**
  * Route loaded data to the right viewer mode (COPC stream / gaussian / point
- * cloud) and return display info for legend + logging.
- * @returns {{bounds:Object, offsetZ:number, count:number, label:string}}
+ * cloud) and return display info for legend + logging. For large uploads still
+ * converting to COPC, polls the job (reporting % via onConvertPct) first.
+ * @returns {Promise<{bounds:Object, offsetZ:number, count:number, label:string}>}
  */
-function dispatchLoad(viewer, data) {
+async function dispatchLoad(viewer, data, onConvertPct) {
+    if (data.mode === 'converting') {
+        const { meta, path } = await pollConvert(data.job, onConvertPct);
+        viewer.loadCopc(meta, path);
+        return { bounds: viewer.bounds, offsetZ: meta.coordOffset[2],
+                 count: meta.point_count, label: 'pts' };
+    }
     if (data.mode === 'copc') {
         viewer.loadCopc(data.meta, data.path);
         return { bounds: viewer.bounds, offsetZ: data.meta.coordOffset[2],
@@ -101,7 +109,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                 const data = await uploadLasFile(file, pct => {
                     $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
                 });
-                const info = dispatchLoad(viewer, data);
+                const info = await dispatchLoad(viewer, data, pct => {
+                    $('st-main').textContent = `Converting ${file.name} to COPC… ${pct}%`;
+                });
                 legend.update(viewer.colorMode, info.bounds, info.offsetZ);
                 if (data.savedPath) {
                     const { setCurrentPath } = await import('./analysis.js');
@@ -204,7 +214,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                         showLoading(`Loading ${mapName}/${f}...`);
                         try {
                             const data = await loadLasFromPath(fullPath);
-                            const info = dispatchLoad(viewer, data);
+                            const info = await dispatchLoad(viewer, data, pct => {
+                                $('st-main').textContent = `Converting ${f} to COPC… ${pct}%`;
+                            });
                             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
                             $('compare-a-name').textContent = `${mapName}/${f}`;
                             // Set current path for analysis
@@ -319,7 +331,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         showLoading(`Loading ${file.name}...`);
         try {
             const data = await uploadLasFile(file);
-            const info = dispatchLoad(viewer, data);
+            const info = await dispatchLoad(viewer, data, pct => {
+                $('st-main').textContent = `Converting ${file.name} to COPC… ${pct}%`;
+            });
             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
             $('no-data-msg').style.display = 'none';
             $('st-main').textContent = `Loaded ${info.count.toLocaleString()} ${info.label}`;

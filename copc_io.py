@@ -253,11 +253,13 @@ def copc_nodes_multiblob(path, keys):
     return struct.pack('<I', count) + b''.join(parts)
 
 
-def ensure_copc(src_path, dst_path=None):
+def ensure_copc(src_path, dst_path=None, progress=None):
     """Convert a non-COPC cloud to .copc.laz, returning the output path.
 
     Tool ladder: PDAL>=2.4 (writers.copc) → copclib builder → raise. Callers
-    should fall back to the legacy whole-cloud path if this raises."""
+    should fall back to the legacy whole-cloud path if this raises.
+    ``progress(done, total)`` is called during the copclib build (PDAL path is
+    a single CLI call with no progress)."""
     if is_copc(src_path):
         return src_path
     if dst_path is None:
@@ -273,7 +275,7 @@ def ensure_copc(src_path, dst_path=None):
         )
         return dst_path
 
-    # 2) copclib octree builder (self-contained)
+    # 2) copclib octree builder (self-contained, bulk Unpack)
     try:
         from tools.las_to_copc import las_to_copc
     except Exception:
@@ -286,7 +288,7 @@ def ensure_copc(src_path, dst_path=None):
                 'COPC conversion unavailable: install PDAL>=2.4 (writers.copc) '
                 'or copclib'
             ) from e
-    las_to_copc(src_path, dst_path)
+    las_to_copc(src_path, dst_path, progress=progress)
     return dst_path
 
 

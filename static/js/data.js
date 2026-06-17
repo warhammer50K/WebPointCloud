@@ -107,7 +107,7 @@ export async function loadLasFromPath(path) {
 }
 
 export async function uploadLasFile(file, onProgress) {
-    const { buffer, savedPath, copcMeta } = await new Promise((resolve, reject) => {
+    const { buffer, savedPath, copcMeta, convertJob } = await new Promise((resolve, reject) => {
         const form = new FormData();
         form.append('file', file);
         const xhr = new XMLHttpRequest();
@@ -122,10 +122,15 @@ export async function uploadLasFile(file, onProgress) {
             if (xhr.status >= 200 && xhr.status < 300) {
                 const ct = xhr.getResponseHeader('Content-Type') || '';
                 const savedPath = xhr.getResponseHeader('X-Saved-Path');
-                // COPC: server returns JSON meta instead of a point binary.
+                // COPC: server returns JSON — either ready-to-stream meta, or a
+                // 202 "converting" job to poll.
                 if (ct.includes('application/json')) {
-                    const meta = JSON.parse(new TextDecoder().decode(xhr.response));
-                    resolve({ copcMeta: meta, savedPath });
+                    const obj = JSON.parse(new TextDecoder().decode(xhr.response));
+                    if (obj.mode === 'converting') {
+                        resolve({ convertJob: obj.job, savedPath });
+                    } else {
+                        resolve({ copcMeta: obj, savedPath });
+                    }
                 } else {
                     resolve({ buffer: xhr.response, savedPath });
                 }
@@ -142,12 +147,28 @@ export async function uploadLasFile(file, onProgress) {
         xhr.onerror = () => reject(new Error('Upload network error'));
         xhr.send(form);
     });
+    if (convertJob) {
+        return { mode: 'converting', job: convertJob, savedPath };
+    }
     if (copcMeta) {
         return { mode: 'copc', meta: copcMeta, path: savedPath, savedPath };
     }
     const data = await workerParseBinary(buffer);
     data.savedPath = savedPath;
     return data;
+}
+
+/** Poll a background COPC conversion job until done; returns {meta, path}. */
+export async function pollConvert(job, onProgress) {
+    for (;;) {
+        const resp = await fetch(`/api/copc/convert_status?job=${encodeURIComponent(job)}`);
+        if (!resp.ok) throw new Error('Conversion status check failed');
+        const s = await resp.json();
+        if (onProgress) onProgress(s.percent || 0);
+        if (s.status === 'done') return { meta: s.meta, path: s.path };
+        if (s.status === 'error') throw new Error(s.error || 'Conversion failed');
+        await new Promise(r => setTimeout(r, 500));
+    }
 }
 
 export function workerFilterPoints(positions, intensities, colors, mvpMatrix, viewportW, viewportH, polyPoints, keep) {

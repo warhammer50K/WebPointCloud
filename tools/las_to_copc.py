@@ -1,60 +1,79 @@
 #!/usr/bin/env python3
 """LAS/LAZ -> COPC(.copc.laz) octree builder using copclib.
 
-copclib can *write* COPC but does not build the octree for you: points must be
-distributed across the EPT octree (VoxelKey nodes) by the caller. This module
-implements the standard top-down voxel-grid subsampling used by COPC/EPT:
+copclib can write COPC but won't build the octree: points must be distributed
+across the EPT octree (VoxelKey nodes) by the caller. This implements the
+standard top-down voxel-grid subsampling COPC/EPT uses:
 
   - root cube = cubic bounds of the cloud (center, halfsize)
   - at each node, quantize points to a GRID^3 lattice; keep one representative
-    point per occupied cell at this level, push the rest down to the 8 children
+    per occupied cell at this level, push the rest to the 8 children
   - recurse until no points remain (or max_depth)
 
-A point lives at exactly one level, so a correct octree cut has no duplicates.
+Points are written in BULK: laspy produces a PDRF 6/7 packed record array, and
+each node's slice is handed to copclib via Points.Unpack (one C++ call per node,
+no per-point Python loop). This is dramatically faster than CreatePoint/AddPoint.
 
-Used for the Stage-0 test sample and as the copclib fallback in
-``copc_io.ensure_copc`` (Stage 3) when PDAL>=2.4 (writers.copc) is unavailable.
+Used for the Stage-0 test sample and as the copclib path in
+``copc_io.ensure_copc``.
 
 Usage: python3 tools/las_to_copc.py <src.las> <dst.copc.laz>
 """
 import sys
+
 import numpy as np
 import laspy
 import copclib as copc
 
+SCALE = 0.001  # 1 mm; coords are centered on the octree center so int32 is ample
 
-def las_to_copc(src_path, dst_path, grid=128, max_depth=16):
+
+def _as_vectorchar(record_slice):
+    """Pack a structured-array slice into a copclib VectorChar (signed char)."""
+    data = np.ascontiguousarray(record_slice).tobytes()
+    return copc.VectorChar(memoryview(data).cast('b'))
+
+
+def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     las = laspy.read(src_path)
-    P = np.column_stack([
-        np.asarray(las.x, dtype=np.float64),
-        np.asarray(las.y, dtype=np.float64),
-        np.asarray(las.z, dtype=np.float64),
-    ])
-    n = len(P)
+    n = int(las.header.point_count)
     if n == 0:
         raise ValueError("empty point cloud")
 
-    dims = {d.name for d in las.point_format.dimensions}
-    # RGB only if actually populated (many LAS files carry an all-zero RGB triplet).
-    has_rgb = {"red", "green", "blue"} <= dims and int(np.asarray(las.red).max()) > 0
-    inten = np.asarray(las.intensity) if "intensity" in dims else np.zeros(n, np.uint16)
+    x = np.asarray(las.x, dtype=np.float64)
+    y = np.asarray(las.y, dtype=np.float64)
+    z = np.asarray(las.z, dtype=np.float64)
+    P = np.column_stack([x, y, z])
 
-    if has_rgb:
-        pfid = 7  # PDRF 7: xyz + intensity + RGB + gps_time
-        R = np.asarray(las.red).astype(np.int64)
-        G = np.asarray(las.green).astype(np.int64)
-        B = np.asarray(las.blue).astype(np.int64)
-    else:
-        pfid = 6  # PDRF 6: xyz + intensity + gps_time (no RGB)
+    dims = {d.name for d in las.point_format.dimensions}
+    has_rgb = {'red', 'green', 'blue'} <= dims and int(np.asarray(las.red).max()) > 0
+    inten = (np.asarray(las.intensity, dtype=np.uint16)
+             if 'intensity' in dims else np.zeros(n, np.uint16))
+    pfid = 7 if has_rgb else 6  # COPC requires PDRF 6/7/8; 7 carries RGB
 
     mins = P.min(axis=0)
     maxs = P.max(axis=0)
     center = (mins + maxs) / 2.0
     halfsize = float((maxs - mins).max()) / 2.0
-    halfsize *= 1.0 + 1e-6  # pad so max corner is strictly inside the root cube
+    halfsize *= 1.0 + 1e-6  # pad so the max corner is strictly inside the cube
     cube_min = center - halfsize
 
-    scale = copc.Vector3(0.001, 0.001, 0.001)
+    # Build a PDRF 6/7 packed record array once (laspy handles the byte layout).
+    hdr = laspy.LasHeader(version="1.4", point_format=pfid)
+    hdr.scales = [SCALE, SCALE, SCALE]
+    hdr.offsets = [float(center[0]), float(center[1]), float(center[2])]
+    packed_las = laspy.LasData(hdr)
+    packed_las.x = x
+    packed_las.y = y
+    packed_las.z = z
+    packed_las.intensity = inten
+    if has_rgb:
+        packed_las.red = np.asarray(las.red, dtype=np.uint16)
+        packed_las.green = np.asarray(las.green, dtype=np.uint16)
+        packed_las.blue = np.asarray(las.blue, dtype=np.uint16)
+    records = packed_las.points.array  # structured packed PDRF records
+
+    scale = copc.Vector3(SCALE, SCALE, SCALE)
     offset = copc.Vector3(float(center[0]), float(center[1]), float(center[2]))
     cfg = copc.CopcConfigWriter(pfid, scale, offset)
     cfg.las_header.min = copc.Vector3(float(mins[0]), float(mins[1]), float(mins[2]))
@@ -67,7 +86,7 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16):
 
     writer = copc.FileWriter(dst_path, cfg)
 
-    # node_pts[(d,x,y,z)] = int index array of points kept AT that node
+    # node_pts[(d,x,y,z)] = int index array kept AT that node
     node_pts = {}
 
     def subsample(d, kx, ky, kz, idx):
@@ -90,7 +109,7 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16):
         if len(rest) == 0:
             return
         mid = nmin + node_size / 2.0
-        ge = P[rest] >= mid  # which octant each remaining point falls in
+        ge = P[rest] >= mid
         for ox in (0, 1):
             for oy in (0, 1):
                 for oz in (0, 1):
@@ -101,27 +120,19 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16):
     sys.setrecursionlimit(10000)
     subsample(0, 0, 0, 0, np.arange(n))
 
-    total = 0
+    done = 0
     for (d, kx, ky, kz), idx in node_pts.items():
         if len(idx) == 0:
             continue
-        pts = copc.Points(pfid)
-        for i in idx:
-            p = pts.CreatePoint()
-            p.x = float(P[i, 0])
-            p.y = float(P[i, 1])
-            p.z = float(P[i, 2])
-            p.intensity = int(inten[i])
-            if has_rgb:
-                p.red = int(R[i])
-                p.green = int(G[i])
-                p.blue = int(B[i])
-            pts.AddPoint(p)
+        vc = _as_vectorchar(records[idx])
+        pts = copc.Points.Unpack(vc, pfid, 0, scale, offset)  # bulk, one C++ call
         writer.AddNode(copc.VoxelKey(d, kx, ky, kz), pts)
-        total += len(idx)
+        done += len(idx)
+        if progress is not None:
+            progress(done, n)
 
     writer.Close()
-    return {"point_count": total, "nodes": len(node_pts),
+    return {"point_count": done, "nodes": len(node_pts),
             "point_format": pfid, "has_rgb": has_rgb}
 
 
