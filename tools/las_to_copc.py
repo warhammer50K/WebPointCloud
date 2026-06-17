@@ -19,20 +19,45 @@ Used for the Stage-0 test sample and as the copclib path in
 
 Usage: python3 tools/las_to_copc.py <src.las> <dst.copc.laz>
 """
+import os
 import sys
 import time
+import multiprocessing as mp
 
 import numpy as np
 import laspy
 import copclib as copc
 
 SCALE = 0.001  # 1 mm; coords are centered on the octree center so int32 is ample
+PARALLEL_MIN_POINTS = int(os.environ.get('WPC_COPC_PARALLEL_MIN', '2000000'))
+MAX_WRITE_PROCS = int(os.environ.get('WPC_COPC_WRITE_PROCS', '8'))
 
 
 def _as_vectorchar(record_slice):
     """Pack a structured-array slice into a copclib VectorChar (signed char)."""
     data = np.ascontiguousarray(record_slice).tobytes()
     return copc.VectorChar(memoryview(data).cast('b'))
+
+
+# ── Parallel LAZ compression workers (forked; share _W_RECORDS via copy-on-write) ──
+# LAZ compression holds the GIL, so threads don't help — but it's CPU-bound and
+# per-node independent, so we fork workers that compress node slices in parallel.
+_W_RECORDS = None   # the full packed PDRF record array (inherited by fork)
+_W_HEADER = None    # per-worker copc LasHeader for CompressBytes
+
+
+def _compress_init(pfid, scale_t, offset_t):
+    global _W_HEADER
+    cfg = copc.CopcConfigWriter(pfid, copc.Vector3(*scale_t), copc.Vector3(*offset_t))
+    _W_HEADER = cfg.las_header
+
+
+def _compress_node(args):
+    key, idx = args
+    rec = np.ascontiguousarray(_W_RECORDS[idx])
+    vc = copc.VectorChar(memoryview(rec.tobytes()).cast('b'))
+    comp = copc.CompressBytes(vc, _W_HEADER)
+    return key, bytes(comp), int(len(idx))
 
 
 def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
@@ -157,16 +182,36 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     subsample(0, 0, 0, 0, np.arange(n))
     t_build = time.monotonic()
 
+    items = [(k, idx) for k, idx in node_pts.items() if len(idx) > 0]
+    nproc = min(MAX_WRITE_PROCS, os.cpu_count() or 1)
     done = 0
-    for (d, kx, ky, kz), idx in node_pts.items():
-        if len(idx) == 0:
-            continue
-        vc = _as_vectorchar(records[idx])
-        pts = copc.Points.Unpack(vc, pfid, 0, scale, offset)  # bulk, one C++ call
-        writer.AddNode(copc.VoxelKey(d, kx, ky, kz), pts)
-        done += len(idx)
-        if progress is not None:
-            progress(done, n, 'writing')
+
+    if nproc > 1 and n >= PARALLEL_MIN_POINTS:
+        # Parallel: workers compress node slices (LAZ), writer adds them serially.
+        global _W_RECORDS
+        _W_RECORDS = records  # forked workers inherit this via copy-on-write
+        offset_t = (float(center[0]), float(center[1]), float(center[2]))
+        try:
+            with mp.Pool(nproc, initializer=_compress_init,
+                         initargs=(pfid, (SCALE, SCALE, SCALE), offset_t)) as pool:
+                for (d, kx, ky, kz), comp, cnt in pool.imap_unordered(
+                        _compress_node, items, chunksize=32):
+                    writer.AddNodeCompressed(
+                        copc.VoxelKey(d, kx, ky, kz),
+                        copc.VectorChar(memoryview(comp).cast('b')), cnt)
+                    done += cnt
+                    if progress is not None:
+                        progress(done, n, 'writing')
+        finally:
+            _W_RECORDS = None
+    else:
+        for (d, kx, ky, kz), idx in items:
+            vc = _as_vectorchar(records[idx])
+            pts = copc.Points.Unpack(vc, pfid, 0, scale, offset)
+            writer.AddNode(copc.VoxelKey(d, kx, ky, kz), pts)
+            done += len(idx)
+            if progress is not None:
+                progress(done, n, 'writing')
 
     writer.Close()
     t_write = time.monotonic()
