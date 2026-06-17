@@ -20,6 +20,7 @@ Used for the Stage-0 test sample and as the copclib path in
 Usage: python3 tools/las_to_copc.py <src.las> <dst.copc.laz>
 """
 import sys
+import time
 
 import numpy as np
 import laspy
@@ -38,6 +39,7 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     # progress(done, total, phase) — phase ∈ {'reading','building','writing'}.
     # Reading/subsampling can't report incremental %, so they emit phase labels;
     # the write loop reports real progress.
+    t_start = time.monotonic()
     if progress is not None:
         progress(0, 1, 'reading')
     las = laspy.read(src_path)
@@ -151,7 +153,9 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     sys.setrecursionlimit(10000)
     if progress is not None:
         progress(0, 1, 'building')
+    t_prep = time.monotonic()        # read + packed prep done
     subsample(0, 0, 0, 0, np.arange(n))
+    t_build = time.monotonic()
 
     done = 0
     for (d, kx, ky, kz), idx in node_pts.items():
@@ -165,6 +169,12 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
             progress(done, n, 'writing')
 
     writer.Close()
+    t_write = time.monotonic()
+    # Stage timing to stderr (captured in the server log) — used to decide where
+    # to parallelize. read = file load + packed-array prep.
+    print(f"[las_to_copc] n={n} nodes={len(node_pts)} "
+          f"read={t_prep - t_start:.1f}s build={t_build - t_prep:.1f}s "
+          f"write={t_write - t_build:.1f}s", file=sys.stderr, flush=True)
     return {"point_count": done, "nodes": len(node_pts),
             "point_format": pfid, "has_rgb": has_rgb}
 
