@@ -8,6 +8,13 @@ import { showToast, customConfirm, showLoading, hideLoading, withLoading } from 
 import { appendLog } from './ui-panels.js';
 import { pollConvert } from './data.js';
 
+/** Conversion overlay label by phase (reading/building have no incremental %). */
+function convLabel(name, pct, phase) {
+    if (phase === 'reading') return `Reading ${name}…`;
+    if (phase === 'building') return `Building octree…`;
+    return `Converting ${name} to COPC… ${pct}%`;
+}
+
 /**
  * Route loaded data to the right viewer mode (COPC stream / gaussian / point
  * cloud) and return display info for legend + logging. For large uploads still
@@ -109,8 +116,8 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                 const data = await uploadLasFile(file, pct => {
                     $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
                 });
-                const info = await dispatchLoad(viewer, data, pct => {
-                    $('st-main').textContent = `Converting ${file.name} to COPC… ${pct}%`;
+                const info = await dispatchLoad(viewer, data, (pct, phase) => {
+                    showLoading(convLabel(file.name, pct, phase));
                 });
                 legend.update(viewer.colorMode, info.bounds, info.offsetZ);
                 if (data.savedPath) {
@@ -214,8 +221,8 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                         showLoading(`Loading ${mapName}/${f}...`);
                         try {
                             const data = await loadLasFromPath(fullPath);
-                            const info = await dispatchLoad(viewer, data, pct => {
-                                $('st-main').textContent = `Converting ${f} to COPC… ${pct}%`;
+                            const info = await dispatchLoad(viewer, data, (pct, phase) => {
+                                showLoading(convLabel(f, pct, phase));
                             });
                             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
                             $('compare-a-name').textContent = `${mapName}/${f}`;
@@ -331,8 +338,8 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         showLoading(`Loading ${file.name}...`);
         try {
             const data = await uploadLasFile(file);
-            const info = await dispatchLoad(viewer, data, pct => {
-                $('st-main').textContent = `Converting ${file.name} to COPC… ${pct}%`;
+            const info = await dispatchLoad(viewer, data, (pct, phase) => {
+                showLoading(convLabel(file.name, pct, phase));
             });
             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
             $('no-data-msg').style.display = 'none';

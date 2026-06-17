@@ -261,15 +261,16 @@ def _start_convert_job(src_path, logger=None):
     /api/copc/convert_status."""
     job_id = uuid.uuid4().hex[:12]
     with _convert_jobs_lock:
-        _convert_jobs[job_id] = {'status': 'running', 'percent': 0}
+        _convert_jobs[job_id] = {'status': 'running', 'percent': 0, 'phase': 'reading'}
 
     def run():
         try:
-            def prog(done, total):
+            def prog(done, total, phase='writing'):
                 pct = int(done / total * 100) if total else 0
                 with _convert_jobs_lock:
                     if job_id in _convert_jobs:
                         _convert_jobs[job_id]['percent'] = pct
+                        _convert_jobs[job_id]['phase'] = phase
             copc_path = copc_io.ensure_copc(src_path, progress=prog)
             with _convert_jobs_lock:
                 _convert_jobs[job_id].update(
@@ -325,7 +326,8 @@ def copc_convert_status():
             return _error_response(e, 'copc_convert_status')
     if j['status'] == 'error':
         return jsonify({'status': 'error', 'error': j.get('error', 'conversion failed')})
-    return jsonify({'status': 'running', 'percent': j.get('percent', 0)})
+    return jsonify({'status': 'running', 'percent': j.get('percent', 0),
+                    'phase': j.get('phase', 'writing')})
 
 
 @api_bp.route('/api/copc/hierarchy', methods=['GET'])

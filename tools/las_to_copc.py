@@ -35,6 +35,11 @@ def _as_vectorchar(record_slice):
 
 
 def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
+    # progress(done, total, phase) — phase ∈ {'reading','building','writing'}.
+    # Reading/subsampling can't report incremental %, so they emit phase labels;
+    # the write loop reports real progress.
+    if progress is not None:
+        progress(0, 1, 'reading')
     las = laspy.read(src_path)
     n = int(las.header.point_count)
     if n == 0:
@@ -130,6 +135,8 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
                         subsample(d + 1, 2 * kx + ox, 2 * ky + oy, 2 * kz + oz, rest[m])
 
     sys.setrecursionlimit(10000)
+    if progress is not None:
+        progress(0, 1, 'building')
     subsample(0, 0, 0, 0, np.arange(n))
 
     done = 0
@@ -141,7 +148,7 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
         writer.AddNode(copc.VoxelKey(d, kx, ky, kz), pts)
         done += len(idx)
         if progress is not None:
-            progress(done, n)
+            progress(done, n, 'writing')
 
     writer.Close()
     return {"point_count": done, "nodes": len(node_pts),

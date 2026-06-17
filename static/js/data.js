@@ -168,7 +168,7 @@ export async function pollConvert(job, onProgress) {
         const resp = await fetch(`/api/copc/convert_status?job=${encodeURIComponent(job)}`);
         if (!resp.ok) throw new Error('Conversion status check failed');
         const s = await resp.json();
-        if (onProgress) onProgress(s.percent || 0);
+        if (onProgress) onProgress(s.percent || 0, s.phase || 'writing');
         if (s.status === 'done') return { meta: s.meta, path: s.path };
         if (s.status === 'error') throw new Error(s.error || 'Conversion failed');
         await new Promise(r => setTimeout(r, 500));
