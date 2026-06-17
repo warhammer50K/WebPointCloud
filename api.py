@@ -269,9 +269,6 @@ def _start_convert_job(src_path, logger=None):
     Progress is reported during the copclib build; the client polls
     /api/copc/convert_status."""
     job_id = uuid.uuid4().hex[:12]
-    # Capture in the request context — the worker thread has no app context.
-    uploads_dir = os.path.realpath(
-        os.path.join(current_app.config['MAPS_DIR'], '_uploads'))
     with _convert_jobs_lock:
         _convert_jobs[job_id] = {'status': 'running', 'percent': 0, 'phase': 'reading'}
 
@@ -284,15 +281,6 @@ def _start_convert_job(src_path, logger=None):
                         _convert_jobs[job_id]['percent'] = pct
                         _convert_jobs[job_id]['phase'] = phase
             copc_path = copc_io.ensure_copc(src_path, progress=prog)
-            # Uploaded originals are only needed for conversion — once the COPC
-            # exists, drop the (multi-GB) upload so _uploads doesn't accumulate.
-            # Files placed directly in the maps tree are left untouched.
-            if (copc_path != src_path
-                    and os.path.realpath(src_path).startswith(uploads_dir + os.sep)):
-                try:
-                    os.remove(src_path)
-                except OSError:
-                    pass
             with _convert_jobs_lock:
                 _convert_jobs[job_id].update(
                     status='done', percent=100, copc_path=copc_path)

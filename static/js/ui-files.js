@@ -57,13 +57,12 @@ export function initFileManagement(viewer, legend, deps, uiState) {
     const openModal = () => {
         uiState.compareMode = 'load';
         $('modal-file-title').textContent = 'Load Point Cloud';
-        $('btn-upload').style.display = '';
         modalBg.classList.add('open');
         const searchInput = $('map-search');
         if (searchInput) searchInput.value = '';
         refreshMapList();
     };
-    const closeModal = () => { modalBg.classList.remove('open'); uiState.compareMode = 'load'; $('btn-upload').style.display = ''; $('btn-upload').textContent = 'Upload File'; };
+    const closeModal = () => { modalBg.classList.remove('open'); uiState.compareMode = 'load'; };
 
     // Expose closeModal on uiState for cross-module use
     uiState.closeModal = closeModal;
@@ -72,70 +71,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
     $('btn-modal-close').addEventListener('click', closeModal);
     modalBg.addEventListener('click', e => { if (e.target === modalBg) closeModal(); });
 
-    // Upload
-    $('btn-upload').addEventListener('click', () => $('file-input').click());
-    $('file-input').addEventListener('change', async e => {
-        const file = e.target.files[0];
-        if (!file) return;
-        // UX-4: File size validation (5 GB matches server MAX_CONTENT_LENGTH)
-        const MAX_UPLOAD_SIZE = 5 * 1024 * 1024 * 1024;
-        if (file.size > MAX_UPLOAD_SIZE) {
-            showToast(`File too large (${formatFileSize(file.size)}). Maximum upload size is 5 GB.`, 'error');
-            e.target.value = '';
-            return;
-        }
-        const isCompare = uiState.compareMode === 'compare';
-        closeModal();
-
-        if (isCompare) {
-            $('st-main').textContent = `Uploading compare map: ${file.name}...`;
-            showLoading(`Loading compare map...`);
-            try {
-                const data = await uploadLasFile(file, pct => {
-                    $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
-                });
-                viewer.loadCompareCloud(data);
-                uiState.compareBPath = data.savedPath || null;
-                $('compare-panel').classList.remove('hidden');
-                $('compare-b-name').textContent = file.name;
-                const ptsA = viewer.pointCloud ? viewer.cloudData?.numPoints?.toLocaleString() || '?' : 'none';
-                const ptsB = data.numPoints.toLocaleString();
-                $('st-main').textContent = `A: ${ptsA} pts | B: ${ptsB} pts`;
-                appendLog(`Compare map uploaded: ${file.name} (${ptsB} pts)`, 'info');
-                showToast(`Map A: ${ptsA} pts + Map B: ${ptsB} pts`, 'success');
-            } catch (err) {
-                $('st-main').textContent = `Error: ${err.message}`;
-                showToast(`Failed: ${err.message}`, 'error');
-            } finally {
-                hideLoading();
-            }
-        } else {
-            $('st-main').textContent = `Uploading ${file.name} (${formatFileSize(file.size)})...`;
-            showLoading(`Loading ${file.name}...`);
-            try {
-                const data = await uploadLasFile(file, pct => {
-                    showLoading(`Uploading ${file.name}… ${pct}%`);
-                });
-                const info = await dispatchLoad(viewer, data, (pct, phase) => {
-                    showLoading(convLabel(file.name, pct, phase));
-                });
-                legend.update(viewer.colorMode, info.bounds, info.offsetZ);
-                if (data.savedPath) {
-                    const { setCurrentPath } = await import('./analysis.js');
-                    setCurrentPath(data.savedPath);
-                }
-                $('compare-a-name').textContent = file.name;
-                $('no-data-msg').style.display = 'none';
-                $('st-main').textContent = `Loaded ${info.count.toLocaleString()} ${info.label}`;
-                appendLog(`Loaded ${file.name} (${info.count.toLocaleString()} ${info.label})`, 'success');
-            } catch (err) {
-                $('st-main').textContent = `Error: ${err.message}`;
-                showToast(`Failed: ${err.message}`, 'error');
-            } finally {
-                hideLoading();
-            }
-        }
-    });
+    // (Upload removed — maps are loaded from ~/maps via the list below.)
 
     // Refresh map list
     async function refreshMapList() {
@@ -146,7 +82,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             const maps = await resp.json();
             list.innerHTML = '';
             if (maps.length === 0) {
-                list.innerHTML = '<div style="color:var(--text-dim)">No saved maps. Use Upload File to load a LAS/LAZ file.</div>';
+                list.innerHTML = '<div style="color:var(--text-dim)">No maps found. Place a LAS/LAZ/COPC file in the maps directory.</div>';
                 return;
             }
             for (const m of maps) {
@@ -320,46 +256,12 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         });
     });
 
-    // ── Drag & Drop ──
-    const wrap = $('viewer-wrap');
-    const dropOverlay = $('drop-overlay');
-    let dragCounter = 0;
-
-    wrap.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dropOverlay.style.display = 'flex'; });
-    wrap.addEventListener('dragleave', e => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dropOverlay.style.display = 'none'; } });
-    wrap.addEventListener('dragover', e => e.preventDefault());
-    wrap.addEventListener('drop', async e => {
-        e.preventDefault();
-        dragCounter = 0;
-        dropOverlay.style.display = 'none';
-        const file = e.dataTransfer.files[0];
-        if (!file || !file.name.match(/\.(las|laz|ply|xyz|txt|csv|pcd|pts|splat)$/i)) return;
-        $('st-main').textContent = `Loading ${file.name}...`;
-        showLoading(`Loading ${file.name}...`);
-        try {
-            const data = await uploadLasFile(file, pct => {
-                showLoading(`Uploading ${file.name}… ${pct}%`);
-            });
-            const info = await dispatchLoad(viewer, data, (pct, phase) => {
-                showLoading(convLabel(file.name, pct, phase));
-            });
-            legend.update(viewer.colorMode, info.bounds, info.offsetZ);
-            $('no-data-msg').style.display = 'none';
-            $('st-main').textContent = `Loaded ${info.count.toLocaleString()} ${info.label}`;
-            appendLog(`Loaded ${file.name} (${info.count.toLocaleString()} pts)`, 'success');
-        } catch (err) {
-            $('st-main').textContent = `Error: ${err.message}`;
-            showToast(`Failed: ${err.message}`, 'error');
-        } finally {
-            hideLoading();
-        }
-    });
+    // (Drag & drop upload removed — maps are loaded from ~/maps via the list.)
 
     // ── Compare map ──
     $('btn-compare-map').addEventListener('click', () => {
         uiState.compareMode = 'compare';
         $('modal-file-title').textContent = 'Select Map B (Compare)';
-        $('btn-upload').textContent = 'Upload Map B';
         $('modal-file').classList.add('open');
         refreshMapList();
     });
