@@ -106,11 +106,24 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     # node_pts[(d,x,y,z)] = int index array kept AT that node
     node_pts = {}
 
+    build_done = [0]
+    build_pct = [0]
+
+    def _build_progress(added):
+        build_done[0] += added
+        if progress is None:
+            return
+        pct = int(build_done[0] / n * 100)
+        if pct > build_pct[0]:
+            build_pct[0] = pct
+            progress(build_done[0], n, 'building')
+
     def subsample(d, kx, ky, kz, idx):
         node_size = (2.0 * halfsize) / (2 ** d)
         nmin = cube_min + np.array([kx, ky, kz], dtype=np.float64) * node_size
         if d >= max_depth:
             node_pts[(d, kx, ky, kz)] = idx
+            _build_progress(len(idx))
             return
         step = node_size / grid
         loc = np.floor((P[idx] - nmin) / step).astype(np.int64)
@@ -123,6 +136,7 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
         keep = idx[order[first]]
         rest = idx[order[~first]]
         node_pts[(d, kx, ky, kz)] = keep
+        _build_progress(len(keep))
         if len(rest) == 0:
             return
         mid = nmin + node_size / 2.0

@@ -8,10 +8,10 @@ import { showToast, customConfirm, showLoading, hideLoading, withLoading } from 
 import { appendLog } from './ui-panels.js';
 import { pollConvert } from './data.js';
 
-/** Conversion overlay label by phase (reading/building have no incremental %). */
+/** Conversion overlay label by phase. */
 function convLabel(name, pct, phase) {
     if (phase === 'reading') return `Reading ${name}…`;
-    if (phase === 'building') return `Building octree…`;
+    if (phase === 'building') return `Building octree… ${pct}%`;
     return `Converting ${name} to COPC… ${pct}%`;
 }
 
