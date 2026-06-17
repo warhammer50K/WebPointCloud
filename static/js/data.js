@@ -97,11 +97,15 @@ export async function loadLasFromPath(path) {
         const err = await resp.json();
         throw new Error(err.error || 'Failed to load');
     }
-    // COPC maps respond with JSON meta and stream via the octree LOD path.
+    // COPC maps respond with JSON — ready-to-stream meta, or a 202 "converting"
+    // job to poll (large non-COPC maps convert in the background here too).
     const ct = resp.headers.get('Content-Type') || '';
     if (ct.includes('application/json')) {
-        const meta = await resp.json();
-        return { mode: 'copc', meta, path };
+        const obj = await resp.json();
+        if (obj.mode === 'converting') {
+            return { mode: 'converting', job: obj.job, path };
+        }
+        return { mode: 'copc', meta: obj, path };
     }
     return workerParseBinary(await resp.arrayBuffer());
 }

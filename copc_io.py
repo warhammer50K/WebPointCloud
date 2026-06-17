@@ -266,6 +266,14 @@ def ensure_copc(src_path, dst_path=None, progress=None):
         base = os.path.splitext(src_path)[0]
         dst_path = base + '.copc.laz'
 
+    # Reuse a previous conversion if it's present and at least as new as the source.
+    if (os.path.exists(dst_path)
+            and os.path.getmtime(dst_path) >= os.path.getmtime(src_path)
+            and is_copc(dst_path)):
+        if progress is not None:
+            progress(1, 1)
+        return dst_path
+
     # 1) PDAL CLI with writers.copc (PDAL >= 2.4)
     if _pdal_has_copc_writer():
         import subprocess
