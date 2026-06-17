@@ -114,7 +114,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             showLoading(`Loading ${file.name}...`);
             try {
                 const data = await uploadLasFile(file, pct => {
-                    $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
+                    showLoading(`Uploading ${file.name}… ${pct}%`);
                 });
                 const info = await dispatchLoad(viewer, data, (pct, phase) => {
                     showLoading(convLabel(file.name, pct, phase));
@@ -337,7 +337,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         $('st-main').textContent = `Loading ${file.name}...`;
         showLoading(`Loading ${file.name}...`);
         try {
-            const data = await uploadLasFile(file);
+            const data = await uploadLasFile(file, pct => {
+                showLoading(`Uploading ${file.name}… ${pct}%`);
+            });
             const info = await dispatchLoad(viewer, data, (pct, phase) => {
                 showLoading(convLabel(file.name, pct, phase));
             });
