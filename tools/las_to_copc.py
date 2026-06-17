@@ -43,16 +43,23 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     x = np.asarray(las.x, dtype=np.float64)
     y = np.asarray(las.y, dtype=np.float64)
     z = np.asarray(las.z, dtype=np.float64)
-    P = np.column_stack([x, y, z])
 
     dims = {d.name for d in las.point_format.dimensions}
     has_rgb = {'red', 'green', 'blue'} <= dims and int(np.asarray(las.red).max()) > 0
     inten = (np.asarray(las.intensity, dtype=np.uint16)
              if 'intensity' in dims else np.zeros(n, np.uint16))
+    if has_rgb:
+        rr = np.asarray(las.red, dtype=np.uint16)
+        gg = np.asarray(las.green, dtype=np.uint16)
+        bb = np.asarray(las.blue, dtype=np.uint16)
     pfid = 7 if has_rgb else 6  # COPC requires PDRF 6/7/8; 7 carries RGB
 
-    mins = P.min(axis=0)
-    maxs = P.max(axis=0)
+    # Release the original record array (can be several GB) before allocating the
+    # packed copy — keeps peak memory roughly halved on big clouds.
+    del las
+
+    mins = np.array([x.min(), y.min(), z.min()])
+    maxs = np.array([x.max(), y.max(), z.max()])
     center = (mins + maxs) / 2.0
     halfsize = float((maxs - mins).max()) / 2.0
     halfsize *= 1.0 + 1e-6  # pad so the max corner is strictly inside the cube
@@ -68,10 +75,15 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     packed_las.z = z
     packed_las.intensity = inten
     if has_rgb:
-        packed_las.red = np.asarray(las.red, dtype=np.uint16)
-        packed_las.green = np.asarray(las.green, dtype=np.uint16)
-        packed_las.blue = np.asarray(las.blue, dtype=np.uint16)
+        packed_las.red = rr
+        packed_las.green = gg
+        packed_las.blue = bb
+        del rr, gg, bb
     records = packed_las.points.array  # structured packed PDRF records
+    del inten
+
+    P = np.column_stack([x, y, z])  # subsample coords; x/y/z now redundant
+    del x, y, z
 
     scale = copc.Vector3(SCALE, SCALE, SCALE)
     offset = copc.Vector3(float(center[0]), float(center[1]), float(center[2]))
