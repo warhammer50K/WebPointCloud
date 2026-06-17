@@ -110,6 +110,11 @@ def copc_meta(path):
     h = reader.header
     ci = reader.copc_info
     center = [float(ci.center[0]), float(ci.center[1]), float(ci.center[2])]
+    try:
+        import config
+        point_budget = int(getattr(config, 'COPC_POINT_BUDGET', 5_000_000))
+    except Exception:
+        point_budget = 5_000_000
     return {
         'mode': 'copc',
         'is_copc': True,
@@ -117,6 +122,7 @@ def copc_meta(path):
         'point_format': int(h.point_format.id),
         'has_rgb': bool(entry['has_rgb']),
         'intensityMax': float(entry['intensity_max']),
+        'pointBudget': point_budget,
         'mins': [float(v) for v in h.mins],
         'maxs': [float(v) for v in h.maxs],
         'root': {
@@ -157,38 +163,14 @@ def copc_hierarchy(path, max_depth=32):
     return {'nodes': out}
 
 
-def copc_nodes_binary(path, keys):
-    """Points for the requested node *keys*, packed in the viewer binary format.
-
-    All nodes are fetched in a single batched read and centered by the fixed
-    octree center, so the payload drops straight into parse-worker's parseBinary
-    (fpp=7) and aligns with every other node."""
-    from laspy.copc import load_octree_for_query
-
-    entry = open_copc(path)
-    reader = entry['reader']
-    want = set(keys)
-    if not want:
-        return arrays_to_binary([], [], [], [], [], [], [], 0,
-                                offset=[0.0, 0.0, 0.0])
-
-    max_level = max(int(k.split('-')[0]) for k in want) + 1
-    all_nodes = load_octree_for_query(
-        reader.source, reader.copc_info, reader.root_page,
-        query_bounds=None, level_range=range(0, max_level),
-    )
-    sel = [nd for nd in all_nodes if _node_key_str(nd.key) in want]
-    if not sel:
-        return arrays_to_binary([], [], [], [], [], [], [], 0,
-                                offset=[0.0, 0.0, 0.0])
-
-    pts = reader._fetch_and_decompress_points_of_nodes(sel)
+def _pack_node_points(pts, entry, center):
+    """Normalize a node's points (matching pointcloud_io._read_las) and pack into
+    the viewer binary format, centered by the fixed octree center."""
     n = len(pts)
     x = np.asarray(pts.x, dtype=np.float64)
     y = np.asarray(pts.y, dtype=np.float64)
     z = np.asarray(pts.z, dtype=np.float64)
 
-    # Normalize identically to pointcloud_io._read_las.
     imax = entry['intensity_max']
     intensity = np.asarray(pts.intensity, dtype=np.float32)
     if imax > 0:
@@ -207,11 +189,68 @@ def copc_nodes_binary(path, keys):
         g = np.full(n, 0.5, dtype=np.float32)
         b = np.full(n, 0.5, dtype=np.float32)
 
-    center = reader.copc_info.center
     return arrays_to_binary(
         x, y, z, intensity, r, g, b, n,
         offset=[float(center[0]), float(center[1]), float(center[2])],
     )
+
+
+def _resolve_nodes(reader, keys):
+    """Map node key strings to OctreeNodes (single hierarchy walk)."""
+    from laspy.copc import load_octree_for_query
+    want = list(dict.fromkeys(keys))                # dedupe, preserve order
+    if not want:
+        return [], {}
+    max_level = max(int(k.split('-')[0]) for k in want) + 1
+    all_nodes = load_octree_for_query(
+        reader.source, reader.copc_info, reader.root_page,
+        query_bounds=None, level_range=range(0, max_level),
+    )
+    by_key = {_node_key_str(nd.key): nd for nd in all_nodes}
+    return want, by_key
+
+
+def copc_nodes_binary(path, keys):
+    """Points for the requested node *keys* as one combined viewer binary."""
+    entry = open_copc(path)
+    reader = entry['reader']
+    want, by_key = _resolve_nodes(reader, keys)
+    sel = [by_key[k] for k in want if k in by_key]
+    if not sel:
+        return arrays_to_binary([], [], [], [], [], [], [], 0,
+                                offset=[0.0, 0.0, 0.0])
+    pts = reader._fetch_and_decompress_points_of_nodes(sel)
+    return _pack_node_points(pts, entry, reader.copc_info.center)
+
+
+def copc_nodes_multiblob(path, keys):
+    """Points for many node *keys* in ONE response, split per node so the client
+    builds a separate geometry per node while paying a single HTTP round-trip.
+
+    Format: [uint32 numBlobs] then per blob:
+            [uint32 keyLen][key utf8][uint32 payloadLen][payload]
+    where payload is the same binary as copc_nodes_binary for that one node."""
+    import struct
+    entry = open_copc(path)
+    reader = entry['reader']
+    center = reader.copc_info.center
+    want, by_key = _resolve_nodes(reader, keys)
+
+    parts = []
+    count = 0
+    for k in want:
+        nd = by_key.get(k)
+        if nd is None:
+            continue
+        pts = reader._fetch_and_decompress_points_of_nodes([nd])
+        payload = _pack_node_points(pts, entry, center)
+        kb = k.encode('utf-8')
+        parts.append(struct.pack('<I', len(kb)))
+        parts.append(kb)
+        parts.append(struct.pack('<I', len(payload)))
+        parts.append(payload)
+        count += 1
+    return struct.pack('<I', count) + b''.join(parts)
 
 
 def ensure_copc(src_path, dst_path=None):

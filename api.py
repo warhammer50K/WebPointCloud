@@ -187,6 +187,15 @@ def load_pointcloud():
         if ext not in SUPPORTED_EXTENSIONS:
             return jsonify({'error': f'Unsupported format: {ext}'}), 400
 
+        # Auto-convert large non-COPC LAS/LAZ to COPC so they stream via octree
+        # LOD. On any failure we fall back to the legacy whole-cloud path.
+        if ext in ('.las', '.laz') and not copc_io.is_copc(path):
+            converted = _maybe_convert_to_copc(path)
+            if converted:
+                path = converted
+                saved_path = converted
+                ext = '.laz'
+
         # COPC: stream via octree LOD (JSON meta) instead of a whole-cloud binary.
         # The frontend distinguishes by Content-Type and switches into copc mode.
         if copc_io.is_copc(path):
@@ -226,6 +235,30 @@ def load_las():
 # ══════════════════════════════════════════════════════
 #  COPC octree LOD streaming
 # ══════════════════════════════════════════════════════
+def _maybe_convert_to_copc(path):
+    """Convert *path* to COPC if it has at least COPC_STREAM_MIN_POINTS points.
+
+    Returns the new .copc.laz path, or None to keep the legacy whole-cloud path
+    (file too small, or conversion unavailable/failed)."""
+    import config
+    threshold = getattr(config, 'COPC_STREAM_MIN_POINTS', 2_000_000)
+    try:
+        import laspy
+        with laspy.open(path) as f:
+            n = int(f.header.point_count)
+    except Exception:
+        return None
+    if n < threshold:
+        return None
+    try:
+        return copc_io.ensure_copc(path)
+    except Exception as e:
+        logger = current_app.config.get('LOGGER')
+        if logger:
+            logger.warning(f"COPC auto-convert failed for {path}: {e}")
+        return None
+
+
 def _copc_guard(path):
     """Validate *path* is inside MAPS_DIR and is a COPC file. Returns an error
     (response, status) tuple on failure, else None."""
@@ -275,7 +308,8 @@ def copc_nodes():
         return guard
     try:
         keys = request.json.get('keys', []) or []
-        binary = copc_io.copc_nodes_binary(path, keys)
+        # Multi-blob: one round-trip carries many nodes, each as its own payload.
+        binary = copc_io.copc_nodes_multiblob(path, keys)
         return send_file(io.BytesIO(binary), mimetype='application/octet-stream')
     except Exception as e:
         return _error_response(e, 'copc_nodes')

@@ -531,6 +531,7 @@ export class Viewer {
         this._syncColorUniforms(this.pointCloud);
         this._syncColorUniforms(this.mapCloud);
         this.kfrmClouds.forEach(c => this._syncColorUniforms(c));
+        if (this.copcManager) this._syncColorUniforms({ material: this.copcManager.material });
         this._dirty = true;
     }
 
@@ -539,6 +540,7 @@ export class Viewer {
         if (this.pointCloud) this.pointCloud.material.uniforms.uGamma.value = g;
         if (this.mapCloud)   this.mapCloud.material.uniforms.uGamma.value = g;
         this.kfrmClouds.forEach(c => { c.material.uniforms.uGamma.value = g; });
+        if (this.copcManager) this.copcManager.material.uniforms.uGamma.value = g;
         this._dirty = true;
     }
 
@@ -551,6 +553,7 @@ export class Viewer {
         this.kfrmClouds.forEach(c => { c.material.uniforms.uPointSize.value = s; });
         if (this.kf0Cloud) this.kf0Cloud.material.uniforms.uPointSize.value = s * 3.0;
         if (this.kf1Cloud) this.kf1Cloud.material.uniforms.uPointSize.value = s * 3.0;
+        if (this.copcManager) this.copcManager.material.uniforms.uPointSize.value = s;
         this._dirty = true;
     }
 
