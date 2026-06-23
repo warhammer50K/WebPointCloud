@@ -18,6 +18,8 @@ per-node geometries share one coordinate frame (see arrays_to_binary's offset).
 """
 
 import os
+import queue
+import contextlib
 import threading
 
 import numpy as np
@@ -71,21 +73,60 @@ def open_copc(path):
         intensity_max = _estimate_intensity_max(reader)
 
         entry = {
-            'reader': reader,
+            'reader': reader,           # used only for header/octree build (single-threaded)
+            'realpath': realpath,
             'mtime': mtime,
             'has_rgb': has_rgb,
             'intensity_max': intensity_max,
+            'lock': threading.Lock(),   # guards one-time octree build + pool growth
+            'reader_pool': queue.Queue(),  # idle CopcReader handles, borrowed per fetch
+            'pool_count': 0,            # handles created so far (≤ pool_max)
+            'pool_max': 16,             # cap concurrent handles (≈ server cores)
+            'thread_readers': [],       # all handles spawned, so eviction can close them
         }
-        # Evict oldest if over capacity (close its handle).
+        # Evict oldest if over capacity (close every handle it opened).
         if len(_readers) >= _CACHE_MAX:
             old_key = next(iter(_readers))
             old = _readers.pop(old_key)
-            try:
-                old['reader'].close()
-            except Exception:
-                pass
+            for r in [old['reader'], *old.get('thread_readers', [])]:
+                try:
+                    r.close()
+                except Exception:
+                    pass
         _readers[realpath] = entry
         return entry
+
+
+@contextlib.contextmanager
+def _borrow_reader(entry):
+    """Borrow a CopcReader from a fixed pool, returning it when done.
+
+    laspy's CopcReader seeks+reads a single shared file handle, so two threads
+    fetching through one reader race on the file position and corrupt each
+    other's reads ('LazrsError: failed to fill whole buffer'). Each fetch needs
+    its own handle — but opening one costs ~0.3s (it reads the root page), and
+    Werkzeug's threaded server spawns a NEW thread per request, so a per-thread
+    handle was re-opened on essentially every request: the open dominated while
+    the actual decompress was ~3ms. A bounded pool opens at most pool_max handles
+    total and recycles them, so node offsets stay absolute (every handle reads
+    the same cached octree correctly) and lazrs decompress runs across them."""
+    from laspy import CopcReader
+    pool = entry['reader_pool']
+    reader = None
+    try:
+        reader = pool.get_nowait()
+    except queue.Empty:
+        with entry['lock']:
+            if entry['pool_count'] < entry['pool_max']:
+                reader = CopcReader.open(open(entry['realpath'], 'rb'))
+                entry['pool_count'] += 1
+                entry['thread_readers'].append(reader)
+        if reader is None:           # at cap → wait for a busy handle to return
+            reader = pool.get()
+    try:
+        yield reader
+    finally:
+        pool.put(reader)
 
 
 def _estimate_intensity_max(reader):
@@ -103,9 +144,28 @@ def _estimate_intensity_max(reader):
         return 65535.0
 
 
+def warm_octree_async(path):
+    """Kick off the (one-time, ~seconds) octree build in the background.
+
+    The first hierarchy/node request otherwise pays the full load_octree_for_query
+    walk (tens of seconds on big files) while the user stares at an empty view.
+    Calling this when meta is served — well before the client asks for the
+    hierarchy — lets the build overlap the round-trip so it's usually cached by
+    the time it's needed. Safe to call repeatedly: _get_octree double-checks."""
+    def run():
+        try:
+            _get_octree(open_copc(path))
+        except Exception:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
 def copc_meta(path):
     """Header + octree root geometry, JSON-serializable."""
     entry = open_copc(path)
+    # Start building the octree now so the client's hierarchy request (next
+    # round-trip) finds it cached instead of blocking on a multi-second walk.
+    warm_octree_async(path)
     reader = entry['reader']
     h = reader.header
     ci = reader.copc_info
@@ -135,23 +195,92 @@ def copc_meta(path):
     }
 
 
+def _cache_dir():
+    """Directory for persisted octree caches (under DATA_DIR, not the maps tree)."""
+    try:
+        import config
+        base = config.DATA_DIR
+    except Exception:
+        base = os.path.expanduser('~/.webpointcloud')
+    d = os.path.join(base, 'cache', 'octree')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _octree_cache_path(realpath, mtime):
+    import hashlib
+    h = hashlib.sha1(realpath.encode('utf-8')).hexdigest()[:16]
+    return os.path.join(_cache_dir(), f'{h}_{int(mtime)}.pkl')
+
+
+def _load_octree_cache(cpath):
+    import pickle
+    try:
+        if os.path.exists(cpath):
+            with open(cpath, 'rb') as f:
+                return pickle.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def _save_octree_cache(cpath, octree):
+    import pickle
+    import glob
+    try:
+        tmp = cpath + '.tmp'
+        with open(tmp, 'wb') as f:
+            pickle.dump(octree, f, protocol=5)
+        os.replace(tmp, cpath)
+        # Drop stale caches for the same file (older mtimes).
+        stem = cpath.rsplit('_', 1)[0]
+        for old in glob.glob(stem + '_*.pkl'):
+            if old != cpath:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
 def _get_octree(entry):
     """Build (once, cached on the reader entry) the full key→OctreeNode map.
 
     load_octree_for_query walks the whole hierarchy and lazily pulls child pages
-    from disk — costly (seconds on big files). Caching it makes every later node
-    fetch and hierarchy request essentially free."""
+    from disk — costly (~15s on a big file). Three tiers of caching avoid paying
+    it twice:
+      1. in-memory on the reader entry (every fetch this process serves),
+      2. on-disk pickle keyed by realpath+mtime (survives restarts; ~4s to load
+         vs ~15s to rebuild — child links are stripped first since they're only
+         used during the walk, not for fetching, which keeps the pickle small),
+      3. otherwise a fresh walk, then persisted for next time."""
     octree = entry.get('octree')
-    if octree is None:
-        from laspy.copc import load_octree_for_query
-        reader = entry['reader']
-        nodes = load_octree_for_query(
-            reader.source, reader.copc_info, reader.root_page,
-            query_bounds=None, level_range=range(0, 32),
-        )
-        octree = {_node_key_str(nd.key): nd for nd in nodes}
+    if octree is not None:
+        return octree
+    # Build once under the lock (double-checked). The build reads heavily from
+    # reader.source; serializing it keeps it from racing concurrent node fetches.
+    with entry['lock']:
+        octree = entry.get('octree')
+        if octree is not None:
+            return octree
+        cpath = _octree_cache_path(entry['realpath'], entry['mtime'])
+        octree = _load_octree_cache(cpath)
+        if octree is None:
+            from laspy.copc import load_octree_for_query
+            reader = entry['reader']
+            nodes = load_octree_for_query(
+                reader.source, reader.copc_info, reader.root_page,
+                query_bounds=None, level_range=range(0, 32),
+            )
+            # Child links are only needed to walk the hierarchy; dropping them
+            # makes the pickle ~8× smaller and far faster to load.
+            for nd in nodes:
+                nd.childs = []
+            octree = {_node_key_str(nd.key): nd for nd in nodes}
+            _save_octree_cache(cpath, octree)
         entry['octree'] = octree
-    return octree
+        return octree
 
 
 def copc_hierarchy(path, max_depth=32):
@@ -210,15 +339,16 @@ def _pack_node_points(pts, entry, center):
 def copc_nodes_binary(path, keys):
     """Points for the requested node *keys* as one combined viewer binary."""
     entry = open_copc(path)
-    reader = entry['reader']
     octree = _get_octree(entry)
     want = list(dict.fromkeys(keys))
     sel = [octree[k] for k in want if k in octree]
     if not sel:
         return arrays_to_binary([], [], [], [], [], [], [], 0,
                                 offset=[0.0, 0.0, 0.0])
-    pts = reader._fetch_and_decompress_points_of_nodes(sel)
-    return _pack_node_points(pts, entry, reader.copc_info.center)
+    with _borrow_reader(entry) as reader:  # pooled handle: no shared-seek race
+        pts = reader._fetch_and_decompress_points_of_nodes(sel)
+        center = reader.copc_info.center
+    return _pack_node_points(pts, entry, center)
 
 
 def copc_nodes_multiblob(path, keys):
@@ -230,8 +360,6 @@ def copc_nodes_multiblob(path, keys):
     where payload is the same binary as copc_nodes_binary for that one node."""
     import struct
     entry = open_copc(path)
-    reader = entry['reader']
-    center = reader.copc_info.center
     octree = _get_octree(entry)
     want = list(dict.fromkeys(keys))
 
@@ -240,18 +368,20 @@ def copc_nodes_multiblob(path, keys):
     # just a chunk decompress (the expensive hierarchy walk is gone).
     parts = []
     count = 0
-    for k in want:
-        nd = octree.get(k)
-        if nd is None:
-            continue
-        pts = reader._fetch_and_decompress_points_of_nodes([nd])
-        payload = _pack_node_points(pts, entry, center)
-        kb = k.encode('utf-8')
-        parts.append(struct.pack('<I', len(kb)))
-        parts.append(kb)
-        parts.append(struct.pack('<I', len(payload)))
-        parts.append(payload)
-        count += 1
+    with _borrow_reader(entry) as reader:  # pooled handle: no shared-seek race
+        center = reader.copc_info.center
+        for k in want:
+            nd = octree.get(k)
+            if nd is None:
+                continue
+            pts = reader._fetch_and_decompress_points_of_nodes([nd])
+            payload = _pack_node_points(pts, entry, center)
+            kb = k.encode('utf-8')
+            parts.append(struct.pack('<I', len(kb)))
+            parts.append(kb)
+            parts.append(struct.pack('<I', len(payload)))
+            parts.append(payload)
+            count += 1
     return struct.pack('<I', count) + b''.join(parts)
 
 

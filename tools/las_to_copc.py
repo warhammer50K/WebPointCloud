@@ -31,6 +31,25 @@ import copclib as copc
 SCALE = 0.001  # 1 mm; coords are centered on the octree center so int32 is ample
 PARALLEL_MIN_POINTS = int(os.environ.get('WPC_COPC_PARALLEL_MIN', '2000000'))
 MAX_WRITE_PROCS = int(os.environ.get('WPC_COPC_WRITE_PROCS', '8'))
+# Octree depth at which the serial top-down pass stops and subtrees fan out to
+# worker processes. The serial pass costs ~one full-N argsort per level above
+# this, so lower = less serial work; but too low yields few/uneven tasks. 3 → up
+# to 512 subtree tasks, enough to keep a 16-core box balanced. Tunable to bench.
+SPLIT_DEPTH = int(os.environ.get('WPC_COPC_SPLIT_DEPTH', '3'))
+
+
+def _read_las(src_path):
+    """Read LAS/LAZ. For LAZ, decompression is the serial read bottleneck, so use
+    the multithreaded lazrs backend to spread it across cores; fall back to the
+    default backend if the parallel one isn't available. Uncompressed .las needs
+    no decompression, so the backend choice is irrelevant there."""
+    if src_path.lower().endswith('.laz'):
+        try:
+            return laspy.read(src_path, laz_backend=laspy.LazBackend.LazrsParallel)
+        except Exception as e:  # backend missing / unusable → plain read
+            print(f"[las_to_copc] LazrsParallel unavailable ({e}); default backend",
+                  file=sys.stderr, flush=True)
+    return laspy.read(src_path)
 
 
 def _as_vectorchar(record_slice):
@@ -80,7 +99,10 @@ def _subsample_into(out, d, kx, ky, kz, idx, P, halfsize, cube_min, grid, max_de
     loc = np.floor((P[idx] - nmin) / step).astype(np.int64)
     np.clip(loc, 0, grid - 1, out=loc)
     cell = (loc[:, 0] * grid + loc[:, 1]) * grid + loc[:, 2]
-    order = np.argsort(cell, kind="stable")
+    # quicksort (not stable): we only need ONE representative point per voxel for
+    # the LOD, and which one is irrelevant — quicksort is ~2-3× faster than the
+    # stable mergesort on int64 keys, and this sort is the build bottleneck.
+    order = np.argsort(cell, kind="quicksort")
     sc = cell[order]
     first = np.ones(len(order), dtype=bool)
     first[1:] = sc[1:] != sc[:-1]
@@ -114,7 +136,7 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     t_start = time.monotonic()
     if progress is not None:
         progress(0, 1, 'reading')
-    las = laspy.read(src_path)
+    las = _read_las(src_path)
     n = int(las.header.point_count)
     if n == 0:
         raise ValueError("empty point cloud")
@@ -164,7 +186,8 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     # float32 coords for subsample — halves memory bandwidth on fancy-indexing /
     # sort. Precision: centered coords are within ±halfsize, so float32 (~7 sig
     # digits) keeps sub-mm accuracy, finer than the deepest grid step.
-    P = np.column_stack([x, y, z]).astype(np.float32)
+    P = np.empty((n, 3), dtype=np.float32)
+    P[:, 0] = x; P[:, 1] = y; P[:, 2] = z   # cast straight in, no float64 (N,3) temp
     del x, y, z
 
     scale = copc.Vector3(SCALE, SCALE, SCALE)
@@ -189,7 +212,6 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
     t_prep = time.monotonic()        # read + packed prep done
 
     nproc = min(MAX_WRITE_PROCS, os.cpu_count() or 1)
-    SPLIT_DEPTH = 4   # process top levels here, fan out subtrees to workers
 
     if nproc > 1 and n >= PARALLEL_MIN_POINTS:
         # Process the top levels serially, collecting subtree roots as tasks.
@@ -205,7 +227,7 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
             loc = np.floor((P[idx] - nmin) / step).astype(np.int64)
             np.clip(loc, 0, grid - 1, out=loc)
             cell = (loc[:, 0] * grid + loc[:, 1]) * grid + loc[:, 2]
-            order = np.argsort(cell, kind="stable")
+            order = np.argsort(cell, kind="quicksort")  # see _subsample_into
             sc = cell[order]
             first = np.ones(len(order), dtype=bool)
             first[1:] = sc[1:] != sc[:-1]

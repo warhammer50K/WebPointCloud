@@ -155,9 +155,18 @@ def rename_map(name):
 # ══════════════════════════════════════════════════════
 #  Point Cloud Loading
 # ══════════════════════════════════════════════════════
+def _upload_tmp_dir():
+    """Temp dir for drag&drop uploads — outside the maps tree so dropped files
+    never accumulate as multi-GB copies there (cleared on reboot anyway)."""
+    d = os.path.join(tempfile.gettempdir(), 'webpc_uploads')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 @api_bp.route('/api/load_pointcloud', methods=['POST'])
 def load_pointcloud():
     tmp_path = None
+    is_upload = False
     try:
         path = None
         saved_path = None
@@ -171,10 +180,10 @@ def load_pointcloud():
             f = request.files['file']
             orig_name = f.filename or 'upload.las'
             suffix = os.path.splitext(orig_name)[1].lower() or '.las'
-            # Save uploaded file to maps/_uploads/ for ICP/analysis use
-            maps_dir = current_app.config['MAPS_DIR']
-            upload_dir = os.path.join(maps_dir, '_uploads')
-            os.makedirs(upload_dir, exist_ok=True)
+            # Drag&drop only gives us the bytes, so dropped files are uploaded to
+            # an OS temp dir (NOT under the maps tree) and removed once the COPC
+            # exists — no multi-GB copy accumulates. See _upload_tmp_dir().
+            upload_dir = _upload_tmp_dir()
             # Fail clearly (not a generic 500 mid-write) if the disk can't hold it.
             need = request.content_length or 0
             free = shutil.disk_usage(upload_dir).free
@@ -188,6 +197,7 @@ def load_pointcloud():
             saved_path = os.path.join(upload_dir, f'{uuid.uuid4().hex[:8]}_{safe_name}')
             f.save(saved_path)
             path = saved_path
+            is_upload = True
 
         if not path or not os.path.isfile(path):
             return jsonify({'error': 'File not found'}), 404
@@ -203,7 +213,8 @@ def load_pointcloud():
             import config
             threshold = getattr(config, 'COPC_STREAM_MIN_POINTS', 2_000_000)
             if _point_count(path) >= threshold:
-                job_id = _start_convert_job(path, current_app.config.get('LOGGER'))
+                job_id = _start_convert_job(path, current_app.config.get('LOGGER'),
+                                            cleanup_src=is_upload)
                 resp = jsonify({'mode': 'converting', 'job': job_id})
                 resp.status_code = 202
                 if saved_path:
@@ -218,6 +229,9 @@ def load_pointcloud():
                 resp.headers['X-Saved-Path'] = saved_path
             return resp
 
+        # Small upload fully read into memory below — drop the temp copy after.
+        if is_upload:
+            tmp_path = path
         d = read_pointcloud(path)
         if d.get('type') == 'gaussian':
             binary = gaussians_to_binary(
@@ -263,11 +277,12 @@ def _point_count(path):
         return 0
 
 
-def _start_convert_job(src_path, logger=None):
+def _start_convert_job(src_path, logger=None, cleanup_src=False):
     """Kick off COPC conversion in a background thread; return its job id.
 
     Progress is reported during the copclib build; the client polls
-    /api/copc/convert_status."""
+    /api/copc/convert_status. When *cleanup_src* is set (drag&drop upload), the
+    temp original is removed once the COPC exists so no copy lingers."""
     job_id = uuid.uuid4().hex[:12]
     with _convert_jobs_lock:
         _convert_jobs[job_id] = {'status': 'running', 'percent': 0, 'phase': 'reading'}
@@ -281,6 +296,13 @@ def _start_convert_job(src_path, logger=None):
                         _convert_jobs[job_id]['percent'] = pct
                         _convert_jobs[job_id]['phase'] = phase
             copc_path = copc_io.ensure_copc(src_path, progress=prog)
+            # Drop the uploaded temp original once the COPC (a separate file) is
+            # built — the COPC is what gets streamed from here on.
+            if cleanup_src and copc_path != src_path:
+                try:
+                    os.remove(src_path)
+                except OSError:
+                    pass
             with _convert_jobs_lock:
                 _convert_jobs[job_id].update(
                     status='done', percent=100, copc_path=copc_path)
@@ -295,12 +317,17 @@ def _start_convert_job(src_path, logger=None):
 
 
 def _copc_guard(path):
-    """Validate *path* is inside MAPS_DIR and is a COPC file. Returns an error
-    (response, status) tuple on failure, else None."""
+    """Validate *path* is inside an allowed root and is a COPC file. Returns an
+    error (response, status) tuple on failure, else None.
+
+    Allowed roots: MAPS_DIR (files loaded from the list) and the upload temp dir
+    (drag&drop uploads are converted to COPC there, then streamed from it)."""
     if not path:
         return jsonify({'error': 'path required'}), 400
-    maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
-    if not os.path.realpath(path).startswith(maps_dir + os.sep):
+    real = os.path.realpath(path)
+    roots = [os.path.realpath(current_app.config['MAPS_DIR']),
+             os.path.realpath(_upload_tmp_dir())]
+    if not any(real.startswith(r + os.sep) for r in roots):
         return jsonify({'error': 'Access denied'}), 403
     if not os.path.isfile(path):
         return jsonify({'error': 'File not found'}), 404
@@ -347,7 +374,18 @@ def copc_hierarchy():
         return err
     try:
         max_depth = int(request.args.get('max_depth', 32))
-        return jsonify(copc_io.copc_hierarchy(path, max_depth=max_depth))
+        data = copc_io.copc_hierarchy(path, max_depth=max_depth)
+        # The node list is large (tens of MB for a big map). Serialize compactly
+        # and gzip it — it's highly repetitive (coordinates), so it shrinks ~6×,
+        # cutting transfer time, especially over a remote connection.
+        payload = json.dumps(data, separators=(',', ':')).encode('utf-8')
+        headers = {}
+        if 'gzip' in (request.headers.get('Accept-Encoding') or ''):
+            import gzip
+            payload = gzip.compress(payload, 5)
+            headers['Content-Encoding'] = 'gzip'
+        return current_app.response_class(
+            payload, mimetype='application/json', headers=headers)
     except Exception as e:
         return _error_response(e, 'copc_hierarchy')
 
