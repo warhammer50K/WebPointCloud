@@ -93,22 +93,80 @@ export class Viewer {
         this.controls.enableDamping = true;
         this.controls.dampingFactor = 0.12;
         this.controls.enableZoom = true;
+        this.controls.panSpeed = 0.1;        // calmer right/middle-drag pan (default 1.0)
+        // Left-drag = FIRST-PERSON look (camera stays put, the view direction
+        // turns) instead of OrbitControls' orbit-around-target, which swings the
+        // camera in a big arc. With rotate disabled, update()'s sphericalDelta is
+        // 0 so it keeps the camera in place and just lookAt()s the target — moving
+        // the target around the camera is exactly a first-person turn.
+        this.controls.enableRotate = false;
 
-        const _zoomFactor = 0.9;
+        // First-person look state (left-drag).
+        this._lookDragging = false;
+        this._lookLastX = 0;
+        this._lookLastY = 0;
+        this._lookFwd = new THREE.Vector3();
+        this._lookDir = new THREE.Vector3();
+        this.lookSpeed = 0.004;              // radians per pixel of drag
+
+        // Wheel = DRIVE forward/back along the view axis, like a vehicle gliding
+        // through the map. Crucially it moves the camera AND the orbit pivot
+        // (controls.target) together, so the pivot DISTANCE is preserved. A plain
+        // dolly shrinks that distance as you zoom in, and OrbitControls scales
+        // both orbit and pan speed by it — so after zooming deep in, rotating and
+        // panning would crawl. Keeping the distance fixed means orbit/pan stay
+        // exactly as responsive however far you've driven in.
+        //   • Shift+wheel → dolly (actually change the pivot distance) for getting
+        //     right up to detail or pulling back out, clamped to a sane range.
+        const _zoomDir = new THREE.Vector3();
         this.renderer.domElement.addEventListener('wheel', (e) => {
             e.preventDefault();
             e.stopImmediatePropagation();
-            const offset = new THREE.Vector3().subVectors(this.camera.position, this.controls.target);
-            const dist = offset.length();
-            if (dist < 1e-6) {
-                return;
+            _zoomDir.subVectors(this.controls.target, this.camera.position);
+            let dist = _zoomDir.length();
+            if (dist < 1e-6) return;
+            _zoomDir.divideScalar(dist);                 // forward unit vector
+
+            const b = this.bounds;
+            const sceneSize = b
+                ? Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin) || dist
+                : dist;
+
+            if (e.shiftKey) {
+                // Dolly: move only the camera, changing the pivot distance.
+                const step = dist * 0.06 * (e.deltaY < 0 ? 1 : -1);
+                const minPivot = Math.max(sceneSize * 0.002, 0.05);
+                const maxPivot = sceneSize * 1.5;
+                const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
+                this.camera.position.copy(this.controls.target)
+                    .addScaledVector(_zoomDir, -newDist);
+            } else {
+                // Drive: translate camera + pivot together (distance preserved).
+                const speed = dist * 0.002 * (e.deltaY < 0 ? 1 : -1);
+                this.camera.position.addScaledVector(_zoomDir, speed);
+                this.controls.target.addScaledVector(_zoomDir, speed);
             }
-            const factor = e.deltaY < 0 ? _zoomFactor : 1 / _zoomFactor;
-            const newDist = Math.max(dist * factor, 1e-4);
-            offset.setLength(newDist);
-            this.camera.position.copy(this.controls.target).add(offset);
             this._dirty = true;
         }, { passive: false, capture: true });
+
+        // First-person look: left-drag turns the view in place. Skipped while a
+        // tool owns the left button (measure / polygon select / point info) or
+        // when controls are disabled.
+        const lookEl = this.renderer.domElement;
+        lookEl.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || !this.controls.enabled) return;
+            if (this.measureMode || this.polySelectMode || this.pointInfoEnabled) return;
+            this._lookDragging = true;
+            this._lookLastX = e.clientX;
+            this._lookLastY = e.clientY;
+        });
+        window.addEventListener('pointermove', (e) => {
+            if (!this._lookDragging) return;
+            this._firstPersonLook(e.clientX - this._lookLastX, e.clientY - this._lookLastY);
+            this._lookLastX = e.clientX;
+            this._lookLastY = e.clientY;
+        });
+        window.addEventListener('pointerup', () => { this._lookDragging = false; });
 
         // Grid (Z-up)
         this.grid = this._makeGrid(1000, 100, 0, 0);
@@ -232,6 +290,27 @@ export class Viewer {
     }
 
     _requestRender() { this._dirty = true; }
+
+    // First-person turn: keep the camera where it is and swing the orbit target
+    // around it (yaw about Z-up, pitch about the view's right axis). The pivot
+    // distance is preserved so pan/zoom feel unchanged. OrbitControls.update()
+    // then does camera.lookAt(target) each frame, completing the in-place turn.
+    _firstPersonLook(dx, dy) {
+        const fwd = this._lookFwd.subVectors(this.controls.target, this.camera.position);
+        const dist = fwd.length();
+        if (dist < 1e-6) return;
+        fwd.divideScalar(dist);
+        let yaw = Math.atan2(fwd.y, fwd.x);
+        let pitch = Math.asin(THREE.MathUtils.clamp(fwd.z, -1, 1));
+        yaw -= dx * this.lookSpeed;
+        pitch -= dy * this.lookSpeed;
+        const lim = Math.PI / 2 - 0.02;            // avoid gimbal flip at the poles
+        pitch = Math.max(-lim, Math.min(lim, pitch));
+        const cp = Math.cos(pitch);
+        const dir = this._lookDir.set(cp * Math.cos(yaw), cp * Math.sin(yaw), Math.sin(pitch));
+        this.controls.target.copy(this.camera.position).addScaledVector(dir, dist);
+        this._dirty = true;
+    }
 
     _onResize() {
         if (this._webglFailed) return;

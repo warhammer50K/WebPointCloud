@@ -256,7 +256,44 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         });
     });
 
-    // (Drag & drop upload removed — maps are loaded from ~/maps via the list.)
+    // ── Drag & Drop ──
+    // Dropped files only expose their bytes (not a path), so they're uploaded to
+    // a server-side temp dir and auto-deleted after COPC conversion — no copy is
+    // kept under the maps tree (see /api/load_pointcloud).
+    const wrap = $('viewer-wrap');
+    const dropOverlay = $('drop-overlay');
+    let dragCounter = 0;
+
+    wrap.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dropOverlay.style.display = 'flex'; });
+    wrap.addEventListener('dragleave', e => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dropOverlay.style.display = 'none'; } });
+    wrap.addEventListener('dragover', e => e.preventDefault());
+    wrap.addEventListener('drop', async e => {
+        e.preventDefault();
+        dragCounter = 0;
+        dropOverlay.style.display = 'none';
+        const file = e.dataTransfer.files[0];
+        if (!file || !file.name.match(/\.(las|laz|ply|xyz|txt|csv|pcd|pts|splat)$/i)) return;
+        $('st-main').textContent = `Loading ${file.name}...`;
+        showLoading(`Loading ${file.name}...`);
+        try {
+            const data = await uploadLasFile(file, pct => {
+                showLoading(`Uploading ${file.name}… ${pct}%`);
+            });
+            const info = await dispatchLoad(viewer, data, (pct, phase) => {
+                showLoading(convLabel(file.name, pct, phase));
+            });
+            legend.update(viewer.colorMode, info.bounds, info.offsetZ);
+            $('compare-a-name').textContent = file.name;
+            $('no-data-msg').style.display = 'none';
+            $('st-main').textContent = `Loaded ${info.count.toLocaleString()} ${info.label}`;
+            appendLog(`Loaded ${file.name} (${info.count.toLocaleString()} ${info.label})`, 'success');
+        } catch (err) {
+            $('st-main').textContent = `Error: ${err.message}`;
+            showToast(`Failed: ${err.message}`, 'error');
+        } finally {
+            hideLoading();
+        }
+    });
 
     // ── Compare map ──
     $('btn-compare-map').addEventListener('click', () => {

@@ -2,10 +2,18 @@
    Parse Worker & Data Loading
    ═══════════════════════════════════════════════════════ */
 
-let parseWorker = null;
+// A POOL of parse workers, not one. COPC streaming fetches many node chunks
+// concurrently (REQUEST_CONCURRENCY); a single worker parses them one-at-a-time
+// so the chunks queue up and detail trickles in. Round-robin across a pool sized
+// to the machine lets parsing keep pace with the network. Callbacks are routed
+// by request id, so any worker can answer any request.
+const POOL_SIZE = Math.max(2, Math.min(8,
+    (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4));
+let parseWorkers = [];
+let _dispatchIdx = 0;
 let _workerId = 0;
 const _workerCallbacks = new Map();
-let _workerRestartCount = 0;
+const _restartCounts = new WeakMap();
 const _MAX_WORKER_RESTARTS = 3;
 let _workerNotSupported = false;
 
@@ -23,49 +31,67 @@ function _showWorkerErrorBanner() {
     document.body.appendChild(banner);
 }
 
+function _setupWorker(worker) {
+    worker.onmessage = function(e) {
+        const { id, ...result } = e.data;
+        const cb = _workerCallbacks.get(id);
+        if (cb) {
+            _workerCallbacks.delete(id);
+            if (cb.timeout) clearTimeout(cb.timeout);
+            if (result.error) cb.reject(new Error(result.error));
+            else cb.resolve(result);
+        }
+    };
+    worker.onerror = function(ev) {
+        console.error('[Worker] Error:', ev.message);
+        // Reject only the requests routed to THIS worker; the rest of the pool
+        // keeps running. Then hot-swap a fresh worker in its slot.
+        for (const [id, cb] of _workerCallbacks) {
+            if (cb.worker === worker) {
+                _workerCallbacks.delete(id);
+                if (cb.timeout) clearTimeout(cb.timeout);
+                cb.reject(new Error(ev.message || 'Worker error'));
+            }
+        }
+        _replaceWorker(worker);
+    };
+    return worker;
+}
+
+function _replaceWorker(worker) {
+    const idx = parseWorkers.indexOf(worker);
+    try { worker.terminate(); } catch {}
+    const n = (_restartCounts.get(worker) || 0) + 1;
+    if (n > _MAX_WORKER_RESTARTS) {
+        if (idx >= 0) parseWorkers.splice(idx, 1);
+        console.error('[Worker] Max restart limit reached for a pool worker');
+        if (parseWorkers.length === 0) _showWorkerErrorBanner();
+        return;
+    }
+    console.warn(`[Worker] Restarting pool worker (${n}/${_MAX_WORKER_RESTARTS})`);
+    const fresh = _setupWorker(new Worker('/static/js/parse-worker.js'));
+    _restartCounts.set(fresh, n);
+    if (idx >= 0) parseWorkers[idx] = fresh; else parseWorkers.push(fresh);
+}
+
 function _createWorker() {
     if (typeof Worker === 'undefined') {
         _workerNotSupported = true;
         console.error('[Worker] Web Worker API is not supported in this browser');
         return;
     }
-    if (parseWorker) {
-        try { parseWorker.terminate(); } catch {}
+    for (const w of parseWorkers) { try { w.terminate(); } catch {} }
+    parseWorkers = [];
+    for (let i = 0; i < POOL_SIZE; i++) {
+        parseWorkers.push(_setupWorker(new Worker('/static/js/parse-worker.js')));
     }
-    parseWorker = new Worker('/static/js/parse-worker.js');
+}
 
-    parseWorker.onmessage = function(e) {
-        const { id, ...result } = e.data;
-        const cb = _workerCallbacks.get(id);
-        if (cb) {
-            _workerCallbacks.delete(id);
-            if (cb.timeout) clearTimeout(cb.timeout);
-            _workerRestartCount = 0;
-            if (result.error) {
-                cb.reject ? cb.reject(new Error(result.error)) : cb(result);
-            } else {
-                cb.resolve ? cb.resolve(result) : cb(result);
-            }
-        }
-    };
-
-    parseWorker.onerror = function(e) {
-        console.error('[Worker] Error:', e.message);
-        for (const [, cb] of _workerCallbacks) {
-            if (cb.timeout) clearTimeout(cb.timeout);
-            const err = new Error(e.message || 'Worker error');
-            if (cb.reject) cb.reject(err);
-        }
-        _workerCallbacks.clear();
-        if (_workerRestartCount < _MAX_WORKER_RESTARTS) {
-            _workerRestartCount++;
-            console.warn(`[Worker] Restarting (${_workerRestartCount}/${_MAX_WORKER_RESTARTS})`);
-            _createWorker();
-        } else {
-            console.error('[Worker] Max restart limit reached');
-            _showWorkerErrorBanner();
-        }
-    };
+function _nextWorker() {
+    if (parseWorkers.length === 0) _createWorker();
+    const w = parseWorkers[_dispatchIdx % parseWorkers.length];
+    _dispatchIdx++;
+    return w;
 }
 
 _createWorker();
@@ -77,13 +103,13 @@ export function workerParseBinary(buffer) {
     }
     return new Promise((resolve, reject) => {
         const id = ++_workerId;
+        const worker = _nextWorker();
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-            _createWorker();
         }, 10000);
-        _workerCallbacks.set(id, { resolve, reject, timeout });
-        parseWorker.postMessage({ id, type: 'binary', buffer }, [buffer]);
+        _workerCallbacks.set(id, { resolve, reject, timeout, worker });
+        worker.postMessage({ id, type: 'binary', buffer }, [buffer]);
     });
 }
 
@@ -92,13 +118,13 @@ export function workerParseMultiblob(buffer) {
     if (_workerNotSupported) return Promise.reject(new Error('Web Worker API not supported'));
     return new Promise((resolve, reject) => {
         const id = ++_workerId;
+        const worker = _nextWorker();
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-            _createWorker();
         }, 15000);
-        _workerCallbacks.set(id, { resolve, reject, timeout });
-        parseWorker.postMessage({ id, type: 'copc-multiblob', buffer }, [buffer]);
+        _workerCallbacks.set(id, { resolve, reject, timeout, worker });
+        worker.postMessage({ id, type: 'copc-multiblob', buffer }, [buffer]);
     });
 }
 
@@ -197,13 +223,13 @@ export function workerFilterPoints(positions, intensities, colors, mvpMatrix, vi
     }
     return new Promise((resolve, reject) => {
         const id = ++_workerId;
+        const worker = _nextWorker();
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-            _createWorker();
         }, 10000);
-        _workerCallbacks.set(id, { resolve, reject, timeout });
-        parseWorker.postMessage({
+        _workerCallbacks.set(id, { resolve, reject, timeout, worker });
+        worker.postMessage({
             id, type: 'filter',
             positions, intensities, colors,
             mvpMatrix, viewportW, viewportH, polyPoints, keep,
