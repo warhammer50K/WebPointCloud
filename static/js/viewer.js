@@ -92,7 +92,11 @@ export class Viewer {
         };
         this.controls.enableDamping = true;
         this.controls.dampingFactor = 0.12;
-        this.controls.enableZoom = true;
+        // Zoom is fully handled by the custom wheel handler below; OrbitControls'
+        // dolly is disabled so the two can never both act on one wheel event
+        // (the capture listener's stopImmediatePropagation blocks it in Chrome,
+        // but that relies on subtle at-target listener ordering — this doesn't).
+        this.controls.enableZoom = false;
         this.controls.panSpeed = 0.1;        // calmer right/middle-drag pan (default 1.0)
         // Left-drag = FIRST-PERSON look (camera stays put, the view direction
         // turns) instead of OrbitControls' orbit-around-target, which swings the
@@ -101,23 +105,30 @@ export class Viewer {
         // the target around the camera is exactly a first-person turn.
         this.controls.enableRotate = false;
 
-        // First-person look state (left-drag).
+        // Look state (left-drag). Mode is chosen per drag at pointerdown:
+        //   • camera INSIDE the data bounds → first-person look (turn in place),
+        //     natural when immersed in a large map;
+        //   • camera OUTSIDE the bounds → orbit around the pivot, natural when
+        //     inspecting a small map/object from outside (first-person look there
+        //     just throws the object off-screen).
         this._lookDragging = false;
+        this._dragMode = 'look';             // 'look' | 'orbit', fixed per drag
         this._lookLastX = 0;
         this._lookLastY = 0;
         this._lookFwd = new THREE.Vector3();
         this._lookDir = new THREE.Vector3();
         this.lookSpeed = 0.004;              // radians per pixel of drag
 
-        // Wheel = DRIVE forward/back along the view axis, like a vehicle gliding
-        // through the map. Crucially it moves the camera AND the orbit pivot
-        // (controls.target) together, so the pivot DISTANCE is preserved. A plain
-        // dolly shrinks that distance as you zoom in, and OrbitControls scales
-        // both orbit and pan speed by it — so after zooming deep in, rotating and
-        // panning would crawl. Keeping the distance fixed means orbit/pan stay
-        // exactly as responsive however far you've driven in.
-        //   • Shift+wheel → dolly (actually change the pivot distance) for getting
-        //     right up to detail or pulling back out, clamped to a sane range.
+        // Wheel = adaptive dolly-drive. Each notch covers 6% of the pivot
+        // distance, so zoom is fast from an overview and fine-grained up close.
+        // The pivot (controls.target) shrinks with the camera like a plain dolly,
+        // but bottoms out at a floor — from there camera and pivot advance
+        // TOGETHER, so the wheel keeps a usable speed for flying through the map
+        // instead of freezing at the pivot (pan, which OrbitControls scales by
+        // pivot distance, stays alive too). Zooming out grows the pivot back up
+        // to a cap, beyond which it becomes a straight backward drive.
+        //   • Shift+wheel → fine dolly with a much smaller floor, for getting
+        //     right up to detail.
         const _zoomDir = new THREE.Vector3();
         this.renderer.domElement.addEventListener('wheel', (e) => {
             e.preventDefault();
@@ -133,7 +144,7 @@ export class Viewer {
                 : dist;
 
             if (e.shiftKey) {
-                // Dolly: move only the camera, changing the pivot distance.
+                // Fine dolly: move only the camera, changing the pivot distance.
                 const step = dist * 0.06 * (e.deltaY < 0 ? 1 : -1);
                 const minPivot = Math.max(sceneSize * 0.002, 0.05);
                 const maxPivot = sceneSize * 1.5;
@@ -141,10 +152,13 @@ export class Viewer {
                 this.camera.position.copy(this.controls.target)
                     .addScaledVector(_zoomDir, -newDist);
             } else {
-                // Drive: translate camera + pivot together (distance preserved).
-                const speed = dist * 0.002 * (e.deltaY < 0 ? 1 : -1);
-                this.camera.position.addScaledVector(_zoomDir, speed);
-                this.controls.target.addScaledVector(_zoomDir, speed);
+                const step = dist * 0.06 * (e.deltaY < 0 ? 1 : -1);
+                const minPivot = Math.max(sceneSize * 0.05, 0.5);
+                const maxPivot = sceneSize * 1.5;
+                const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
+                this.camera.position.addScaledVector(_zoomDir, step);
+                this.controls.target.copy(this.camera.position)
+                    .addScaledVector(_zoomDir, newDist);
             }
             this._dirty = true;
         }, { passive: false, capture: true });
@@ -157,12 +171,16 @@ export class Viewer {
             if (e.button !== 0 || !this.controls.enabled) return;
             if (this.measureMode || this.polySelectMode || this.pointInfoEnabled) return;
             this._lookDragging = true;
+            this._dragMode = this._isCameraInsideBounds() ? 'look' : 'orbit';
             this._lookLastX = e.clientX;
             this._lookLastY = e.clientY;
         });
         window.addEventListener('pointermove', (e) => {
             if (!this._lookDragging) return;
-            this._firstPersonLook(e.clientX - this._lookLastX, e.clientY - this._lookLastY);
+            const dx = e.clientX - this._lookLastX;
+            const dy = e.clientY - this._lookLastY;
+            if (this._dragMode === 'orbit') this._orbitLook(dx, dy);
+            else this._firstPersonLook(dx, dy);
             this._lookLastX = e.clientX;
             this._lookLastY = e.clientY;
         });
@@ -290,6 +308,39 @@ export class Viewer {
     }
 
     _requestRender() { this._dirty = true; }
+
+    // Immersed or outside-looking-in? Decides the left-drag mode: first-person
+    // look inside the data, orbit when viewing it from outside. A small margin
+    // keeps the mode from flip-flopping right at the boundary.
+    _isCameraInsideBounds() {
+        const b = this.bounds;
+        if (!b) return true;
+        const m = Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin) * 0.05;
+        const p = this.camera.position;
+        return p.x > b.xMin - m && p.x < b.xMax + m
+            && p.y > b.yMin - m && p.y < b.yMax + m
+            && p.z > b.zMin - m && p.z < b.zMax + m;
+    }
+
+    // Orbit: swing the camera around the pivot (controls.target), keeping the
+    // pivot distance. Signs match OrbitControls' grab-the-object convention:
+    // drag right spins the object right, drag up tips it up.
+    _orbitLook(dx, dy) {
+        const off = this._lookFwd.subVectors(this.camera.position, this.controls.target);
+        const r = off.length();
+        if (r < 1e-6) return;
+        off.divideScalar(r);
+        let yaw = Math.atan2(off.y, off.x);
+        let pitch = Math.asin(THREE.MathUtils.clamp(off.z, -1, 1));
+        yaw -= dx * this.lookSpeed;
+        pitch += dy * this.lookSpeed;
+        const lim = Math.PI / 2 - 0.02;            // avoid gimbal flip at the poles
+        pitch = Math.max(-lim, Math.min(lim, pitch));
+        const cp = Math.cos(pitch);
+        const dir = this._lookDir.set(cp * Math.cos(yaw), cp * Math.sin(yaw), Math.sin(pitch));
+        this.camera.position.copy(this.controls.target).addScaledVector(dir, r);
+        this._dirty = true;
+    }
 
     // First-person turn: keep the camera where it is and swing the orbit target
     // around it (yaw about Z-up, pitch about the view's right axis). The pivot
