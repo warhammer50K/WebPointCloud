@@ -1,6 +1,7 @@
 """REST API routes (Flask Blueprint) — File management + Analysis"""
 
 from flask import Blueprint, jsonify, request, send_file, current_app
+from werkzeug.exceptions import RequestEntityTooLarge
 import numpy as np
 import json
 import os
@@ -46,6 +47,15 @@ def _error_response(e: Exception, context: str = ''):
     logger = current_app.config.get('LOGGER')
     if logger:
         logger.error(f"[{cid}] {context} {type(e).__name__}: {e}")
+    # Oversized drag&drop upload: don't bury it in a generic 500 — tell the user the
+    # cap and point them at the no-limit path (drop the file in the maps directory
+    # and load it from the list instead of uploading it through the browser).
+    if isinstance(e, RequestEntityTooLarge):
+        limit_mb = current_app.config.get('MAX_CONTENT_LENGTH', 0) / (1024 * 1024)
+        return jsonify({'error':
+            f'File exceeds the {limit_mb:.0f} MB upload limit. Place it in the maps '
+            f'directory and load it from the list — direct load has no size limit.',
+            'cid': cid}), 413
     return jsonify({'error': 'Internal server error', 'cid': cid}), 500
 
 
