@@ -36,6 +36,14 @@ MAX_WRITE_PROCS = int(os.environ.get('WPC_COPC_WRITE_PROCS', '8'))
 # this, so lower = less serial work; but too low yields few/uneven tasks. 3 → up
 # to 512 subtree tasks, enough to keep a 16-core box balanced. Tunable to bench.
 SPLIT_DEPTH = int(os.environ.get('WPC_COPC_SPLIT_DEPTH', '3'))
+# Stop subdividing once a node has <= MIN_NODE_PTS points and keep them all as a
+# leaf (no subsample, no recursion). Real COPC writers (PDAL/untwine) do the same
+# with a target points-per-node. Each LAZ node carries ~1.7ms of fixed compress
+# overhead regardless of size, so the tail of tiny 1-100pt leaves dominates write
+# time — collapsing them cuts node count ~25× (92K→3.3K on a 7M-pt indoor scan)
+# and the write phase with it. The viewer scores nodes by octree level, so a fat
+# leaf just renders MORE detail than its level implies — no artifacts.
+MIN_NODE_PTS = int(os.environ.get('WPC_COPC_MIN_NODE', '2000'))
 
 
 def _read_las(src_path):
@@ -87,12 +95,14 @@ _B_HALFSIZE = None
 _B_CUBE_MIN = None   # np.float64 (3,)
 _B_GRID = None
 _B_MAXDEPTH = None
+_B_MINNODE = None
 
 
-def _subsample_into(out, d, kx, ky, kz, idx, P, halfsize, cube_min, grid, max_depth):
+def _subsample_into(out, d, kx, ky, kz, idx, P, halfsize, cube_min, grid,
+                    max_depth, min_node):
     node_size = (2.0 * halfsize) / (2 ** d)
     nmin = cube_min + np.array([kx, ky, kz], dtype=np.float64) * node_size
-    if d >= max_depth:
+    if d >= max_depth or len(idx) <= min_node:
         out[(d, kx, ky, kz)] = idx
         return
     step = node_size / grid
@@ -118,18 +128,20 @@ def _subsample_into(out, d, kx, ky, kz, idx, P, halfsize, cube_min, grid, max_de
                 m = (ge[:, 0] == bool(ox)) & (ge[:, 1] == bool(oy)) & (ge[:, 2] == bool(oz))
                 if m.any():
                     _subsample_into(out, d + 1, 2 * kx + ox, 2 * ky + oy, 2 * kz + oz,
-                                    rest[m], P, halfsize, cube_min, grid, max_depth)
+                                    rest[m], P, halfsize, cube_min, grid, max_depth,
+                                    min_node)
 
 
 def _subtree_worker(task):
     d, kx, ky, kz, idx = task
     local = {}
     _subsample_into(local, d, kx, ky, kz, idx, _B_P, _B_HALFSIZE, _B_CUBE_MIN,
-                    _B_GRID, _B_MAXDEPTH)
+                    _B_GRID, _B_MAXDEPTH, _B_MINNODE)
     return local
 
 
-def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
+def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None,
+                min_node=MIN_NODE_PTS):
     # progress(done, total, phase) — phase ∈ {'reading','building','writing'}.
     # Reading/subsampling can't report incremental %, so they emit phase labels;
     # the write loop reports real progress.
@@ -218,6 +230,9 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
         tasks = []
 
         def split(d, kx, ky, kz, idx):
+            if len(idx) <= min_node:   # tiny subtree: keep as a single leaf
+                node_pts[(d, kx, ky, kz)] = idx
+                return
             if d >= SPLIT_DEPTH:
                 tasks.append((d, kx, ky, kz, idx))
                 return
@@ -246,9 +261,9 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
 
         split(0, 0, 0, 0, np.arange(n))
 
-        global _B_P, _B_HALFSIZE, _B_CUBE_MIN, _B_GRID, _B_MAXDEPTH
+        global _B_P, _B_HALFSIZE, _B_CUBE_MIN, _B_GRID, _B_MAXDEPTH, _B_MINNODE
         _B_P, _B_HALFSIZE, _B_CUBE_MIN = P, halfsize, cube_min
-        _B_GRID, _B_MAXDEPTH = grid, max_depth
+        _B_GRID, _B_MAXDEPTH, _B_MINNODE = grid, max_depth, min_node
         bdone = sum(len(v) for v in node_pts.values())
         try:
             with mp.Pool(nproc) as pool:
@@ -259,9 +274,10 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None):
                         progress(bdone, n, 'building')
         finally:
             _B_P = _B_HALFSIZE = _B_CUBE_MIN = _B_GRID = _B_MAXDEPTH = None
+            _B_MINNODE = None
     else:
         _subsample_into(node_pts, 0, 0, 0, 0, np.arange(n), P, halfsize,
-                        cube_min, grid, max_depth)
+                        cube_min, grid, max_depth, min_node)
         if progress is not None:
             progress(n, n, 'building')
 
