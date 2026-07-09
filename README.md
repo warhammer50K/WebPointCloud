@@ -33,6 +33,7 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 
 ### Viewer
 - **GPU-Accelerated 3D Rendering** — Powered by Three.js with custom WebGL shaders
+- **COPC Octree Streaming** — Large maps stream view-dependent LOD from a COPC octree instead of loading whole (see [COPC Streaming](#copc-streaming-large-point-clouds))
 - **Color Modes** — Intensity, Height (turbo colormap), RGB
 - **Post-Processing** — Eye-Dome Lighting (EDL), Screen-Space Ambient Occlusion (SSAO)
 - **Measurement Tools** — Distance measurement, polygon selection, point info
@@ -68,7 +69,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open **http://localhost:6001** in your browser, then drag & drop a point cloud file or click **Load Map > Upload File**.
+Open **http://localhost:6001** in your browser, then drag & drop a point cloud file, or place files under the maps directory (default `~/maps`) and pick them from **Load Map**.
 
 A sample point cloud is included at `sample/building_scan.las` (100k points) — drag it into the viewer to try it out.
 
@@ -78,6 +79,7 @@ A sample point cloud is included at `sample/building_scan.las` (100k points) —
 |--------|-----------|-------|
 | LAS | `.las` | ASPRS LAS 1.2 - 1.4 |
 | LAZ | `.laz` | Compressed LAS (via lazrs) |
+| COPC | `.copc.laz` | Cloud Optimized Point Cloud — streamed with octree LOD |
 | PLY | `.ply` | ASCII and binary (little/big endian) |
 | XYZ | `.xyz` `.txt` `.csv` | Whitespace or comma delimited |
 | PCD | `.pcd` | Point Cloud Library format (ASCII and binary) |
@@ -100,17 +102,29 @@ When two clouds are loaded for comparison, the offset difference is applied auto
 
 No configuration is required — just load the file and coordinates are preserved to sub-millimeter precision regardless of their absolute magnitude.
 
+## COPC Streaming (Large Point Clouds)
+
+Small files are parsed and rendered whole. Large LAS/LAZ files (≥ 2M points by default) are **automatically converted to [COPC](https://copc.io/)** — a LAZ file with an internal octree — in the background on first load. Progress is shown in the loading overlay, and the result is written next to the source (`map.copc.laz`), so the conversion cost is paid only once; every later load streams the COPC directly.
+
+COPC maps are never loaded whole. The viewer streams octree nodes on demand from the current camera view — coarse levels for the whole scene, finer levels only where the camera is looking — under a resident point budget (25M points by default). Chunks that fall out of view or budget are evicted and re-fetched later. This is why a multi-GB, hundred-million-point map opens in seconds and stays smooth while navigating, where parsing the raw LAS up front would take minutes and exhaust GPU memory.
+
+`.copc.laz` files can also be produced offline with `tools/las_to_copc.py <input.las>` (multiprocess writer; see the `WPC_COPC_*` variables below).
+
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `WEB_PORT` | `6001` | HTTP server port |
 | `WPC_DATA_DIR` | `~/webpointcloud` | Data directory (maps + logs) |
-| `WPC_MAPS_DIR` | `$WPC_DATA_DIR/maps` | Point cloud storage directory |
+| `WPC_MAPS_DIR` | `~/maps` | Point cloud storage directory |
 | `FLASK_DEBUG` | `0` | Enable Flask debug mode |
 | `FLASK_SECRET_KEY` | auto-generated | Flask session secret key |
 | `WPC_PUBLIC` | `0` | Set to `1` to disable IP whitelist (for public deployments) |
 | `WPC_MAX_UPLOAD_MB` | `5120` | Maximum upload size in MB |
+| `WPC_COPC_MIN_POINTS` | `2000000` | Point count above which LAS/LAZ auto-converts to COPC streaming |
+| `WPC_COPC_BUDGET` | `25000000` | Resident point budget for COPC streaming (~28 B/point on GPU) |
+| `WPC_COPC_WRITE_PROCS` | `8` | COPC converter: parallel write processes |
+| `WPC_COPC_MIN_NODE` | `2000` | COPC converter: collapse octree leaves below this point count |
 
 ## Architecture
 
