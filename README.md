@@ -110,6 +110,20 @@ COPC maps are never loaded whole. The viewer streams octree nodes on demand from
 
 `.copc.laz` files can also be produced offline with `tools/las_to_copc.py <input.las>` (multiprocess writer; see the `WPC_COPC_*` variables below).
 
+## Classification Coloring
+
+LAS/LAZ point classification (ground, vegetation, building, water, …) is carried through the whole pipeline — direct loads, COPC conversion, and streaming — and can be used as a color mode:
+
+1. Load a classified LAS/LAZ/COPC file
+2. Pick **Color > Classification** in the sidebar
+
+Points are colored with the standard ASPRS palette (2 Ground = brown, 3-5 Vegetation = greens, 6 Building = red, 9 Water = blue, …), the legend shows a swatch per class, and the Point Info tool reports the class number (`C:`) of the hovered point. Classification survives polygon delete / undo / downsampling.
+
+Notes:
+
+- Files whose points are all class 0 (typical for SLAM-generated maps) render uniformly gray in this mode — the data simply carries no classification.
+- `map.copc.laz` files converted before classification support (2026-07) were written without the classification field. Delete the `.copc.laz` and reload the map to re-convert it with classes preserved.
+
 ## Configuration
 
 | Environment Variable | Default | Description |
