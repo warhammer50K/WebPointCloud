@@ -216,7 +216,7 @@ export async function pollConvert(job, onProgress) {
     }
 }
 
-export function workerFilterPoints(positions, intensities, colors, mvpMatrix, viewportW, viewportH, polyPoints, keep) {
+export function workerFilterPoints(positions, intensities, colors, mvpMatrix, viewportW, viewportH, polyPoints, keep, classifications = null) {
     if (_workerNotSupported) {
         alert('Web Workers are not supported in this browser. Point cloud processing is unavailable.');
         return Promise.reject(new Error('Web Worker API not supported'));
@@ -231,7 +231,7 @@ export function workerFilterPoints(positions, intensities, colors, mvpMatrix, vi
         _workerCallbacks.set(id, { resolve, reject, timeout, worker });
         worker.postMessage({
             id, type: 'filter',
-            positions, intensities, colors,
+            positions, intensities, colors, classifications,
             mvpMatrix, viewportW, viewportH, polyPoints, keep,
         });
     });

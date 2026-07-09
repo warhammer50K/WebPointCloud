@@ -3,7 +3,7 @@
    ═══════════════════════════════════════════════════════ */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG, GAUSSIAN_VERT, GAUSSIAN_FRAG } from './shaders.js';
+import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG, GAUSSIAN_VERT, GAUSSIAN_FRAG, CLASS_PALETTE, CLASS_NAMES } from './shaders.js';
 import { GaussianSplat } from './gaussian-splat.js';
 import { CopcLodManager } from './copc-lod.js';
 
@@ -449,18 +449,24 @@ export class Viewer {
     }
 
     /* ── Shader material factory ── */
+    _colorModeInt() {
+        return this.colorMode === 'height' ? 1
+             : this.colorMode === 'rgb' ? 2
+             : this.colorMode === 'classification' ? 3 : 0;
+    }
+
     _makeMaterial() {
-        const colorModeInt = this.colorMode === 'height' ? 1 : this.colorMode === 'rgb' ? 2 : 0;
         return new THREE.ShaderMaterial({
             uniforms: {
                 uPointSize: { value: this.pointSize },
-                uColorMode: { value: colorModeInt },
+                uColorMode: { value: this._colorModeInt() },
                 uMinVal:    { value: 0.0 },
                 uMaxVal:    { value: 1.0 },
                 uGamma:     { value: this.gamma },
                 uOpacity:      { value: 1.0 },
                 uTintColor:    { value: new THREE.Vector3(1, 1, 1) },
                 uTintStrength: { value: 0.0 },
+                uClassPalette: { value: CLASS_PALETTE.map(c => new THREE.Vector3(...c)) },
             },
             vertexShader: VERT,
             fragmentShader: FRAG,
@@ -472,14 +478,12 @@ export class Viewer {
     _syncColorUniforms(cloud) {
         if (!cloud) return;
         const u = cloud.material.uniforms;
+        u.uColorMode.value = this._colorModeInt();
         if (this.colorMode === 'intensity') {
-            u.uColorMode.value = 0; u.uMinVal.value = 0; u.uMaxVal.value = 1;
+            u.uMinVal.value = 0; u.uMaxVal.value = 1;
         } else if (this.colorMode === 'height') {
-            u.uColorMode.value = 1;
             u.uMinVal.value = this.bounds ? this.bounds.zMin : 0;
             u.uMaxVal.value = this.bounds ? this.bounds.zMax : 1;
-        } else {
-            u.uColorMode.value = 2;
         }
         u.uGamma.value = this.gamma;
     }
@@ -489,6 +493,10 @@ export class Viewer {
         geom.setAttribute('position',  new THREE.Float32BufferAttribute(data.positions, 3));
         geom.setAttribute('intensity', new THREE.Float32BufferAttribute(data.intensities, 1));
         geom.setAttribute('rgb',       new THREE.Float32BufferAttribute(data.colors, 3));
+        // Sources without classification (PLY/XYZ/PCD/realtime) render as class 0.
+        const cls = data.classifications && data.classifications.length === data.numPoints
+            ? data.classifications : new Float32Array(data.numPoints);
+        geom.setAttribute('classification', new THREE.Float32BufferAttribute(cls, 1));
         return geom;
     }
 
@@ -700,6 +708,8 @@ export class Viewer {
         const intensities = new Float32Array(outN);
         const hasColor = data.colors && data.colors.length > 0;
         const colors = hasColor ? new Float32Array(outN * 3) : new Float32Array(0);
+        const hasClass = data.classifications && data.classifications.length > 0;
+        const classifications = hasClass ? new Float32Array(outN) : null;
 
         for (let i = 0, o = 0; i < srcN && o < outN; i += step, o++) {
             const i3 = i * 3, o3 = o * 3;
@@ -712,8 +722,9 @@ export class Viewer {
                 colors[o3 + 1] = data.colors[i3 + 1];
                 colors[o3 + 2] = data.colors[i3 + 2];
             }
+            if (hasClass) classifications[o] = data.classifications[i];
         }
-        return { positions, intensities, colors, numPoints: outN, bounds: data.bounds, offset: data.offset };
+        return { positions, intensities, colors, classifications, numPoints: outN, bounds: data.bounds, offset: data.offset };
     }
 
     setDownsampleRatio(ratio) {
@@ -889,6 +900,8 @@ export class Viewer {
             colors.set(data.colors);
             geom.setAttribute('intensity', new THREE.Float32BufferAttribute(intensities, 1));
             geom.setAttribute('rgb', new THREE.Float32BufferAttribute(colors, 3));
+            // realtime streams carry no classification — render as class 0
+            geom.setAttribute('classification', new THREE.Float32BufferAttribute(new Float32Array(capacity), 1));
         }
 
         geom.setDrawRange(0, n);
@@ -1805,7 +1818,13 @@ export class Legend {
             this.panel.classList.remove('visible');
             return;
         }
+        if (mode === 'classification') {
+            this._renderClassLegend();
+            return;
+        }
         this.panel.classList.add('visible');
+        this.canvas.style.display = '';
+        this.labelsEl.style.cssText = '';
 
         const oz = zOffset || 0;
         let min, max, title;
@@ -1841,5 +1860,24 @@ export class Legend {
             span.textContent = val.toFixed(2);
             this.labelsEl.appendChild(span);
         }
+    }
+
+    // Discrete ASPRS class swatches instead of the gradient strip.
+    _renderClassLegend() {
+        this.panel.classList.add('visible');
+        this.titleEl.textContent = 'Classification';
+        this.canvas.style.display = 'none';
+        this.labelsEl.style.cssText = 'display:flex;flex-direction:column;gap:2px';
+        this.labelsEl.innerHTML = '';
+        CLASS_NAMES.forEach((name, i) => {
+            const [r, g, b] = CLASS_PALETTE[i];
+            const row = document.createElement('span');
+            row.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:10px;line-height:12px';
+            const chip = document.createElement('span');
+            chip.style.cssText = `flex-shrink:0;width:10px;height:10px;border-radius:2px;background:rgb(${r * 255 | 0},${g * 255 | 0},${b * 255 | 0})`;
+            row.appendChild(chip);
+            row.appendChild(document.createTextNode(`${i <= 18 ? i : '19+'} ${name}`));
+            this.labelsEl.appendChild(row);
+        });
     }
 }

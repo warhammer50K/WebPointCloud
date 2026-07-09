@@ -34,7 +34,7 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 ### Viewer
 - **GPU-Accelerated 3D Rendering** — Powered by Three.js with custom WebGL shaders
 - **COPC Octree Streaming** — Large maps stream view-dependent LOD from a COPC octree instead of loading whole (see [COPC Streaming](#copc-streaming-large-point-clouds))
-- **Color Modes** — Intensity, Height (turbo colormap), RGB
+- **Color Modes** — Intensity, Height (turbo colormap), RGB, Classification (ASPRS palette + legend)
 - **Post-Processing** — Eye-Dome Lighting (EDL), Screen-Space Ambient Occlusion (SSAO)
 - **Measurement Tools** — Distance measurement, polygon selection, point info
 - **Map Comparison** — Overlay two point clouds with transform controls (offset + rotation)

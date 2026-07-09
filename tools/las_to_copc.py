@@ -165,6 +165,8 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None,
         rr = np.asarray(las.red, dtype=np.uint16)
         gg = np.asarray(las.green, dtype=np.uint16)
         bb = np.asarray(las.blue, dtype=np.uint16)
+    cls = (np.asarray(las.classification, dtype=np.uint8)
+           if 'classification' in dims else None)
     pfid = 7 if has_rgb else 6  # COPC requires PDRF 6/7/8; 7 carries RGB
 
     # Release the original record array (can be several GB) before allocating the
@@ -192,6 +194,9 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None,
         packed_las.green = gg
         packed_las.blue = bb
         del rr, gg, bb
+    if cls is not None:
+        packed_las.classification = cls
+        del cls
     records = packed_las.points.array  # structured packed PDRF records
     del inten
 

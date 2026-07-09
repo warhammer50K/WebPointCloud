@@ -133,6 +133,9 @@ function parseBinary(buffer) {
     const positions   = new Float32Array(numPoints * 3);
     const intensities = new Float32Array(numPoints);
     const colors      = new Float32Array(numPoints * 3);
+    // fpp=8 carries LAS classification as the 8th float; zeros otherwise.
+    const classifications = new Float32Array(numPoints);
+    const hasClass = fpp >= 8;
 
     for (let i = 0; i < numPoints; i++) {
         const b = i * fpp;
@@ -143,8 +146,9 @@ function parseBinary(buffer) {
         colors[i * 3]        = raw[b + 4];
         colors[i * 3 + 1]    = raw[b + 5];
         colors[i * 3 + 2]    = raw[b + 6];
+        if (hasClass) classifications[i] = raw[b + 7];
     }
-    return { positions, intensities, colors, bounds, numPoints, offset };
+    return { positions, intensities, colors, classifications, bounds, numPoints, offset };
 }
 
 /* ── COPC multi-blob: merge many node payloads into ONE geometry buffer ──
@@ -164,8 +168,9 @@ function parseMultiblob(buffer) {
         const key = new TextDecoder().decode(new Uint8Array(buffer, off, keyLen));
         off += keyLen;
         const plen = view.getUint32(off, true); off += 4;
-        const n = view.getUint32(off, true);   // payload header: numPoints
-        blobs.push({ key, dataOff: off + 64, n }); // header(8)+offset(24)+bounds(32)
+        const n = view.getUint32(off, true);       // payload header: numPoints
+        const fpp = view.getUint32(off + 4, true); // payload header: floats per point
+        blobs.push({ key, dataOff: off + 64, n, fpp }); // header(8)+offset(24)+bounds(32)
         off += plen;
         totalN += n;
     }
@@ -173,23 +178,26 @@ function parseMultiblob(buffer) {
     const positions = new Float32Array(totalN * 3);
     const intensities = new Float32Array(totalN);
     const colors = new Float32Array(totalN * 3);
+    const classifications = new Float32Array(totalN);
     const nodeKeys = [];
     const nodeCounts = [];
     let w = 0;
     for (const b of blobs) {
         // slice → fresh, aligned buffer (payload start may be unaligned).
-        const raw = new Float32Array(buffer.slice(b.dataOff, b.dataOff + b.n * 7 * 4));
+        const raw = new Float32Array(buffer.slice(b.dataOff, b.dataOff + b.n * b.fpp * 4));
+        const hasClass = b.fpp >= 8;
         for (let i = 0; i < b.n; i++) {
-            const s = i * 7, o = w * 3;
+            const s = i * b.fpp, o = w * 3;
             positions[o] = raw[s]; positions[o + 1] = raw[s + 1]; positions[o + 2] = raw[s + 2];
             intensities[w] = raw[s + 3];
             colors[o] = raw[s + 4]; colors[o + 1] = raw[s + 5]; colors[o + 2] = raw[s + 6];
+            if (hasClass) classifications[w] = raw[s + 7];
             w++;
         }
         nodeKeys.push(b.key);
         nodeCounts.push(b.n);
     }
-    return { positions, intensities, colors, numPoints: totalN, nodeKeys, nodeCounts };
+    return { positions, intensities, colors, classifications, numPoints: totalN, nodeKeys, nodeCounts };
 }
 
 /* ── Point-in-polygon (ray casting) ── */
@@ -207,7 +215,7 @@ function isPointInPoly2D(px, py, poly) {
 
 /* ── Polygon Filter (runs in worker to avoid UI freeze) ── */
 function filterPoints(data) {
-    const { positions, intensities, colors, mvpMatrix, viewportW, viewportH, polyPoints, keep } = data;
+    const { positions, intensities, colors, classifications, mvpMatrix, viewportW, viewportH, polyPoints, keep } = data;
     const n = positions.length / 3;
     const mvp = mvpMatrix; // Float64Array(16), column-major
 
@@ -215,6 +223,14 @@ function filterPoints(data) {
     const newPos = [];
     const newInt = [];
     const newRgb = [];
+    const newCls = [];
+
+    const takePoint = (i, x, y, z) => {
+        newPos.push(x, y, z);
+        newInt.push(intensities[i]);
+        if (colors) newRgb.push(colors[i*3], colors[i*3+1], colors[i*3+2]);
+        if (classifications) newCls.push(classifications[i]);
+    };
 
     for (let i = 0; i < n; i++) {
         const x = positions[i * 3];
@@ -231,11 +247,7 @@ function filterPoints(data) {
         const ndcZ = cz / cw;
         if (ndcZ < -1 || ndcZ > 1) {
             // Behind camera — keep if deleting selection, discard if keeping
-            if (!keep) {
-                newPos.push(x, y, z);
-                newInt.push(intensities[i]);
-                if (colors) newRgb.push(colors[i*3], colors[i*3+1], colors[i*3+2]);
-            }
+            if (!keep) takePoint(i, x, y, z);
             continue;
         }
 
@@ -247,22 +259,20 @@ function filterPoints(data) {
         const sy = (-ndcY * 0.5 + 0.5) * viewportH;
 
         const inside = isPointInPoly2D(sx, sy, polyPoints);
-        if ((keep && inside) || (!keep && !inside)) {
-            newPos.push(x, y, z);
-            newInt.push(intensities[i]);
-            if (colors) newRgb.push(colors[i*3], colors[i*3+1], colors[i*3+2]);
-        }
+        if ((keep && inside) || (!keep && !inside)) takePoint(i, x, y, z);
     }
 
     const outN = newPos.length / 3;
     const outPositions = new Float32Array(newPos);
     const outIntensities = new Float32Array(newInt);
     const outColors = colors ? new Float32Array(newRgb) : null;
+    const outClassifications = classifications ? new Float32Array(newCls) : null;
 
     // Compute bounds
     const bounds = computeBounds(outPositions, outN);
 
-    return { positions: outPositions, intensities: outIntensities, colors: outColors, bounds, numPoints: outN };
+    return { positions: outPositions, intensities: outIntensities, colors: outColors,
+             classifications: outClassifications, bounds, numPoints: outN };
 }
 
 importScripts('/static/vendor/pako_inflate.min.js');
@@ -296,6 +306,7 @@ self.onmessage = function(e) {
     const transferables = [result.positions.buffer];
     if (result.intensities) transferables.push(result.intensities.buffer);
     if (result.colors) transferables.push(result.colors.buffer);
+    if (result.classifications) transferables.push(result.classifications.buffer);
     if (result.scales) transferables.push(result.scales.buffer);
     if (result.rotations) transferables.push(result.rotations.buffer);
     if (result.opacities) transferables.push(result.opacities.buffer);

@@ -198,6 +198,8 @@ export function initPointInfo(viewer) {
         let info = `X: ${(pt.x+_ox).toFixed(3)}  Y: ${(pt.y+_oy).toFixed(3)}  Z: ${(pt.z+_oz).toFixed(3)}`;
         const intAttr = hit.object?.geometry?.getAttribute('intensity');
         if (intAttr && hit.index != null) info += `  I: ${intAttr.getX(hit.index).toFixed(3)}`;
+        const clsAttr = hit.object?.geometry?.getAttribute('classification');
+        if (clsAttr && hit.index != null) info += `  C: ${Math.round(clsAttr.getX(hit.index))}`;
         infoEl.style.display = 'block';
         infoEl.style.left = `${e.clientX - rect.left + 16}px`;
         infoEl.style.top = `${e.clientY - rect.top - 10}px`;
@@ -242,6 +244,8 @@ export function initPointInfo(viewer) {
         let info = `X: ${(pt.x+_ox2).toFixed(3)}  Y: ${(pt.y+_oy2).toFixed(3)}  Z: ${(pt.z+_oz2).toFixed(3)}`;
         const intAttr = hit.object?.geometry?.getAttribute('intensity');
         if (intAttr && hit.index != null) info += `  I: ${intAttr.getX(hit.index).toFixed(3)}`;
+        const clsAttr = hit.object?.geometry?.getAttribute('classification');
+        if (clsAttr && hit.index != null) info += `  C: ${Math.round(clsAttr.getX(hit.index))}`;
         infoEl.style.display = 'block';
         infoEl.style.left = `${touch.clientX - rect.left + 16}px`;
         infoEl.style.top = `${touch.clientY - rect.top - 10}px`;
@@ -436,15 +440,17 @@ export async function applyPolyFilter(viewer, keep) {
         const count = geom.drawRange.count === Infinity ? pos.count : geom.drawRange.count;
         const intAttr = geom.getAttribute('intensity');
         const rgbAttr = geom.getAttribute('rgb');
+        const clsAttr = geom.getAttribute('classification');
 
         // pass copies to Worker
         const posArr = new Float32Array(pos.array.buffer.slice(0, count * 3 * 4));
         const intArr = new Float32Array(intAttr.array.buffer.slice(0, count * 4));
         const rgbArr = rgbAttr ? new Float32Array(rgbAttr.array.buffer.slice(0, count * 3 * 4)) : null;
+        const clsArr = clsAttr ? new Float32Array(clsAttr.array.buffer.slice(0, count * 4)) : null;
 
         const result = await workerFilterPoints(
             posArr, intArr, rgbArr,
-            mvpMatrix, rect.width, rect.height, poly, keep
+            mvpMatrix, rect.width, rect.height, poly, keep, clsArr
         );
 
         const n = result.numPoints;
@@ -452,6 +458,7 @@ export async function applyPolyFilter(viewer, keep) {
         pos.needsUpdate = true;
         if (intAttr) { intAttr.array.set(result.intensities); intAttr.needsUpdate = true; }
         if (rgbAttr && result.colors) { rgbAttr.array.set(result.colors); rgbAttr.needsUpdate = true; }
+        if (clsAttr && result.classifications) { clsAttr.array.set(result.classifications); clsAttr.needsUpdate = true; }
         geom.setDrawRange(0, n);
     }
 
@@ -492,10 +499,12 @@ export function snapshotGeometry(viewer) {
         if (!obj) continue;
         const geom = obj.geometry;
         const dc = geom.drawRange.count === Infinity ? geom.getAttribute('position').count : geom.drawRange.count;
+        const clsAttr = geom.getAttribute('classification');
         snap[prop] = {
             positions: new Float32Array(geom.getAttribute('position').array.slice(0, dc * 3)),
             intensities: new Float32Array(geom.getAttribute('intensity').array.slice(0, dc)),
             colors: new Float32Array(geom.getAttribute('rgb').array.slice(0, dc * 3)),
+            classifications: clsAttr ? new Float32Array(clsAttr.array.slice(0, dc)) : null,
             count: dc,
         };
     }
@@ -514,6 +523,11 @@ export function restoreSnapshot(viewer, snap) {
         geom.getAttribute('intensity').needsUpdate = true;
         geom.getAttribute('rgb').array.set(s.colors);
         geom.getAttribute('rgb').needsUpdate = true;
+        const clsAttr = geom.getAttribute('classification');
+        if (clsAttr && s.classifications) {
+            clsAttr.array.set(s.classifications);
+            clsAttr.needsUpdate = true;
+        }
         geom.setDrawRange(0, s.count);
     }
     if (snap.bounds) viewer.bounds = { ...snap.bounds };

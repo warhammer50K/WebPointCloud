@@ -2,6 +2,39 @@
    GPU Shaders & Colormap
    ═══════════════════════════════════════════════════════ */
 
+/* ASPRS LAS classification palette (0-18 standard, 19 = everything else).
+   Shared by the vertex shader (uClassPalette uniform) and the legend. */
+export const CLASS_PALETTE = [
+    [0.70, 0.70, 0.70],  //  0 Never Classified
+    [0.55, 0.55, 0.55],  //  1 Unclassified
+    [0.63, 0.44, 0.26],  //  2 Ground
+    [0.55, 0.83, 0.40],  //  3 Low Vegetation
+    [0.30, 0.70, 0.30],  //  4 Medium Vegetation
+    [0.10, 0.50, 0.15],  //  5 High Vegetation
+    [0.85, 0.25, 0.20],  //  6 Building
+    [0.35, 0.20, 0.45],  //  7 Low Point (Noise)
+    [0.80, 0.80, 0.60],  //  8 Reserved
+    [0.20, 0.45, 0.90],  //  9 Water
+    [0.75, 0.65, 0.15],  // 10 Rail
+    [0.35, 0.35, 0.38],  // 11 Road Surface
+    [0.95, 0.90, 0.55],  // 12 Reserved / Overlap
+    [0.45, 0.85, 0.90],  // 13 Wire Guard
+    [0.20, 0.75, 0.85],  // 14 Wire Conductor
+    [0.95, 0.55, 0.15],  // 15 Transmission Tower
+    [0.85, 0.40, 0.85],  // 16 Wire Connector
+    [0.80, 0.70, 0.50],  // 17 Bridge Deck
+    [1.00, 0.30, 0.55],  // 18 High Noise
+    [1.00, 0.95, 0.30],  // 19+ Other
+];
+
+export const CLASS_NAMES = [
+    'Never Classified', 'Unclassified', 'Ground', 'Low Vegetation',
+    'Medium Vegetation', 'High Vegetation', 'Building', 'Low Point (Noise)',
+    'Reserved', 'Water', 'Rail', 'Road Surface', 'Overlap',
+    'Wire Guard', 'Wire Conductor', 'Transmission Tower', 'Wire Connector',
+    'Bridge Deck', 'High Noise', 'Other',
+];
+
 export function turbo(t) {
     t = Math.max(0, Math.min(1, t));
     const r = 0.13572138 + t * (4.6153926 + t * (-42.6603226 + t * (132.1310823 + t * (-152.9423940 + t * 59.2863794))));
@@ -12,13 +45,15 @@ export function turbo(t) {
 
 export const VERT = `
 uniform float uPointSize;
-uniform int   uColorMode;   // 0=intensity  1=height  2=rgb
+uniform int   uColorMode;   // 0=intensity  1=height  2=rgb  3=classification
 uniform float uMinVal;
 uniform float uMaxVal;
 uniform float uGamma;
+uniform vec3  uClassPalette[20];
 
 attribute float intensity;
 attribute vec3  rgb;
+attribute float classification;
 
 varying vec3 vColor;
 
@@ -46,6 +81,10 @@ void main() {
     } else if (uColorMode == 1) {
         float t = clamp((position.z - uMinVal) / range, 0.0, 1.0);
         vColor = turbo(pow(t, uGamma));
+    } else if (uColorMode == 3) {
+        int c = int(classification + 0.5);
+        if (c < 0 || c > 18) c = 19;
+        vColor = uClassPalette[c];
     } else {
         vColor = rgb;
     }

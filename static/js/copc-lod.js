@@ -402,10 +402,11 @@ export class CopcLodManager {
         for (const op of this._deleteOps) {
             const res = await workerFilterPoints(
                 cur.positions, cur.intensities, cur.colors,
-                op.mvp, op.w, op.h, op.poly, op.keep);
+                op.mvp, op.w, op.h, op.poly, op.keep, cur.classifications);
             if (this._disposed) return res;
             cur = { positions: res.positions, intensities: res.intensities,
-                    colors: res.colors, numPoints: res.numPoints };
+                    colors: res.colors, classifications: res.classifications,
+                    numPoints: res.numPoints };
             if (cur.numPoints === 0) break;
         }
         return cur;
@@ -424,12 +425,14 @@ export class CopcLodManager {
             const pos = geom.getAttribute('position');
             const intAttr = geom.getAttribute('intensity');
             const rgbAttr = geom.getAttribute('rgb');
+            const clsAttr = geom.getAttribute('classification');
             const cnt = geom.drawRange.count === Infinity ? pos.count : geom.drawRange.count;
             const posArr = new Float32Array(pos.array.buffer.slice(0, cnt * 3 * 4));
             const intArr = new Float32Array(intAttr.array.buffer.slice(0, cnt * 4));
             const rgbArr = rgbAttr ? new Float32Array(rgbAttr.array.buffer.slice(0, cnt * 3 * 4)) : null;
+            const clsArr = clsAttr ? new Float32Array(clsAttr.array.buffer.slice(0, cnt * 4)) : null;
             const res = await workerFilterPoints(
-                posArr, intArr, rgbArr, op.mvp, op.w, op.h, op.poly, op.keep);
+                posArr, intArr, rgbArr, op.mvp, op.w, op.h, op.poly, op.keep, clsArr);
             if (this._disposed) return;
             // Evicted while the filter ran: _unloadChunk already settled the
             // point count; touching the stale entry would corrupt it.
@@ -444,6 +447,7 @@ export class CopcLodManager {
                 pos.array.set(res.positions); pos.needsUpdate = true;
                 intAttr.array.set(res.intensities); intAttr.needsUpdate = true;
                 if (rgbAttr && res.colors) { rgbAttr.array.set(res.colors); rgbAttr.needsUpdate = true; }
+                if (clsAttr && res.classifications) { clsAttr.array.set(res.classifications); clsAttr.needsUpdate = true; }
                 geom.setDrawRange(0, res.numPoints);
             }
         }

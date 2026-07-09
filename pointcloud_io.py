@@ -42,7 +42,8 @@ def read_pointcloud(path):
 #  Binary packing (for web viewer)
 # ══════════════════════════════════════════════════════
 
-def arrays_to_binary(x, y, z, intensity, r, g, b, n, offset=None):
+def arrays_to_binary(x, y, z, intensity, r, g, b, n, offset=None,
+                     classification=None):
     """Pack point cloud arrays into binary format for the web viewer.
 
     Coordinates are centered by subtracting the bounding-box midpoint in
@@ -55,7 +56,12 @@ def arrays_to_binary(x, y, z, intensity, r, g, b, n, offset=None):
     center) and the per-node geometries align seamlessly; recomputing a
     per-node midpoint would scatter nodes in space.
 
-    Format: header(8) + offset(24, 3×float64) + bounds(32, 8×float32) + data(n×7 float32)
+    When ``classification`` is given (LAS sources), it rides as an 8th float
+    per point and fpp becomes 8. The client keys on fpp, so 7-float payloads
+    from formats without classification stay valid unchanged.
+
+    Format: header(8: n, fpp) + offset(24, 3×float64) + bounds(32, 8×float32)
+            + data(n×fpp float32)
     """
     x64 = np.asarray(x, dtype=np.float64)
     y64 = np.asarray(y, dtype=np.float64)
@@ -74,16 +80,21 @@ def arrays_to_binary(x, y, z, intensity, r, g, b, n, offset=None):
     yc = (y64 - oy).astype(np.float32)
     zc = (z64 - oz).astype(np.float32)
 
+    cols = [xc, yc, zc, intensity, r, g, b]
+    if classification is not None:
+        cols.append(np.asarray(classification, dtype=np.float32))
+    fpp = len(cols)
+
     if n > 0:
-        data = np.column_stack([xc, yc, zc, intensity, r, g, b]).astype(np.float32)
+        data = np.column_stack(cols).astype(np.float32)
         bounds = np.array([
             xc.min(), xc.max(), yc.min(), yc.max(), zc.min(), zc.max(), 0.0, 1.0
         ], dtype=np.float32)
     else:
-        data = np.empty((0, 7), dtype=np.float32)
+        data = np.empty((0, fpp), dtype=np.float32)
         bounds = np.zeros(8, dtype=np.float32)
 
-    header = struct.pack('<II', n, 7)
+    header = struct.pack('<II', n, fpp)
     offset = struct.pack('<ddd', ox, oy, oz)
     return header + offset + bounds.tobytes() + data.tobytes()
 
@@ -172,11 +183,15 @@ def _read_las(path):
         g = np.full(n, 0.5, dtype=np.float32)
         b = np.full(n, 0.5, dtype=np.float32)
 
+    classification = (np.array(las.classification, dtype=np.float32)
+                      if hasattr(las, 'classification') else None)
+
     return {
         'x': x, 'y': y, 'z': z,
         'intensity': intensity,
         'r': r, 'g': g, 'b': b,
         'n': n, 'has_rgb': has_rgb,
+        'classification': classification,
     }
 
 

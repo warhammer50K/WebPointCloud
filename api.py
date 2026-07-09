@@ -251,7 +251,8 @@ def load_pointcloud():
                 d['opacity'], d['n'])
         else:
             binary = arrays_to_binary(d['x'], d['y'], d['z'], d['intensity'],
-                                      d['r'], d['g'], d['b'], d['n'])
+                                      d['r'], d['g'], d['b'], d['n'],
+                                      classification=d.get('classification'))
         resp = send_file(io.BytesIO(binary), mimetype='application/octet-stream')
         if saved_path:
             resp.headers['X-Saved-Path'] = saved_path

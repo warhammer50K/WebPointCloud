@@ -330,9 +330,12 @@ def _pack_node_points(pts, entry, center):
         g = np.full(n, 0.5, dtype=np.float32)
         b = np.full(n, 0.5, dtype=np.float32)
 
+    classification = np.asarray(pts.classification, dtype=np.float32)
+
     return arrays_to_binary(
         x, y, z, intensity, r, g, b, n,
         offset=[float(center[0]), float(center[1]), float(center[2])],
+        classification=classification,
     )
 
 
