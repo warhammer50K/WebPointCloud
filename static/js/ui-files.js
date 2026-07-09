@@ -6,6 +6,42 @@
 import { $, formatFileSize, formatDate, formatPoints } from './utils.js';
 import { showToast, customConfirm, showLoading, hideLoading, withLoading } from './ui-notifications.js';
 import { appendLog } from './ui-panels.js';
+import { pollConvert } from './data.js';
+
+/** Conversion overlay label by phase. */
+function convLabel(name, pct, phase) {
+    if (phase === 'reading') return `Reading ${name}…`;
+    if (phase === 'building') return `Building octree… ${pct}%`;
+    return `Converting ${name} to COPC… ${pct}%`;
+}
+
+/**
+ * Route loaded data to the right viewer mode (COPC stream / gaussian / point
+ * cloud) and return display info for legend + logging. For large uploads still
+ * converting to COPC, polls the job (reporting % via onConvertPct) first.
+ * @returns {Promise<{bounds:Object, offsetZ:number, count:number, label:string}>}
+ */
+async function dispatchLoad(viewer, data, onConvertPct) {
+    if (data.mode === 'converting') {
+        const { meta, path } = await pollConvert(data.job, onConvertPct);
+        viewer.loadCopc(meta, path);
+        return { bounds: viewer.bounds, offsetZ: meta.coordOffset[2],
+                 count: meta.point_count, label: 'pts' };
+    }
+    if (data.mode === 'copc') {
+        viewer.loadCopc(data.meta, data.path);
+        return { bounds: viewer.bounds, offsetZ: data.meta.coordOffset[2],
+                 count: data.meta.point_count, label: 'pts' };
+    }
+    if (data.type === 'gaussian') {
+        viewer.loadGaussianSplat(data);
+        return { bounds: data.bounds, offsetZ: data.offset ? data.offset[2] : 0,
+                 count: data.numPoints, label: 'gaussians' };
+    }
+    viewer.loadPointCloud(data);
+    return { bounds: data.bounds, offsetZ: data.offset ? data.offset[2] : 0,
+             count: data.numPoints, label: 'pts' };
+}
 
 /**
  * @param {import('./viewer.js').Viewer} viewer
@@ -21,13 +57,12 @@ export function initFileManagement(viewer, legend, deps, uiState) {
     const openModal = () => {
         uiState.compareMode = 'load';
         $('modal-file-title').textContent = 'Load Point Cloud';
-        $('btn-upload').style.display = '';
         modalBg.classList.add('open');
         const searchInput = $('map-search');
         if (searchInput) searchInput.value = '';
         refreshMapList();
     };
-    const closeModal = () => { modalBg.classList.remove('open'); uiState.compareMode = 'load'; $('btn-upload').style.display = ''; $('btn-upload').textContent = 'Upload File'; };
+    const closeModal = () => { modalBg.classList.remove('open'); uiState.compareMode = 'load'; };
 
     // Expose closeModal on uiState for cross-module use
     uiState.closeModal = closeModal;
@@ -36,73 +71,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
     $('btn-modal-close').addEventListener('click', closeModal);
     modalBg.addEventListener('click', e => { if (e.target === modalBg) closeModal(); });
 
-    // Upload
-    $('btn-upload').addEventListener('click', () => $('file-input').click());
-    $('file-input').addEventListener('change', async e => {
-        const file = e.target.files[0];
-        if (!file) return;
-        // UX-4: File size validation (5 GB matches server MAX_CONTENT_LENGTH)
-        const MAX_UPLOAD_SIZE = 5 * 1024 * 1024 * 1024;
-        if (file.size > MAX_UPLOAD_SIZE) {
-            showToast(`File too large (${formatFileSize(file.size)}). Maximum upload size is 5 GB.`, 'error');
-            e.target.value = '';
-            return;
-        }
-        const isCompare = uiState.compareMode === 'compare';
-        closeModal();
-
-        if (isCompare) {
-            $('st-main').textContent = `Uploading compare map: ${file.name}...`;
-            showLoading(`Loading compare map...`);
-            try {
-                const data = await uploadLasFile(file, pct => {
-                    $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
-                });
-                viewer.loadCompareCloud(data);
-                uiState.compareBPath = data.savedPath || null;
-                $('compare-panel').classList.remove('hidden');
-                $('compare-b-name').textContent = file.name;
-                const ptsA = viewer.pointCloud ? viewer.cloudData?.numPoints?.toLocaleString() || '?' : 'none';
-                const ptsB = data.numPoints.toLocaleString();
-                $('st-main').textContent = `A: ${ptsA} pts | B: ${ptsB} pts`;
-                appendLog(`Compare map uploaded: ${file.name} (${ptsB} pts)`, 'info');
-                showToast(`Map A: ${ptsA} pts + Map B: ${ptsB} pts`, 'success');
-            } catch (err) {
-                $('st-main').textContent = `Error: ${err.message}`;
-                showToast(`Failed: ${err.message}`, 'error');
-            } finally {
-                hideLoading();
-            }
-        } else {
-            $('st-main').textContent = `Uploading ${file.name} (${formatFileSize(file.size)})...`;
-            showLoading(`Loading ${file.name}...`);
-            try {
-                const data = await uploadLasFile(file, pct => {
-                    $('st-main').textContent = `Uploading ${file.name}... ${pct}%`;
-                });
-                if (data.type === 'gaussian') {
-                    viewer.loadGaussianSplat(data);
-                } else {
-                    viewer.loadPointCloud(data);
-                }
-                legend.update(viewer.colorMode, data.bounds, data.offset ? data.offset[2] : 0);
-                if (data.savedPath) {
-                    const { setCurrentPath } = await import('./analysis.js');
-                    setCurrentPath(data.savedPath);
-                }
-                $('compare-a-name').textContent = file.name;
-                $('no-data-msg').style.display = 'none';
-                const label = data.type === 'gaussian' ? 'gaussians' : 'points';
-                $('st-main').textContent = `Loaded ${data.numPoints.toLocaleString()} ${label}`;
-                appendLog(`Loaded ${file.name} (${data.numPoints.toLocaleString()} ${label})`, 'success');
-            } catch (err) {
-                $('st-main').textContent = `Error: ${err.message}`;
-                showToast(`Failed: ${err.message}`, 'error');
-            } finally {
-                hideLoading();
-            }
-        }
-    });
+    // (Upload removed — maps are loaded from ~/maps via the list below.)
 
     // Refresh map list
     async function refreshMapList() {
@@ -113,7 +82,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             const maps = await resp.json();
             list.innerHTML = '';
             if (maps.length === 0) {
-                list.innerHTML = '<div style="color:var(--text-dim)">No saved maps. Use Upload File to load a LAS/LAZ file.</div>';
+                list.innerHTML = '<div style="color:var(--text-dim)">No maps found. Place a LAS/LAZ/COPC file in the maps directory.</div>';
                 return;
             }
             for (const m of maps) {
@@ -188,19 +157,16 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                         showLoading(`Loading ${mapName}/${f}...`);
                         try {
                             const data = await loadLasFromPath(fullPath);
-                            if (data.type === 'gaussian') {
-                                viewer.loadGaussianSplat(data);
-                            } else {
-                                viewer.loadPointCloud(data);
-                            }
-                            legend.update(viewer.colorMode, data.bounds, data.offset ? data.offset[2] : 0);
+                            const info = await dispatchLoad(viewer, data, (pct, phase) => {
+                                showLoading(convLabel(f, pct, phase));
+                            });
+                            legend.update(viewer.colorMode, info.bounds, info.offsetZ);
                             $('compare-a-name').textContent = `${mapName}/${f}`;
                             // Set current path for analysis
                             const { setCurrentPath } = await import('./analysis.js');
                             setCurrentPath(fullPath);
                             $('no-data-msg').style.display = 'none';
-                            const label = data.type === 'gaussian' ? 'gaussians' : 'pts';
-                            appendLog(`Map loaded: ${mapName}/${f} (${data.numPoints.toLocaleString()} ${label})`, 'success');
+                            appendLog(`Map loaded: ${mapName}/${f} (${info.count.toLocaleString()} ${info.label})`, 'success');
                         } catch (err) {
                             $('st-main').textContent = `Error: ${err.message}`;
                             showToast(`Failed: ${err.message}`, 'error');
@@ -291,6 +257,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
     });
 
     // ── Drag & Drop ──
+    // Dropped files only expose their bytes (not a path), so they're uploaded to
+    // a server-side temp dir and auto-deleted after COPC conversion — no copy is
+    // kept under the maps tree (see /api/load_pointcloud).
     const wrap = $('viewer-wrap');
     const dropOverlay = $('drop-overlay');
     let dragCounter = 0;
@@ -307,17 +276,17 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         $('st-main').textContent = `Loading ${file.name}...`;
         showLoading(`Loading ${file.name}...`);
         try {
-            const data = await uploadLasFile(file);
-            if (data.type === 'gaussian') {
-                viewer.loadGaussianSplat(data);
-            } else {
-                viewer.loadPointCloud(data);
-            }
-            legend.update(viewer.colorMode, data.bounds, data.offset ? data.offset[2] : 0);
+            const data = await uploadLasFile(file, pct => {
+                showLoading(`Uploading ${file.name}… ${pct}%`);
+            });
+            const info = await dispatchLoad(viewer, data, (pct, phase) => {
+                showLoading(convLabel(file.name, pct, phase));
+            });
+            legend.update(viewer.colorMode, info.bounds, info.offsetZ);
+            $('compare-a-name').textContent = file.name;
             $('no-data-msg').style.display = 'none';
-            const label = data.type === 'gaussian' ? 'gaussians' : 'points';
-            $('st-main').textContent = `Loaded ${data.numPoints.toLocaleString()} ${label}`;
-            appendLog(`Loaded ${file.name} (${data.numPoints.toLocaleString()} pts)`, 'success');
+            $('st-main').textContent = `Loaded ${info.count.toLocaleString()} ${info.label}`;
+            appendLog(`Loaded ${file.name} (${info.count.toLocaleString()} ${info.label})`, 'success');
         } catch (err) {
             $('st-main').textContent = `Error: ${err.message}`;
             showToast(`Failed: ${err.message}`, 'error');
@@ -330,7 +299,6 @@ export function initFileManagement(viewer, legend, deps, uiState) {
     $('btn-compare-map').addEventListener('click', () => {
         uiState.compareMode = 'compare';
         $('modal-file-title').textContent = 'Select Map B (Compare)';
-        $('btn-upload').textContent = 'Upload Map B';
         $('modal-file').classList.add('open');
         refreshMapList();
     });

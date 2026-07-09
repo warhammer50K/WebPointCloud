@@ -68,7 +68,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open **http://localhost:5000** in your browser, then drag & drop a point cloud file or click **Load Map > Upload File**.
+Open **http://localhost:6001** in your browser, then drag & drop a point cloud file or click **Load Map > Upload File**.
 
 A sample point cloud is included at `sample/building_scan.las` (100k points) — drag it into the viewer to try it out.
 
@@ -104,7 +104,7 @@ No configuration is required — just load the file and coordinates are preserve
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `WEB_PORT` | `5000` | HTTP server port |
+| `WEB_PORT` | `6001` | HTTP server port |
 | `WPC_DATA_DIR` | `~/webpointcloud` | Data directory (maps + logs) |
 | `WPC_MAPS_DIR` | `$WPC_DATA_DIR/maps` | Point cloud storage directory |
 | `FLASK_DEBUG` | `0` | Enable Flask debug mode |

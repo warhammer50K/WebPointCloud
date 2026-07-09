@@ -2,10 +2,18 @@
    Parse Worker & Data Loading
    ═══════════════════════════════════════════════════════ */
 
-let parseWorker = null;
+// A POOL of parse workers, not one. COPC streaming fetches many node chunks
+// concurrently (REQUEST_CONCURRENCY); a single worker parses them one-at-a-time
+// so the chunks queue up and detail trickles in. Round-robin across a pool sized
+// to the machine lets parsing keep pace with the network. Callbacks are routed
+// by request id, so any worker can answer any request.
+const POOL_SIZE = Math.max(2, Math.min(8,
+    (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4));
+let parseWorkers = [];
+let _dispatchIdx = 0;
 let _workerId = 0;
 const _workerCallbacks = new Map();
-let _workerRestartCount = 0;
+const _restartCounts = new WeakMap();
 const _MAX_WORKER_RESTARTS = 3;
 let _workerNotSupported = false;
 
@@ -23,49 +31,67 @@ function _showWorkerErrorBanner() {
     document.body.appendChild(banner);
 }
 
+function _setupWorker(worker) {
+    worker.onmessage = function(e) {
+        const { id, ...result } = e.data;
+        const cb = _workerCallbacks.get(id);
+        if (cb) {
+            _workerCallbacks.delete(id);
+            if (cb.timeout) clearTimeout(cb.timeout);
+            if (result.error) cb.reject(new Error(result.error));
+            else cb.resolve(result);
+        }
+    };
+    worker.onerror = function(ev) {
+        console.error('[Worker] Error:', ev.message);
+        // Reject only the requests routed to THIS worker; the rest of the pool
+        // keeps running. Then hot-swap a fresh worker in its slot.
+        for (const [id, cb] of _workerCallbacks) {
+            if (cb.worker === worker) {
+                _workerCallbacks.delete(id);
+                if (cb.timeout) clearTimeout(cb.timeout);
+                cb.reject(new Error(ev.message || 'Worker error'));
+            }
+        }
+        _replaceWorker(worker);
+    };
+    return worker;
+}
+
+function _replaceWorker(worker) {
+    const idx = parseWorkers.indexOf(worker);
+    try { worker.terminate(); } catch {}
+    const n = (_restartCounts.get(worker) || 0) + 1;
+    if (n > _MAX_WORKER_RESTARTS) {
+        if (idx >= 0) parseWorkers.splice(idx, 1);
+        console.error('[Worker] Max restart limit reached for a pool worker');
+        if (parseWorkers.length === 0) _showWorkerErrorBanner();
+        return;
+    }
+    console.warn(`[Worker] Restarting pool worker (${n}/${_MAX_WORKER_RESTARTS})`);
+    const fresh = _setupWorker(new Worker('/static/js/parse-worker.js'));
+    _restartCounts.set(fresh, n);
+    if (idx >= 0) parseWorkers[idx] = fresh; else parseWorkers.push(fresh);
+}
+
 function _createWorker() {
     if (typeof Worker === 'undefined') {
         _workerNotSupported = true;
         console.error('[Worker] Web Worker API is not supported in this browser');
         return;
     }
-    if (parseWorker) {
-        try { parseWorker.terminate(); } catch {}
+    for (const w of parseWorkers) { try { w.terminate(); } catch {} }
+    parseWorkers = [];
+    for (let i = 0; i < POOL_SIZE; i++) {
+        parseWorkers.push(_setupWorker(new Worker('/static/js/parse-worker.js')));
     }
-    parseWorker = new Worker('/static/js/parse-worker.js');
+}
 
-    parseWorker.onmessage = function(e) {
-        const { id, ...result } = e.data;
-        const cb = _workerCallbacks.get(id);
-        if (cb) {
-            _workerCallbacks.delete(id);
-            if (cb.timeout) clearTimeout(cb.timeout);
-            _workerRestartCount = 0;
-            if (result.error) {
-                cb.reject ? cb.reject(new Error(result.error)) : cb(result);
-            } else {
-                cb.resolve ? cb.resolve(result) : cb(result);
-            }
-        }
-    };
-
-    parseWorker.onerror = function(e) {
-        console.error('[Worker] Error:', e.message);
-        for (const [, cb] of _workerCallbacks) {
-            if (cb.timeout) clearTimeout(cb.timeout);
-            const err = new Error(e.message || 'Worker error');
-            if (cb.reject) cb.reject(err);
-        }
-        _workerCallbacks.clear();
-        if (_workerRestartCount < _MAX_WORKER_RESTARTS) {
-            _workerRestartCount++;
-            console.warn(`[Worker] Restarting (${_workerRestartCount}/${_MAX_WORKER_RESTARTS})`);
-            _createWorker();
-        } else {
-            console.error('[Worker] Max restart limit reached');
-            _showWorkerErrorBanner();
-        }
-    };
+function _nextWorker() {
+    if (parseWorkers.length === 0) _createWorker();
+    const w = parseWorkers[_dispatchIdx % parseWorkers.length];
+    _dispatchIdx++;
+    return w;
 }
 
 _createWorker();
@@ -77,13 +103,28 @@ export function workerParseBinary(buffer) {
     }
     return new Promise((resolve, reject) => {
         const id = ++_workerId;
+        const worker = _nextWorker();
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-            _createWorker();
         }, 10000);
-        _workerCallbacks.set(id, { resolve, reject, timeout });
-        parseWorker.postMessage({ id, type: 'binary', buffer }, [buffer]);
+        _workerCallbacks.set(id, { resolve, reject, timeout, worker });
+        worker.postMessage({ id, type: 'binary', buffer }, [buffer]);
+    });
+}
+
+/** Parse a COPC multi-blob (many nodes) into one merged buffer in the worker. */
+export function workerParseMultiblob(buffer) {
+    if (_workerNotSupported) return Promise.reject(new Error('Web Worker API not supported'));
+    return new Promise((resolve, reject) => {
+        const id = ++_workerId;
+        const worker = _nextWorker();
+        const timeout = setTimeout(() => {
+            _workerCallbacks.delete(id);
+            reject(new Error('Worker request timed out'));
+        }, 15000);
+        _workerCallbacks.set(id, { resolve, reject, timeout, worker });
+        worker.postMessage({ id, type: 'copc-multiblob', buffer }, [buffer]);
     });
 }
 
@@ -97,11 +138,21 @@ export async function loadLasFromPath(path) {
         const err = await resp.json();
         throw new Error(err.error || 'Failed to load');
     }
+    // COPC maps respond with JSON — ready-to-stream meta, or a 202 "converting"
+    // job to poll (large non-COPC maps convert in the background here too).
+    const ct = resp.headers.get('Content-Type') || '';
+    if (ct.includes('application/json')) {
+        const obj = await resp.json();
+        if (obj.mode === 'converting') {
+            return { mode: 'converting', job: obj.job, path };
+        }
+        return { mode: 'copc', meta: obj, path };
+    }
     return workerParseBinary(await resp.arrayBuffer());
 }
 
 export async function uploadLasFile(file, onProgress) {
-    const { buffer, savedPath } = await new Promise((resolve, reject) => {
+    const { buffer, savedPath, copcMeta, convertJob } = await new Promise((resolve, reject) => {
         const form = new FormData();
         form.append('file', file);
         const xhr = new XMLHttpRequest();
@@ -114,7 +165,20 @@ export async function uploadLasFile(file, onProgress) {
         }
         xhr.onload = () => {
             if (xhr.status >= 200 && xhr.status < 300) {
-                resolve({ buffer: xhr.response, savedPath: xhr.getResponseHeader('X-Saved-Path') });
+                const ct = xhr.getResponseHeader('Content-Type') || '';
+                const savedPath = xhr.getResponseHeader('X-Saved-Path');
+                // COPC: server returns JSON — either ready-to-stream meta, or a
+                // 202 "converting" job to poll.
+                if (ct.includes('application/json')) {
+                    const obj = JSON.parse(new TextDecoder().decode(xhr.response));
+                    if (obj.mode === 'converting') {
+                        resolve({ convertJob: obj.job, savedPath });
+                    } else {
+                        resolve({ copcMeta: obj, savedPath });
+                    }
+                } else {
+                    resolve({ buffer: xhr.response, savedPath });
+                }
             } else {
                 try {
                     const text = new TextDecoder().decode(xhr.response);
@@ -128,9 +192,28 @@ export async function uploadLasFile(file, onProgress) {
         xhr.onerror = () => reject(new Error('Upload network error'));
         xhr.send(form);
     });
+    if (convertJob) {
+        return { mode: 'converting', job: convertJob, savedPath };
+    }
+    if (copcMeta) {
+        return { mode: 'copc', meta: copcMeta, path: savedPath, savedPath };
+    }
     const data = await workerParseBinary(buffer);
     data.savedPath = savedPath;
     return data;
+}
+
+/** Poll a background COPC conversion job until done; returns {meta, path}. */
+export async function pollConvert(job, onProgress) {
+    for (;;) {
+        const resp = await fetch(`/api/copc/convert_status?job=${encodeURIComponent(job)}`);
+        if (!resp.ok) throw new Error('Conversion status check failed');
+        const s = await resp.json();
+        if (onProgress) onProgress(s.percent || 0, s.phase || 'writing');
+        if (s.status === 'done') return { meta: s.meta, path: s.path };
+        if (s.status === 'error') throw new Error(s.error || 'Conversion failed');
+        await new Promise(r => setTimeout(r, 500));
+    }
 }
 
 export function workerFilterPoints(positions, intensities, colors, mvpMatrix, viewportW, viewportH, polyPoints, keep) {
@@ -140,13 +223,13 @@ export function workerFilterPoints(positions, intensities, colors, mvpMatrix, vi
     }
     return new Promise((resolve, reject) => {
         const id = ++_workerId;
+        const worker = _nextWorker();
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-            _createWorker();
         }, 10000);
-        _workerCallbacks.set(id, { resolve, reject, timeout });
-        parseWorker.postMessage({
+        _workerCallbacks.set(id, { resolve, reject, timeout, worker });
+        worker.postMessage({
             id, type: 'filter',
             positions, intensities, colors,
             mvpMatrix, viewportW, viewportH, polyPoints, keep,

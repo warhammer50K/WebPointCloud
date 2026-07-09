@@ -5,6 +5,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG, GAUSSIAN_VERT, GAUSSIAN_FRAG } from './shaders.js';
 import { GaussianSplat } from './gaussian-splat.js';
+import { CopcLodManager } from './copc-lod.js';
 
 import {
     initMeasureInput, addMeasurePoint as _addMeasurePoint,
@@ -56,6 +57,7 @@ export class Viewer {
         this.coordOffset = null;      // Float64Array([ox,oy,oz]) — add back for original coords
         this.pointCloud = null;
         this.gaussianSplat = null;
+        this.copcManager = null;      // COPC octree LOD streaming (when active)
         this.pointSize = 0.05;
         this.colorMode = 'intensity';
         this.gamma = 0.6;
@@ -90,23 +92,99 @@ export class Viewer {
         };
         this.controls.enableDamping = true;
         this.controls.dampingFactor = 0.12;
-        this.controls.enableZoom = true;
+        // Zoom is fully handled by the custom wheel handler below; OrbitControls'
+        // dolly is disabled so the two can never both act on one wheel event
+        // (the capture listener's stopImmediatePropagation blocks it in Chrome,
+        // but that relies on subtle at-target listener ordering — this doesn't).
+        this.controls.enableZoom = false;
+        this.controls.panSpeed = 0.1;        // calmer right/middle-drag pan (default 1.0)
+        // Left-drag = FIRST-PERSON look (camera stays put, the view direction
+        // turns) instead of OrbitControls' orbit-around-target, which swings the
+        // camera in a big arc. With rotate disabled, update()'s sphericalDelta is
+        // 0 so it keeps the camera in place and just lookAt()s the target — moving
+        // the target around the camera is exactly a first-person turn.
+        this.controls.enableRotate = false;
 
-        const _zoomFactor = 0.9;
+        // Look state (left-drag). Mode is chosen per drag at pointerdown:
+        //   • camera INSIDE the data bounds → first-person look (turn in place),
+        //     natural when immersed in a large map;
+        //   • camera OUTSIDE the bounds → orbit around the pivot, natural when
+        //     inspecting a small map/object from outside (first-person look there
+        //     just throws the object off-screen).
+        this._lookDragging = false;
+        this._dragMode = 'look';             // 'look' | 'orbit', fixed per drag
+        this._lookLastX = 0;
+        this._lookLastY = 0;
+        this._lookFwd = new THREE.Vector3();
+        this._lookDir = new THREE.Vector3();
+        this.lookSpeed = 0.004;              // radians per pixel of drag
+
+        // Wheel = adaptive dolly-drive. Each notch covers 6% of the pivot
+        // distance, so zoom is fast from an overview and fine-grained up close.
+        // The pivot (controls.target) shrinks with the camera like a plain dolly,
+        // but bottoms out at a floor — from there camera and pivot advance
+        // TOGETHER, so the wheel keeps a usable speed for flying through the map
+        // instead of freezing at the pivot (pan, which OrbitControls scales by
+        // pivot distance, stays alive too). Zooming out grows the pivot back up
+        // to a cap, beyond which it becomes a straight backward drive.
+        //   • Shift+wheel → fine dolly with a much smaller floor, for getting
+        //     right up to detail.
+        const _zoomDir = new THREE.Vector3();
         this.renderer.domElement.addEventListener('wheel', (e) => {
             e.preventDefault();
             e.stopImmediatePropagation();
-            const offset = new THREE.Vector3().subVectors(this.camera.position, this.controls.target);
-            const dist = offset.length();
-            if (dist < 1e-6) {
-                return;
+            _zoomDir.subVectors(this.controls.target, this.camera.position);
+            let dist = _zoomDir.length();
+            if (dist < 1e-6) return;
+            _zoomDir.divideScalar(dist);                 // forward unit vector
+
+            const b = this.bounds;
+            const sceneSize = b
+                ? Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin) || dist
+                : dist;
+
+            if (e.shiftKey) {
+                // Fine dolly: move only the camera, changing the pivot distance.
+                const step = dist * 0.06 * (e.deltaY < 0 ? 1 : -1);
+                const minPivot = Math.max(sceneSize * 0.002, 0.05);
+                const maxPivot = sceneSize * 1.5;
+                const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
+                this.camera.position.copy(this.controls.target)
+                    .addScaledVector(_zoomDir, -newDist);
+            } else {
+                const step = dist * 0.06 * (e.deltaY < 0 ? 1 : -1);
+                const minPivot = Math.max(sceneSize * 0.05, 0.5);
+                const maxPivot = sceneSize * 1.5;
+                const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
+                this.camera.position.addScaledVector(_zoomDir, step);
+                this.controls.target.copy(this.camera.position)
+                    .addScaledVector(_zoomDir, newDist);
             }
-            const factor = e.deltaY < 0 ? _zoomFactor : 1 / _zoomFactor;
-            const newDist = Math.max(dist * factor, 1e-4);
-            offset.setLength(newDist);
-            this.camera.position.copy(this.controls.target).add(offset);
             this._dirty = true;
         }, { passive: false, capture: true });
+
+        // First-person look: left-drag turns the view in place. Skipped while a
+        // tool owns the left button (measure / polygon select / point info) or
+        // when controls are disabled.
+        const lookEl = this.renderer.domElement;
+        lookEl.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || !this.controls.enabled) return;
+            if (this.measureMode || this.polySelectMode || this.pointInfoEnabled) return;
+            this._lookDragging = true;
+            this._dragMode = this._isCameraInsideBounds() ? 'look' : 'orbit';
+            this._lookLastX = e.clientX;
+            this._lookLastY = e.clientY;
+        });
+        window.addEventListener('pointermove', (e) => {
+            if (!this._lookDragging) return;
+            const dx = e.clientX - this._lookLastX;
+            const dy = e.clientY - this._lookLastY;
+            if (this._dragMode === 'orbit') this._orbitLook(dx, dy);
+            else this._firstPersonLook(dx, dy);
+            this._lookLastX = e.clientX;
+            this._lookLastY = e.clientY;
+        });
+        window.addEventListener('pointerup', () => { this._lookDragging = false; });
 
         // Grid (Z-up)
         this.grid = this._makeGrid(1000, 100, 0, 0);
@@ -231,6 +309,60 @@ export class Viewer {
 
     _requestRender() { this._dirty = true; }
 
+    // Immersed or outside-looking-in? Decides the left-drag mode: first-person
+    // look inside the data, orbit when viewing it from outside. A small margin
+    // keeps the mode from flip-flopping right at the boundary.
+    _isCameraInsideBounds() {
+        const b = this.bounds;
+        if (!b) return true;
+        const m = Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin) * 0.05;
+        const p = this.camera.position;
+        return p.x > b.xMin - m && p.x < b.xMax + m
+            && p.y > b.yMin - m && p.y < b.yMax + m
+            && p.z > b.zMin - m && p.z < b.zMax + m;
+    }
+
+    // Orbit: swing the camera around the pivot (controls.target), keeping the
+    // pivot distance. Signs match OrbitControls' grab-the-object convention:
+    // drag right spins the object right, drag up tips it up.
+    _orbitLook(dx, dy) {
+        const off = this._lookFwd.subVectors(this.camera.position, this.controls.target);
+        const r = off.length();
+        if (r < 1e-6) return;
+        off.divideScalar(r);
+        let yaw = Math.atan2(off.y, off.x);
+        let pitch = Math.asin(THREE.MathUtils.clamp(off.z, -1, 1));
+        yaw -= dx * this.lookSpeed;
+        pitch += dy * this.lookSpeed;
+        const lim = Math.PI / 2 - 0.02;            // avoid gimbal flip at the poles
+        pitch = Math.max(-lim, Math.min(lim, pitch));
+        const cp = Math.cos(pitch);
+        const dir = this._lookDir.set(cp * Math.cos(yaw), cp * Math.sin(yaw), Math.sin(pitch));
+        this.camera.position.copy(this.controls.target).addScaledVector(dir, r);
+        this._dirty = true;
+    }
+
+    // First-person turn: keep the camera where it is and swing the orbit target
+    // around it (yaw about Z-up, pitch about the view's right axis). The pivot
+    // distance is preserved so pan/zoom feel unchanged. OrbitControls.update()
+    // then does camera.lookAt(target) each frame, completing the in-place turn.
+    _firstPersonLook(dx, dy) {
+        const fwd = this._lookFwd.subVectors(this.controls.target, this.camera.position);
+        const dist = fwd.length();
+        if (dist < 1e-6) return;
+        fwd.divideScalar(dist);
+        let yaw = Math.atan2(fwd.y, fwd.x);
+        let pitch = Math.asin(THREE.MathUtils.clamp(fwd.z, -1, 1));
+        yaw -= dx * this.lookSpeed;
+        pitch -= dy * this.lookSpeed;
+        const lim = Math.PI / 2 - 0.02;            // avoid gimbal flip at the poles
+        pitch = Math.max(-lim, Math.min(lim, pitch));
+        const cp = Math.cos(pitch);
+        const dir = this._lookDir.set(cp * Math.cos(yaw), cp * Math.sin(yaw), Math.sin(pitch));
+        this.controls.target.copy(this.camera.position).addScaledVector(dir, dist);
+        this._dirty = true;
+    }
+
     _onResize() {
         if (this._webglFailed) return;
         const w = this.container.clientWidth;
@@ -274,6 +406,7 @@ export class Viewer {
 
         this.controls.update();
         if (this.gaussianSplat) this.gaussianSplat.update();
+        if (this.copcManager) this.copcManager.maybeUpdate();
         if (this._dirty) {
             const usePost = this.edlEnabled || this.ssaoEnabled;
             if (!usePost) {
@@ -364,8 +497,9 @@ export class Viewer {
         if (this._webglFailed) {
             return;
         }
-        // Clear gaussian splat if present (they don't coexist)
+        // Clear gaussian splat / COPC stream if present (modes don't coexist)
         this.clearGaussianSplat();
+        this.clearCopc();
 
         this._fullCloudData = data;   // keep original
         this._dsRatio = 1.0;
@@ -418,11 +552,65 @@ export class Viewer {
         this._dirty = true;
     }
 
+    /* ── Load a COPC map as a streaming octree LOD ── */
+    loadCopc(meta, path) {
+        if (this._webglFailed) return;
+
+        // Modes don't coexist — tear down point cloud / gaussian / prior COPC.
+        this.clearGaussianSplat();
+        this.clearCopc();
+        if (this.pointCloud) {
+            this.scene.remove(this.pointCloud);
+            this.pointCloud.geometry.dispose();
+            this.pointCloud.material.dispose();
+            this.pointCloud = null;
+        }
+        this.cloudData = null;
+        this._fullCloudData = null;
+        this._undoStack.length = 0;
+        this._redoStack.length = 0;
+
+        // Centered bounds (real-world minus the octree center) so this matches
+        // the per-node geometry frame used by clipping / height coloring / fit.
+        const c = meta.coordOffset;
+        this.bounds = {
+            xMin: meta.mins[0] - c[0], xMax: meta.maxs[0] - c[0],
+            yMin: meta.mins[1] - c[1], yMax: meta.maxs[1] - c[1],
+            zMin: meta.mins[2] - c[2], zMax: meta.maxs[2] - c[2],
+            iMin: 0, iMax: 1,
+        };
+        this.coordOffset = new Float64Array(c);
+
+        this.resetClipping();
+        const b = this.bounds;
+        const maxExtent = Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin);
+        this.camera.far = Math.max(10000, maxExtent * 3);
+        this.camera.updateProjectionMatrix();
+
+        document.getElementById('no-data-msg').style.display = 'none';
+        const ptsEl = document.getElementById('viewer-pts');
+        if (ptsEl) ptsEl.textContent = `Points: 0`;
+
+        this.copcManager = new CopcLodManager(this, meta, path);
+        this._fitCamera();
+        this.updateStats();
+        this._dirty = true;
+    }
+
+    clearCopc() {
+        if (this.copcManager) {
+            this.copcManager.dispose();
+            this.copcManager = null;
+            this._dirty = true;
+        }
+    }
+
     /* ── Load / replace gaussian splat ── */
     loadGaussianSplat(data) {
         if (this._webglFailed) return;
 
-        // Clear existing point cloud (they don't coexist)
+        // Clear existing point cloud / COPC stream (they don't coexist)
+        this.clearCopc();
         if (this.pointCloud) {
             this.scene.remove(this.pointCloud);
             this.pointCloud.geometry.dispose();
@@ -473,6 +661,7 @@ export class Viewer {
         this._syncColorUniforms(this.pointCloud);
         this._syncColorUniforms(this.mapCloud);
         this.kfrmClouds.forEach(c => this._syncColorUniforms(c));
+        if (this.copcManager) this._syncColorUniforms({ material: this.copcManager.material });
         this._dirty = true;
     }
 
@@ -481,6 +670,7 @@ export class Viewer {
         if (this.pointCloud) this.pointCloud.material.uniforms.uGamma.value = g;
         if (this.mapCloud)   this.mapCloud.material.uniforms.uGamma.value = g;
         this.kfrmClouds.forEach(c => { c.material.uniforms.uGamma.value = g; });
+        if (this.copcManager) this.copcManager.material.uniforms.uGamma.value = g;
         this._dirty = true;
     }
 
@@ -493,6 +683,7 @@ export class Viewer {
         this.kfrmClouds.forEach(c => { c.material.uniforms.uPointSize.value = s; });
         if (this.kf0Cloud) this.kf0Cloud.material.uniforms.uPointSize.value = s * 3.0;
         if (this.kf1Cloud) this.kf1Cloud.material.uniforms.uPointSize.value = s * 3.0;
+        if (this.copcManager) this.copcManager.material.uniforms.uPointSize.value = s;
         this._dirty = true;
     }
 

@@ -72,4 +72,6 @@ if __name__ == '__main__':
     logger.info(f"  Log dir  : {config.LOG_DIR}")
     logger.info(f"  URL      : http://localhost:{config.WEB_PORT}")
     logger.info("═══════════════════════════════════════")
-    app.run(host='0.0.0.0', port=config.WEB_PORT, debug=_is_debug)
+    # threaded=True so COPC node fetches (many small concurrent requests while
+    # streaming) are served in parallel instead of one-at-a-time.
+    app.run(host='0.0.0.0', port=config.WEB_PORT, debug=_is_debug, threaded=True)
