@@ -15,7 +15,7 @@
    detail) — they accumulate without duplicates.
    ═══════════════════════════════════════════════════════ */
 import * as THREE from 'three';
-import { workerParseMultiblob } from './data.js';
+import { workerParseMultiblob, workerFilterPoints } from './data.js';
 
 const NODES_PER_REQUEST = 24;          // nodes merged into one chunk / request
 // The server decodes nodes under one Python GIL (lazrs releases it but the numpy
@@ -54,6 +54,15 @@ export class CopcLodManager {
         this._pending = 0;                            // nodes queued/in-flight (progress)
         this._chunkSeq = 0;
         this._selectSeq = 0;                          // monotonic, for LRU keep-alive
+
+        // Polygon-delete edits. Each op is a screen-space lasso captured at the
+        // viewpoint it was drawn from: {mvp, w, h, poly, keep}. Because a chunk can
+        // be evicted and re-fetched from the server (original points) as the camera
+        // moves, the edits must be replayed onto every freshly loaded chunk — not
+        // just baked into the chunks visible at delete time. Replaying the same
+        // screen-space projection keeps the cut consistent across LOD levels.
+        this._deleteOps = [];
+        this._redoOps = [];
 
         // One material shared by every chunk so color-mode / point-size / gamma /
         // EDL / SSAO controls update everything uniformly.
@@ -332,21 +341,33 @@ export class CopcLodManager {
             k => this.desired.has(k) && !this.nodeToChunk.has(k));
         if (keepKeys.length === 0) return;
 
-        const geom = this.viewer._buildGeometry(merged);
-        const points = new THREE.Points(geom, this.material);
-        points.frustumCulled = false;
+        // Node identity is fixed before filtering (the filter only thins points).
+        const keySet = new Set(merged.nodeKeys);
+
+        // Replay any polygon-delete edits onto this fresh chunk so deletions
+        // survive eviction/refetch and apply uniformly across LOD levels.
+        const filtered = await this._replayDeleteOps(merged);
+        if (this._disposed) return;
         const chunkId = ++this._chunkSeq;
-        points.userData.chunkId = chunkId;
-        this.lodGroup.add(points);
+
+        let points = null;
+        if (filtered.numPoints > 0) {
+            const geom = this.viewer._buildGeometry(filtered);
+            points = new THREE.Points(geom, this.material);
+            points.frustumCulled = false;
+            points.userData.chunkId = chunkId;
+            this.lodGroup.add(points);
+        }
 
         // Record every node carried by this chunk (even ones not in keepKeys —
         // they're rendered anyway, and tracking them avoids a duplicate refetch).
-        const keySet = new Set(merged.nodeKeys);
-        this.chunks.set(chunkId, { points, keys: keySet, pointCount: merged.numPoints,
+        // A chunk fully erased by edits is still registered (points: null) so its
+        // nodes count as loaded and aren't re-fetched every cut.
+        this.chunks.set(chunkId, { points, keys: keySet, pointCount: filtered.numPoints,
                                    lastWanted: this._selectSeq,
                                    lastWantedTime: performance.now() });
         for (const k of merged.nodeKeys) this.nodeToChunk.set(k, chunkId);
-        this.loadedPointCount += merged.numPoints;
+        this.loadedPointCount += filtered.numPoints;
 
         this._syncMaterial();
         this._updateHud();
@@ -356,14 +377,101 @@ export class CopcLodManager {
     _unloadChunk(chunkId) {
         const chunk = this.chunks.get(chunkId);
         if (!chunk) return;
-        this.lodGroup.remove(chunk.points);
-        chunk.points.geometry.dispose();
+        if (chunk.points) {
+            this.lodGroup.remove(chunk.points);
+            chunk.points.geometry.dispose();
+        }
         for (const k of chunk.keys) {
             if (this.nodeToChunk.get(k) === chunkId) this.nodeToChunk.delete(k);
         }
         this.loadedPointCount -= chunk.pointCount;
         this.chunks.delete(chunkId);
         this._updateHud();
+        this.viewer._dirty = true;
+    }
+
+    /* ── Polygon-delete edits ──────────────────────────────────────────
+       Screen-space lasso deletions replayed onto the streamed octree.
+       Source of truth is `_deleteOps`; chunks are derived state. */
+
+    // Run every stored edit through the filter worker, threading the thinned
+    // arrays from one op into the next. Returns the surviving {positions,
+    // intensities, colors, numPoints}. No-op (returns input) when no edits.
+    async _replayDeleteOps(data) {
+        let cur = data;
+        for (const op of this._deleteOps) {
+            const res = await workerFilterPoints(
+                cur.positions, cur.intensities, cur.colors,
+                op.mvp, op.w, op.h, op.poly, op.keep);
+            if (this._disposed) return res;
+            cur = { positions: res.positions, intensities: res.intensities,
+                    colors: res.colors, numPoints: res.numPoints };
+            if (cur.numPoints === 0) break;
+        }
+        return cur;
+    }
+
+    // Record a new lasso edit and apply it immediately to every loaded chunk,
+    // so the deletion shows at once instead of only after a re-fetch.
+    async applyDeleteOp(op) {
+        this._deleteOps.push(op);
+        this._redoOps.length = 0;
+        for (const [chunkId, chunk] of [...this.chunks]) {
+            if (this._disposed) return;
+            // Re-check: an await below can let the render loop evict this chunk.
+            if (!this.chunks.has(chunkId) || !chunk.points) continue;
+            const geom = chunk.points.geometry;
+            const pos = geom.getAttribute('position');
+            const intAttr = geom.getAttribute('intensity');
+            const rgbAttr = geom.getAttribute('rgb');
+            const cnt = geom.drawRange.count === Infinity ? pos.count : geom.drawRange.count;
+            const posArr = new Float32Array(pos.array.buffer.slice(0, cnt * 3 * 4));
+            const intArr = new Float32Array(intAttr.array.buffer.slice(0, cnt * 4));
+            const rgbArr = rgbAttr ? new Float32Array(rgbAttr.array.buffer.slice(0, cnt * 3 * 4)) : null;
+            const res = await workerFilterPoints(
+                posArr, intArr, rgbArr, op.mvp, op.w, op.h, op.poly, op.keep);
+            if (this._disposed) return;
+            // Evicted while the filter ran: _unloadChunk already settled the
+            // point count; touching the stale entry would corrupt it.
+            if (!this.chunks.has(chunkId)) continue;
+            this.loadedPointCount += res.numPoints - chunk.pointCount;
+            chunk.pointCount = res.numPoints;
+            if (res.numPoints === 0) {
+                this.lodGroup.remove(chunk.points);
+                chunk.points.geometry.dispose();
+                chunk.points = null;
+            } else {
+                pos.array.set(res.positions); pos.needsUpdate = true;
+                intAttr.array.set(res.intensities); intAttr.needsUpdate = true;
+                if (rgbAttr && res.colors) { rgbAttr.array.set(res.colors); rgbAttr.needsUpdate = true; }
+                geom.setDrawRange(0, res.numPoints);
+            }
+        }
+        this._updateHud();
+        this.viewer._dirty = true;
+    }
+
+    // Undo/redo move edits between the two stacks, then rebuild from the
+    // server: every resident chunk is dropped and re-fetched, with the
+    // remaining edits replayed on load. Simpler and exact vs. trying to
+    // reverse a destructive per-chunk filter in place.
+    undoDeleteOp() {
+        if (this._deleteOps.length === 0) return;
+        this._redoOps.push(this._deleteOps.pop());
+        this._reloadAll();
+    }
+
+    redoDeleteOp() {
+        if (this._redoOps.length === 0) return;
+        this._deleteOps.push(this._redoOps.pop());
+        this._reloadAll();
+    }
+
+    _reloadAll() {
+        for (const chunkId of [...this.chunks.keys()]) this._unloadChunk(chunkId);
+        this.nodeToChunk.clear();
+        this._forceUpdate = true;
+        this.maybeUpdate();
         this.viewer._dirty = true;
     }
 
@@ -383,6 +491,7 @@ export class CopcLodManager {
     dispose() {
         this._disposed = true;
         for (const chunk of this.chunks.values()) {
+            if (!chunk.points) continue;
             this.lodGroup.remove(chunk.points);
             chunk.points.geometry.dispose();
         }

@@ -395,10 +395,6 @@ export function isPointInPoly2D(px, py, poly) {
 /** Returns { total, keep } or null — async (Worker-based) */
 export async function applyPolyFilter(viewer, keep) {
     if (!viewer._polyClosedOnce || viewer._polyPoints.length < 3) return null;
-    // P2-6: save snapshot before filtering
-    viewer._undoStack.push(snapshotGeometry(viewer));
-    if (viewer._undoStack.length > viewer._maxUndoLevels) viewer._undoStack.shift();
-    viewer._redoStack.length = 0;
 
     const rect = viewer.container.getBoundingClientRect();
     const poly = viewer._polyPoints.map(p => [p.x, p.y]);
@@ -407,6 +403,26 @@ export async function applyPolyFilter(viewer, keep) {
     const mvpMatrix = new Float64Array(16);
     const pmMat = new THREE.Matrix4().multiplyMatrices(viewer.camera.projectionMatrix, viewer.camera.matrixWorldInverse);
     for (let i = 0; i < 16; i++) mvpMatrix[i] = pmMat.elements[i];
+
+    // COPC streaming: points live in the LOD manager's chunks (not pointCloud/
+    // mapCloud). Hand the lasso to it as a replayable edit so the deletion
+    // survives chunk eviction/refetch and applies across LOD levels.
+    if (viewer.copcManager) {
+        await viewer.copcManager.applyDeleteOp(
+            { mvp: mvpMatrix, w: rect.width, h: rect.height, poly, keep });
+        clearPolySelect(viewer);
+        updateUndoRedoButtons(viewer);
+        const total = viewer.copcManager.loadedPointCount;
+        const pe = document.getElementById('viewer-pts');
+        if (pe) pe.textContent = `Points: ${total.toLocaleString()}`;
+        viewer._dirty = true;
+        return { total, keep };
+    }
+
+    // P2-6: save snapshot before filtering
+    viewer._undoStack.push(snapshotGeometry(viewer));
+    if (viewer._undoStack.length > viewer._maxUndoLevels) viewer._undoStack.shift();
+    viewer._redoStack.length = 0;
 
     const clouds = [
         { obj: viewer.pointCloud, prop: 'pointCloud' },
@@ -512,6 +528,7 @@ export function restoreSnapshot(viewer, snap) {
 }
 
 export function undoFilter(viewer) {
+    if (viewer.copcManager) { viewer.copcManager.undoDeleteOp(); updateUndoRedoButtons(viewer); return; }
     if (viewer._undoStack.length === 0) return;
     viewer._redoStack.push(snapshotGeometry(viewer));
     const snap = viewer._undoStack.pop();
@@ -520,6 +537,7 @@ export function undoFilter(viewer) {
 }
 
 export function redoFilter(viewer) {
+    if (viewer.copcManager) { viewer.copcManager.redoDeleteOp(); updateUndoRedoButtons(viewer); return; }
     if (viewer._redoStack.length === 0) return;
     viewer._undoStack.push(snapshotGeometry(viewer));
     const snap = viewer._redoStack.pop();
@@ -530,6 +548,11 @@ export function redoFilter(viewer) {
 export function updateUndoRedoButtons(viewer) {
     const undoBtn = document.getElementById('btn-undo');
     const redoBtn = document.getElementById('btn-redo');
+    if (viewer.copcManager) {
+        if (undoBtn) undoBtn.disabled = viewer.copcManager._deleteOps.length === 0;
+        if (redoBtn) redoBtn.disabled = viewer.copcManager._redoOps.length === 0;
+        return;
+    }
     if (undoBtn) undoBtn.disabled = viewer._undoStack.length === 0;
     if (redoBtn) redoBtn.disabled = viewer._redoStack.length === 0;
 }
