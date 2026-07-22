@@ -403,10 +403,16 @@ export async function applyPolyFilter(viewer, keep) {
     const rect = viewer.container.getBoundingClientRect();
     const poly = viewer._polyPoints.map(p => [p.x, p.y]);
 
-    // compute MVP matrix (projectionMatrix * modelViewMatrix)
-    const mvpMatrix = new Float64Array(16);
-    const pmMat = new THREE.Matrix4().multiplyMatrices(viewer.camera.projectionMatrix, viewer.camera.matrixWorldInverse);
-    for (let i = 0; i < 16; i++) mvpMatrix[i] = pmMat.elements[i];
+    // proj * view — per-cloud model matrices are multiplied in below, so a
+    // Cloud Transform offset/rotation deletes what the user actually lassoed.
+    const pvMat = new THREE.Matrix4().multiplyMatrices(viewer.camera.projectionMatrix, viewer.camera.matrixWorldInverse);
+    const mvpFor = obj => {
+        obj.updateMatrixWorld();
+        const m = new THREE.Matrix4().multiplyMatrices(pvMat, obj.matrixWorld);
+        return Float64Array.from(m.elements);
+    };
+    // COPC chunks live in lodGroup (identity transform, positions pre-centered).
+    const mvpMatrix = Float64Array.from(pvMat.elements);
 
     // COPC streaming: points live in the LOD manager's chunks (not pointCloud/
     // mapCloud). Hand the lasso to it as a replayable edit so the deletion
@@ -450,7 +456,7 @@ export async function applyPolyFilter(viewer, keep) {
 
         const result = await workerFilterPoints(
             posArr, intArr, rgbArr,
-            mvpMatrix, rect.width, rect.height, poly, keep, clsArr
+            mvpFor(obj), rect.width, rect.height, poly, keep, clsArr
         );
 
         const n = result.numPoints;

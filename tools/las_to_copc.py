@@ -178,11 +178,14 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None,
     center = (mins + maxs) / 2.0
     halfsize = float((maxs - mins).max()) / 2.0
     halfsize *= 1.0 + 1e-6  # pad so the max corner is strictly inside the cube
-    cube_min = center - halfsize
+
+    # mm resolution unless the cloud is so large (>~4300km across) that centered
+    # int32 coords would overflow — then coarsen just enough to fit.
+    scale_v = max(SCALE, halfsize / (2**31 - 2) * 1.001)
 
     # Build a PDRF 6/7 packed record array once (laspy handles the byte layout).
     hdr = laspy.LasHeader(version="1.4", point_format=pfid)
-    hdr.scales = [SCALE, SCALE, SCALE]
+    hdr.scales = [scale_v, scale_v, scale_v]
     hdr.offsets = [float(center[0]), float(center[1]), float(center[2])]
     packed_las = laspy.LasData(hdr)
     packed_las.x = x
@@ -201,13 +204,18 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None,
     del inten
 
     # float32 coords for subsample — halves memory bandwidth on fancy-indexing /
-    # sort. Precision: centered coords are within ±halfsize, so float32 (~7 sig
-    # digits) keeps sub-mm accuracy, finer than the deepest grid step.
+    # sort. The subtraction MUST happen in float64 BEFORE the float32 cast:
+    # centered coords are within ±halfsize so float32 (~7 sig digits) keeps
+    # sub-mm accuracy, but raw UTM absolutes (~10⁶-10⁷ m) cast straight to
+    # float32 lose up to ~0.5 m and misassign points near node boundaries.
+    x -= center[0]; y -= center[1]; z -= center[2]   # in-place, no (N,3) f64 temp
     P = np.empty((n, 3), dtype=np.float32)
-    P[:, 0] = x; P[:, 1] = y; P[:, 2] = z   # cast straight in, no float64 (N,3) temp
+    P[:, 0] = x; P[:, 1] = y; P[:, 2] = z
     del x, y, z
+    # cube_min in the same centered frame P lives in.
+    cube_min = np.full(3, -halfsize, dtype=np.float64)
 
-    scale = copc.Vector3(SCALE, SCALE, SCALE)
+    scale = copc.Vector3(scale_v, scale_v, scale_v)
     offset = copc.Vector3(float(center[0]), float(center[1]), float(center[2]))
     cfg = copc.CopcConfigWriter(pfid, scale, offset)
     cfg.las_header.min = copc.Vector3(float(mins[0]), float(mins[1]), float(mins[2]))
@@ -298,7 +306,7 @@ def las_to_copc(src_path, dst_path, grid=128, max_depth=16, progress=None,
         offset_t = (float(center[0]), float(center[1]), float(center[2]))
         try:
             with mp.Pool(nproc, initializer=_compress_init,
-                         initargs=(pfid, (SCALE, SCALE, SCALE), offset_t)) as pool:
+                         initargs=(pfid, (scale_v, scale_v, scale_v), offset_t)) as pool:
                 for (d, kx, ky, kz), comp, cnt in pool.imap_unordered(
                         _compress_node, items, chunksize=32):
                     writer.AddNodeCompressed(

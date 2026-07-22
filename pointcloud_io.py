@@ -195,9 +195,22 @@ def _read_las(path):
     }
 
 
+def _as_uint16_channel(a):
+    """LAS intensity/RGB dims are uint16. The viewer pipeline (read_pointcloud)
+    hands us 0-1 normalized floats — scale those to the full 16-bit range;
+    integer input is assumed to already be raw LAS values."""
+    a = np.asarray(a)
+    if a.dtype.kind == 'f':
+        return np.clip(np.round(a * 65535.0), 0, 65535).astype(np.uint16)
+    return a.astype(np.uint16)
+
+
 def write_las(path, x, y, z, intensity=None, r=None, g=None, b=None,
-              point_format=2, source_las=None):
-    """Write arrays to a LAS file."""
+              point_format=2, source_las=None, classification=None):
+    """Write arrays to a LAS file.
+
+    intensity/r/g/b accept either 0-1 normalized floats (what read_pointcloud
+    returns) or raw uint16 LAS values."""
     import laspy
     if source_las is not None:
         header = laspy.LasHeader(point_format=source_las.header.point_format, version="1.2")
@@ -205,7 +218,15 @@ def write_las(path, x, y, z, intensity=None, r=None, g=None, b=None,
         header = laspy.LasHeader(point_format=point_format, version="1.2")
 
     n = len(x)
-    header.scales = np.array([0.001, 0.001, 0.001])
+    # mm resolution by default, coarsened just enough that the largest axis
+    # extent still fits int32 (a fixed 1mm scale overflows past ~2100km).
+    scale = 0.001
+    if n > 0:
+        span = max(x.max() - x.min(), y.max() - y.min(), z.max() - z.min())
+        min_scale = span / (2**31 - 2)
+        if min_scale > scale:
+            scale = min_scale * 1.001
+    header.scales = np.array([scale, scale, scale])
     header.offsets = np.array([
         np.floor(x.min()) if n > 0 else 0,
         np.floor(y.min()) if n > 0 else 0,
@@ -218,11 +239,16 @@ def write_las(path, x, y, z, intensity=None, r=None, g=None, b=None,
     las.z = z
 
     if intensity is not None:
-        las.intensity = np.array(intensity)
+        las.intensity = _as_uint16_channel(intensity)
     if r is not None and g is not None and b is not None:
-        las.red = np.array(r)
-        las.green = np.array(g)
-        las.blue = np.array(b)
+        las.red = _as_uint16_channel(r)
+        las.green = _as_uint16_channel(g)
+        las.blue = _as_uint16_channel(b)
+    if classification is not None:
+        # Legacy PDRFs (0-5) store classification in 5 bits.
+        max_cls = 255 if header.point_format.id >= 6 else 31
+        cls = np.round(np.asarray(classification, dtype=np.float64))
+        las.classification = np.clip(cls, 0, max_cls).astype(np.uint8)
 
     las.write(path)
     return n

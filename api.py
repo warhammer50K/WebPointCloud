@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import threading
 import uuid
+import urllib.parse
 from datetime import datetime
 from pointcloud_io import read_pointcloud, arrays_to_binary, gaussians_to_binary, write_las, SUPPORTED_EXTENSIONS
 import copc_io
@@ -228,7 +229,7 @@ def load_pointcloud():
                 resp = jsonify({'mode': 'converting', 'job': job_id})
                 resp.status_code = 202
                 if saved_path:
-                    resp.headers['X-Saved-Path'] = saved_path
+                    resp.headers['X-Saved-Path'] = urllib.parse.quote(saved_path)
                 return resp
 
         # COPC: stream via octree LOD (JSON meta) instead of a whole-cloud binary.
@@ -236,7 +237,7 @@ def load_pointcloud():
         if copc_io.is_copc(path):
             resp = jsonify(copc_io.copc_meta(path))
             if saved_path:
-                resp.headers['X-Saved-Path'] = saved_path
+                resp.headers['X-Saved-Path'] = urllib.parse.quote(saved_path)
             return resp
 
         # Small upload fully read into memory below — drop the temp copy after.
@@ -255,7 +256,7 @@ def load_pointcloud():
                                       classification=d.get('classification'))
         resp = send_file(io.BytesIO(binary), mimetype='application/octet-stream')
         if saved_path:
-            resp.headers['X-Saved-Path'] = saved_path
+            resp.headers['X-Saved-Path'] = urllib.parse.quote(saved_path)
         return resp
 
     except Exception as e:
@@ -276,6 +277,7 @@ def load_las():
 # ══════════════════════════════════════════════════════
 # ── Background COPC conversion jobs ──
 _convert_jobs = {}                       # job_id -> {status, percent, copc_path, error}
+_convert_src_jobs = {}                   # src realpath -> job_id of a RUNNING conversion
 _convert_jobs_lock = threading.Lock()
 
 
@@ -294,9 +296,16 @@ def _start_convert_job(src_path, logger=None, cleanup_src=False):
     Progress is reported during the copclib build; the client polls
     /api/copc/convert_status. When *cleanup_src* is set (drag&drop upload), the
     temp original is removed once the COPC exists so no copy lingers."""
+    src_key = os.path.realpath(src_path)
     job_id = uuid.uuid4().hex[:12]
     with _convert_jobs_lock:
+        # Same source already converting (double-click, page reload): join that
+        # job instead of racing a second writer onto the same output file.
+        existing = _convert_src_jobs.get(src_key)
+        if existing and _convert_jobs.get(existing, {}).get('status') == 'running':
+            return existing
         _convert_jobs[job_id] = {'status': 'running', 'percent': 0, 'phase': 'reading'}
+        _convert_src_jobs[src_key] = job_id
 
     def run():
         try:
@@ -322,6 +331,10 @@ def _start_convert_job(src_path, logger=None, cleanup_src=False):
                 logger.warning(f"COPC convert job {job_id} failed: {e}")
             with _convert_jobs_lock:
                 _convert_jobs[job_id].update(status='error', error=str(e))
+        finally:
+            with _convert_jobs_lock:
+                if _convert_src_jobs.get(src_key) == job_id:
+                    del _convert_src_jobs[src_key]
 
     threading.Thread(target=run, daemon=True).start()
     return job_id
@@ -473,8 +486,9 @@ def save_compare_b():
             a_intensity = d_a['intensity']
             a_r, a_g, a_b = d_a['r'], d_a['g'], d_a['b']
         else:
+            d_a = None
             ax = ay = az = np.array([], dtype=np.float64)
-            a_intensity = a_r = a_g = a_b = np.array([], dtype=np.uint16)
+            a_intensity = a_r = a_g = a_b = np.array([], dtype=np.float32)
 
         # ── Merge A + B ──
         mx = np.concatenate([ax, bx])
@@ -484,6 +498,20 @@ def save_compare_b():
         m_r = np.concatenate([a_r, b_r])
         m_g = np.concatenate([a_g, b_g])
         m_b = np.concatenate([a_b, b_b])
+        # Classification survives the merge only if every side has it (missing
+        # side of an A+B merge gets 0 = "never classified").
+        b_cls = d_b.get('classification')
+        a_cls = (d_a.get('classification') if d_a is not None
+                 else np.array([], dtype=np.float32))
+        if b_cls is not None and a_cls is not None:
+            m_cls = np.concatenate([a_cls, b_cls])
+        elif b_cls is not None or (a_cls is not None and len(a_cls)):
+            m_cls = np.concatenate([
+                a_cls if a_cls is not None else np.zeros(len(ax), np.float32),
+                b_cls if b_cls is not None else np.zeros(len(bx), np.float32),
+            ])
+        else:
+            m_cls = None
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         save_dir = os.path.join(maps_dir, f'{timestamp}_merged')
@@ -492,7 +520,7 @@ def save_compare_b():
 
         n_total = len(mx)
         write_las(save_path, mx, my, mz, intensity=m_intensity,
-                  r=m_r, g=m_g, b=m_b)
+                  r=m_r, g=m_g, b=m_b, classification=m_cls)
 
         if log:
             log.info(f"[Merge] A={len(ax)} + B={len(bx)} = {n_total} pts -> {save_path}")
@@ -528,6 +556,11 @@ def save_screenshot():
             return jsonify({'error': 'Missing path or image'}), 400
 
         save_dir = map_path if os.path.isdir(map_path) else os.path.dirname(map_path)
+        # Same boundary every other endpoint enforces — without it this writes
+        # attacker-chosen directories anywhere the server can.
+        maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
+        if not os.path.realpath(save_dir).startswith(maps_dir + os.sep):
+            return jsonify({'error': 'Access denied'}), 403
         if not os.path.isdir(save_dir):
             os.makedirs(save_dir, exist_ok=True)
 
@@ -693,6 +726,8 @@ def analysis_sor():
             r=pc['r'][inlier_mask] if pc['r'] is not None else None,
             g=pc['g'][inlier_mask] if pc['g'] is not None else None,
             b=pc['b'][inlier_mask] if pc['b'] is not None else None,
+            classification=(pc.get('classification')[inlier_mask]
+                            if pc.get('classification') is not None else None),
         )
 
         log = current_app.config.get('LOGGER')
@@ -758,6 +793,8 @@ def analysis_cross_section():
             r=pc['r'][mask] if pc['r'] is not None else None,
             g=pc['g'][mask] if pc['g'] is not None else None,
             b=pc['b'][mask] if pc['b'] is not None else None,
+            classification=(pc.get('classification')[mask]
+                            if pc.get('classification') is not None else None),
         )
 
         return jsonify({
@@ -943,7 +980,8 @@ def save_transformed():
 
         n = len(x)
         write_las(save_path, x, y, z, intensity=d['intensity'],
-                  r=d['r'], g=d['g'], b=d['b'])
+                  r=d['r'], g=d['g'], b=d['b'],
+                  classification=d.get('classification'))
 
         log = current_app.config.get('LOGGER')
         if log:

@@ -70,7 +70,7 @@ def open_copc(path):
         reader = CopcReader.open(open(realpath, 'rb'))
         dims = set(reader.header.point_format.dimension_names)
         has_rgb = {'red', 'green', 'blue'} <= dims
-        intensity_max = _estimate_intensity_max(reader)
+        intensity_max, rgb_scale = _estimate_norm_scales(reader, has_rgb)
 
         entry = {
             'reader': reader,           # used only for header/octree build (single-threaded)
@@ -78,6 +78,7 @@ def open_copc(path):
             'mtime': mtime,
             'has_rgb': has_rgb,
             'intensity_max': intensity_max,
+            'rgb_scale': rgb_scale,
             'lock': threading.Lock(),   # guards one-time octree build + pool growth
             'reader_pool': queue.Queue(),  # idle CopcReader handles, borrowed per fetch
             'pool_count': 0,            # handles created so far (≤ pool_max)
@@ -129,19 +130,26 @@ def _borrow_reader(entry):
         pool.put(reader)
 
 
-def _estimate_intensity_max(reader):
-    """Global intensity max for consistent per-node normalization.
+def _estimate_norm_scales(reader, has_rgb):
+    """(intensity_max, rgb_scale) for consistent per-node normalization.
 
-    A single value must normalize every node (matching _read_las, which uses the
-    file-wide max) or node colors won't agree. Estimate from coarse levels — they
-    sample the whole cloud and are cheap to read."""
+    A single value must normalize every node (matching _read_las, which uses
+    file-wide values) or node colors won't agree — judging 8- vs 16-bit RGB per
+    node makes dark nodes of a 16-bit file render up to 257× brighter than their
+    neighbors. Estimate from coarse levels — they sample the whole cloud and are
+    cheap to read."""
+    intensity_max, rgb_scale = 65535.0, 65535.0
     try:
         pts = reader.query(level=range(0, 4))
         arr = np.asarray(pts.intensity, dtype=np.float64)
         m = float(arr.max()) if len(arr) else 0.0
-        return m if m > 0 else 1.0
+        intensity_max = m if m > 0 else 1.0
+        if has_rgb:
+            rmax = float(np.asarray(pts.red).max()) if len(arr) else 0.0
+            rgb_scale = 65535.0 if rmax > 255 else 255.0
     except Exception:
-        return 65535.0
+        pass
+    return intensity_max, rgb_scale
 
 
 def warm_octree_async(path):
@@ -322,9 +330,9 @@ def _pack_node_points(pts, entry, center):
         r = np.asarray(pts.red, dtype=np.float32)
         g = np.asarray(pts.green, dtype=np.float32)
         b = np.asarray(pts.blue, dtype=np.float32)
-        rmax = max(float(r.max()) if n else 0.0, 1.0)
-        scale = 65535.0 if rmax > 255 else 255.0
+        scale = entry['rgb_scale']   # file-global 8/16-bit judgment, not per-node
         r /= scale; g /= scale; b /= scale
+        np.clip(r, 0.0, 1.0, out=r); np.clip(g, 0.0, 1.0, out=g); np.clip(b, 0.0, 1.0, out=b)
     else:
         r = np.full(n, 0.5, dtype=np.float32)
         g = np.full(n, 0.5, dtype=np.float32)
@@ -409,29 +417,42 @@ def ensure_copc(src_path, dst_path=None, progress=None):
             progress(1, 1)
         return dst_path
 
-    # 1) PDAL CLI with writers.copc (PDAL >= 2.4)
-    if _pdal_has_copc_writer():
-        import subprocess
-        subprocess.run(
-            ['pdal', 'translate', src_path, dst_path, '--writers.copc'],
-            check=True, capture_output=True,
-        )
-        return dst_path
-
-    # 2) copclib octree builder (self-contained, bulk Unpack)
+    # Build into a temp file, then atomically rename. Writing dst directly means
+    # a crash mid-convert leaves a partial file that can pass the mtime reuse
+    # check above, and two concurrent conversions would corrupt each other.
+    # (.copc.laz suffix kept so PDAL's extension-based writer inference still
+    # picks writers.copc for the temp output.)
+    tmp_path = f'{dst_path}.{os.getpid()}.tmp.copc.laz'
     try:
-        from tools.las_to_copc import las_to_copc
-    except Exception:
-        try:
-            import sys
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tools'))
-            from las_to_copc import las_to_copc
-        except Exception as e:
-            raise RuntimeError(
-                'COPC conversion unavailable: install PDAL>=2.4 (writers.copc) '
-                'or copclib'
-            ) from e
-    las_to_copc(src_path, dst_path, progress=progress)
+        # 1) PDAL CLI with writers.copc (PDAL >= 2.4)
+        if _pdal_has_copc_writer():
+            import subprocess
+            subprocess.run(
+                ['pdal', 'translate', src_path, tmp_path, '--writers.copc'],
+                check=True, capture_output=True,
+            )
+        else:
+            # 2) copclib octree builder (self-contained, bulk Unpack)
+            try:
+                from tools.las_to_copc import las_to_copc
+            except Exception:
+                try:
+                    import sys
+                    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tools'))
+                    from las_to_copc import las_to_copc
+                except Exception as e:
+                    raise RuntimeError(
+                        'COPC conversion unavailable: install PDAL>=2.4 '
+                        '(writers.copc) or copclib'
+                    ) from e
+            las_to_copc(src_path, tmp_path, progress=progress)
+        os.replace(tmp_path, dst_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
     return dst_path
 
 

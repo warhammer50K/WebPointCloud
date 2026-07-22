@@ -166,7 +166,10 @@ export async function uploadLasFile(file, onProgress) {
         xhr.onload = () => {
             if (xhr.status >= 200 && xhr.status < 300) {
                 const ct = xhr.getResponseHeader('Content-Type') || '';
-                const savedPath = xhr.getResponseHeader('X-Saved-Path');
+                // Server percent-encodes the header (HTTP headers are latin-1;
+                // raw non-ASCII filenames would kill the response).
+                const rawSaved = xhr.getResponseHeader('X-Saved-Path');
+                const savedPath = rawSaved ? decodeURIComponent(rawSaved) : rawSaved;
                 // COPC: server returns JSON — either ready-to-stream meta, or a
                 // 202 "converting" job to poll.
                 if (ct.includes('application/json')) {

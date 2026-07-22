@@ -737,6 +737,12 @@ export class Viewer {
         }
         this._dsRatio = ratio;
 
+        // Snapshots hold the pre-downsample array sizes; restoring one into the
+        // rebuilt (smaller) geometry would throw RangeError mid-undo.
+        this._undoStack.length = 0;
+        this._redoStack.length = 0;
+        _updateUndoRedoButtons(this);
+
         const display = this._downsampleData(this._fullCloudData, ratio);
         this.cloudData = display;
 
