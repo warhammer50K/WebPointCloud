@@ -10,8 +10,8 @@ import struct
 import io
 import glob
 import shutil
-import tempfile
 import threading
+import time
 import uuid
 import urllib.parse
 from datetime import datetime
@@ -111,6 +111,12 @@ def list_maps():
                             with open(lf, 'rb') as fh:
                                 fh.seek(107)
                                 info['num_points'] = struct.unpack('<I', fh.read(4))[0]
+                            if info['num_points'] == 0:
+                                # LAS 1.4 (PDRF>=6) leaves the legacy count 0 —
+                                # fall back to the real header via laspy.
+                                import laspy
+                                with laspy.open(lf) as fh:
+                                    info['num_points'] = int(fh.header.point_count)
                         else:
                             # LAZ/COPC (often LAS 1.4): read header via laspy.
                             import laspy
@@ -146,9 +152,12 @@ def delete_map(name):
     with lock:
         try:
             shutil.rmtree(safe)
-            return jsonify({'status': 'ok'})
         except Exception as e:
             return _error_response(e, 'delete_map')
+    # Map is gone — drop its lock so _map_locks doesn't grow unboundedly.
+    with _map_locks_guard:
+        _map_locks.pop(name, None)
+    return jsonify({'status': 'ok'})
 
 
 @api_bp.route('/api/maps/<name>/rename', methods=['POST'])
@@ -247,10 +256,13 @@ def load_pointcloud():
         if ext not in SUPPORTED_EXTENSIONS:
             return jsonify({'error': f'Unsupported format: {ext}'}), 400
 
+        # is_copc opens the file via CopcReader (~0.3s) — call it once and reuse.
+        file_is_copc = ext in ('.las', '.laz') and copc_io.is_copc(path)
+
         # Large non-COPC LAS/LAZ: convert to COPC in the background and return a
         # job id immediately so the client can show conversion progress. Small
         # files fall through to the legacy whole-cloud path.
-        if ext in ('.las', '.laz') and not copc_io.is_copc(path):
+        if ext in ('.las', '.laz') and not file_is_copc:
             import config
             threshold = getattr(config, 'COPC_STREAM_MIN_POINTS', 2_000_000)
             if _point_count(path) >= threshold:
@@ -264,7 +276,7 @@ def load_pointcloud():
 
         # COPC: stream via octree LOD (JSON meta) instead of a whole-cloud binary.
         # The frontend distinguishes by Content-Type and switches into copc mode.
-        if copc_io.is_copc(path):
+        if file_is_copc:
             if preview_pts > 0:
                 binary = copc_io.copc_preview_binary(path, max_points=preview_pts)
                 resp = send_file(io.BytesIO(binary),
@@ -314,6 +326,17 @@ def load_las():
 _convert_jobs = {}                       # job_id -> {status, percent, copc_path, error}
 _convert_src_jobs = {}                   # src realpath -> job_id of a RUNNING conversion
 _convert_jobs_lock = threading.Lock()
+_CONVERT_JOB_TTL = 3600                  # finished jobs pruned an hour after completion
+
+
+def _prune_convert_jobs_locked():
+    """Drop finished jobs whose result nobody can still care about (TTL passed).
+    Caller must hold _convert_jobs_lock."""
+    now = time.monotonic()
+    for jid in [jid for jid, j in _convert_jobs.items()
+                if j.get('status') in ('done', 'error')
+                and now - j.get('finished_at', now) > _CONVERT_JOB_TTL]:
+        del _convert_jobs[jid]
 
 
 def _point_count(path):
@@ -334,6 +357,7 @@ def _start_convert_job(src_path, logger=None, cleanup_src=False):
     src_key = os.path.realpath(src_path)
     job_id = uuid.uuid4().hex[:12]
     with _convert_jobs_lock:
+        _prune_convert_jobs_locked()
         # Same source already converting (double-click, page reload): join that
         # job instead of racing a second writer onto the same output file.
         existing = _convert_src_jobs.get(src_key)
@@ -360,12 +384,14 @@ def _start_convert_job(src_path, logger=None, cleanup_src=False):
                     pass
             with _convert_jobs_lock:
                 _convert_jobs[job_id].update(
-                    status='done', percent=100, copc_path=copc_path)
+                    status='done', percent=100, copc_path=copc_path,
+                    finished_at=time.monotonic())
         except Exception as e:
             if logger:
                 logger.warning(f"COPC convert job {job_id} failed: {e}")
             with _convert_jobs_lock:
-                _convert_jobs[job_id].update(status='error', error=str(e))
+                _convert_jobs[job_id].update(status='error', error=str(e),
+                                             finished_at=time.monotonic())
         finally:
             with _convert_jobs_lock:
                 if _convert_src_jobs.get(src_key) == job_id:
@@ -470,6 +496,24 @@ def copc_nodes():
 # ══════════════════════════════════════════════════════
 #  Merge & Save (Map A + transformed Map B)
 # ══════════════════════════════════════════════════════
+def _make_save_dir(maps_dir, tag):
+    """Create a unique '<timestamp>_<tag>' directory under maps_dir.
+
+    Two requests landing in the same second would otherwise write into the
+    same directory — create with exist_ok=False and retry once with a short
+    random suffix on collision. Returns (save_dir, name)."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    name = f'{timestamp}_{tag}'
+    save_dir = os.path.join(maps_dir, name)
+    try:
+        os.makedirs(save_dir, exist_ok=False)
+    except FileExistsError:
+        name = f'{timestamp}_{tag}_{uuid.uuid4().hex[:6]}'
+        save_dir = os.path.join(maps_dir, name)
+        os.makedirs(save_dir, exist_ok=False)
+    return save_dir, name
+
+
 def _euler_xyz_matrix(rx_deg, ry_deg, rz_deg):
     """R = Rx·Ry·Rz — the composition three.js uses for Euler order 'XYZ',
     which is what the viewer applies via object.rotation. Column-vector
@@ -576,9 +620,7 @@ def save_compare_b():
         else:
             m_cls = None
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(maps_dir, f'{timestamp}_merged')
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir, save_name = _make_save_dir(maps_dir, 'merged')
         save_path = os.path.join(save_dir, 'map.las')
 
         n_total = len(mx)
@@ -593,7 +635,7 @@ def save_compare_b():
             'points': n_total,
             'points_a': len(ax),
             'points_b': len(bx),
-            'name': f'{timestamp}_merged',
+            'name': save_name,
         })
 
     except Exception as e:
@@ -645,37 +687,6 @@ def save_screenshot():
 # ══════════════════════════════════════════════════════
 #  Analysis API
 # ══════════════════════════════════════════════════════
-
-def _load_points_from_request():
-    """Load point cloud from request JSON path or uploaded file. Returns (x, y, z, intensity) numpy arrays."""
-    tmp_path = None
-    try:
-        path = None
-        if request.is_json and 'path' in request.json:
-            path = request.json['path']
-            maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
-            if not os.path.realpath(path).startswith(maps_dir + os.sep):
-                return None, 'Access denied'
-        elif 'file' in request.files:
-            f = request.files['file']
-            fd, tmp_path = tempfile.mkstemp(suffix='.las')
-            os.close(fd)
-            f.save(tmp_path)
-            path = tmp_path
-
-        if not path or not os.path.isfile(path):
-            return None, 'File not found'
-
-        d = read_pointcloud(path)
-        x, y, z = d['x'].astype(np.float64), d['y'].astype(np.float64), d['z'].astype(np.float64)
-        intensity = d['intensity'].astype(np.float64) if d['intensity'] is not None else np.zeros(len(x))
-
-        return {'x': x, 'y': y, 'z': z, 'intensity': intensity, 'n': len(x),
-                'r': d['r'], 'g': d['g'], 'b': d['b']}, None
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
 
 @api_bp.route('/api/analysis/statistics', methods=['POST'])
 def analysis_statistics():
@@ -787,9 +798,7 @@ def analysis_sor():
         n_removed = int((~inlier_mask).sum())
 
         # Save filtered result
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(maps_dir, f'{timestamp}_sor')
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir, save_name = _make_save_dir(maps_dir, 'sor')
         save_path = os.path.join(save_dir, 'map.las')
 
         write_las(
@@ -813,7 +822,7 @@ def analysis_sor():
             'removed_points': n_removed,
             'threshold': round(threshold, 6),
             'saved_path': save_path,
-            'saved_name': f'{timestamp}_sor',
+            'saved_name': save_name,
         })
 
     except Exception as e:
@@ -862,9 +871,7 @@ def analysis_cross_section():
         n_selected = int(mask.sum())
 
         # Save cross-section
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(maps_dir, f'{timestamp}_section')
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir, save_name = _make_save_dir(maps_dir, 'section')
         save_path = os.path.join(save_dir, 'map.las')
 
         write_las(
@@ -885,7 +892,7 @@ def analysis_cross_section():
             'center': center,
             'thickness': thickness,
             'saved_path': save_path,
-            'saved_name': f'{timestamp}_section',
+            'saved_name': save_name,
         })
 
     except Exception as e:
@@ -1065,9 +1072,7 @@ def save_transformed():
 
         x += ox; y += oy; z += oz
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(maps_dir, f'{timestamp}_transformed')
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir, save_name = _make_save_dir(maps_dir, 'transformed')
         save_path = os.path.join(save_dir, 'map.las')
 
         n = len(x)
@@ -1080,7 +1085,7 @@ def save_transformed():
             log.info(f"[Transform] {n} pts -> {save_path} "
                      f"T=({ox},{oy},{oz}) R=({rx},{ry},{rz})")
 
-        return jsonify({'path': save_path, 'points': n, 'name': f'{timestamp}_transformed'})
+        return jsonify({'path': save_path, 'points': n, 'name': save_name})
 
     except Exception as e:
         return _error_response(e, 'save_transformed')

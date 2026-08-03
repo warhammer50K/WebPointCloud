@@ -43,8 +43,14 @@ export function customConfirm(message) {
             dlg.classList.remove('open');
             okBtn.onclick = null;
             cancelBtn.onclick = null;
+            document.removeEventListener('keydown', onKey);
             resolve(result);
         };
+        const onKey = e => {
+            if (e.key === 'Enter') { e.preventDefault(); cleanup(true); }
+            else if (e.key === 'Escape') { e.preventDefault(); cleanup(false); }
+        };
+        document.addEventListener('keydown', onKey);
         okBtn.onclick = () => cleanup(true);
         cancelBtn.onclick = () => cleanup(false);
     });
@@ -67,8 +73,14 @@ export function customPrompt(message, defaultValue = '') {
             okBtn.onclick = null;
             cancelBtn.onclick = null;
             inputEl.onkeydown = null;
+            document.removeEventListener('keydown', onKey);
             resolve(result);
         };
+        const onKey = e => {
+            if (e.key === 'Enter') { e.preventDefault(); cleanup(inputEl.value); }
+            else if (e.key === 'Escape') { e.preventDefault(); cleanup(null); }
+        };
+        document.addEventListener('keydown', onKey);
         okBtn.onclick = () => cleanup(inputEl.value);
         cancelBtn.onclick = () => cleanup(null);
         inputEl.onkeydown = e => { if (e.key === 'Enter') cleanup(inputEl.value); };

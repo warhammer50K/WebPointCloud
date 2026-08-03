@@ -79,7 +79,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         list.innerHTML = '<div style="color:var(--text-dim)">Loading...</div>';
         try {
             const resp = await fetch('/api/maps');
+            if (!resp.ok) throw new Error(`Failed to load map list (${resp.status})`);
             const maps = await resp.json();
+            if (!Array.isArray(maps)) throw new Error('Invalid map list response');
             list.innerHTML = '';
             if (maps.length === 0) {
                 list.innerHTML = '<div style="color:var(--text-dim)">No maps found. Place a LAS/LAZ/COPC file in the maps directory.</div>';
@@ -212,7 +214,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         if (!listEl) return;
         try {
             const resp = await fetch('/api/maps');
+            if (!resp.ok) throw new Error(`Failed to load map list (${resp.status})`);
             const maps = await resp.json();
+            if (!Array.isArray(maps)) throw new Error('Invalid map list response');
             listEl.innerHTML = '';
             const withFiles = maps.filter(m => m.las_files && m.las_files.length > 0);
             if (emptyEl) emptyEl.style.display = withFiles.length === 0 ? '' : 'none';
@@ -321,7 +325,11 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         dragCounter = 0;
         dropOverlay.style.display = 'none';
         const file = e.dataTransfer.files[0];
-        if (!file || !file.name.match(/\.(las|laz|ply|xyz|txt|csv|pcd|pts|splat)$/i)) return;
+        if (!file) return;
+        if (!file.name.match(/\.(las|laz|ply|xyz|txt|csv|pcd|pts|splat)$/i)) {
+            showToast(`Unsupported file type: ${file.name} (supported: las, laz, ply, xyz, txt, csv, pcd, pts, splat)`, 'warn');
+            return;
+        }
         $('st-main').textContent = `Loading ${file.name}...`;
         showLoading(`Loading ${file.name}...`);
         try {
@@ -398,8 +406,13 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         });
         header.addEventListener('pointermove', e => {
             if (!dragging) return;
-            panel.style.left = (e.clientX - dx) + 'px';
-            panel.style.top = (e.clientY - dy) + 'px';
+            // Clamp so the panel can't be dragged fully off-screen (keep at
+            // least a grabbable sliver of the header visible).
+            const minVisible = 60;
+            const left = Math.min(Math.max(e.clientX - dx, minVisible - panel.offsetWidth), window.innerWidth - minVisible);
+            const top = Math.min(Math.max(e.clientY - dy, 0), window.innerHeight - 40);
+            panel.style.left = left + 'px';
+            panel.style.top = top + 'px';
         });
         header.addEventListener('pointerup', () => { dragging = false; });
     }

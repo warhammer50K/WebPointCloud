@@ -204,6 +204,10 @@ export function initAnalysis(viewer, legend, deps, uiState) {
                     mean: parseFloat(res.headers.get('X-C2C-Mean')),
                     std: parseFloat(res.headers.get('X-C2C-Std')),
                 };
+                if ([stats.min, stats.max, stats.mean, stats.std].some(Number.isNaN)) {
+                    showToast('C2C failed: missing result headers in response', 'error');
+                    return;
+                }
 
                 const c2cEl = $('c2c-result');
                 if (c2cEl) {

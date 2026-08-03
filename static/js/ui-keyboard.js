@@ -22,6 +22,7 @@ export function initKeyboardShortcuts(viewer, legend, deps, uiState) {
     // ── Keyboard shortcuts ──
     document.addEventListener('keydown', e => {
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;   // don't hijack browser/OS combos
         switch (e.key) {
             case '1': $('sel-view').value = 'free'; viewer.setView('free'); break;
             case '2': $('sel-view').value = 'top'; viewer.setView('top'); break;

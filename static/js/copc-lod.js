@@ -30,6 +30,9 @@ const DEFAULT_SSE_THRESHOLD = 4.0;     // pixels: descend while node error excee
 // kept in the cut), so the view thins out instead of blanking — and only after this
 // grace window, so brief leaves during an orbit/pan don't churn-evict-then-refetch.
 const COARSEN_DELAY_MS = 500;
+// After a failed fetch (server error / network), don't re-request the same
+// node keys for this long — avoids hammering a persistently failing server.
+const FAIL_BACKOFF_MS = 5000;
 
 export class CopcLodManager {
     constructor(viewer, meta, path) {
@@ -50,6 +53,7 @@ export class CopcLodManager {
         this.loading = new Set();                     // node keys with an in-flight fetch
         this.desired = new Set();                     // current cut
         this.queue = [];                              // keys to fetch, most-visible first
+        this._failedAt = new Map();                   // node key -> failure time (retry backoff)
         this._activeWorkers = 0;                      // live fetch workers (global cap)
         this.loadedPointCount = 0;
         this._pending = 0;                            // nodes queued/in-flight (progress)
@@ -236,7 +240,13 @@ export class CopcLodManager {
         for (const c of candidates) metaByKey.set(c.key, c);
         const queue = [];
         for (const key of desired) {
-            if (!this.nodeToChunk.has(key) && !this.loading.has(key)) queue.push(key);
+            if (this.nodeToChunk.has(key) || this.loading.has(key)) continue;
+            const failedAt = this._failedAt.get(key);
+            if (failedAt !== undefined) {
+                if (now - failedAt < FAIL_BACKOFF_MS) continue;   // still backing off
+                this._failedAt.delete(key);
+            }
+            queue.push(key);
         }
         // Load DEEPEST (finest) visible nodes first, then largest on screen. On a
         // big map zoomed in, the coarse ancestor nodes are nearly empty in the
@@ -332,7 +342,8 @@ export class CopcLodManager {
                     body: JSON.stringify({ path: this.path, keys }),
                     signal: this._abortCtrl.signal,
                 });
-                if (!resp.ok || this._disposed) return;
+                if (this._disposed) return;
+                if (!resp.ok) { this._markFailed(keys); return; }
                 buf = await resp.arrayBuffer();
             } finally {
                 this._pending = Math.max(0, this._pending - keys.length);
@@ -382,6 +393,7 @@ export class CopcLodManager {
             this.viewer._dirty = true;
         } catch (err) {
             if (!this._disposed && (!err || err.name !== 'AbortError')) {
+                this._markFailed(keys);
                 console.warn('[COPC] chunk fetch failed', err);
             }
         } finally {
@@ -391,6 +403,12 @@ export class CopcLodManager {
             // double-fetching and double-rendering it.
             for (const k of keys) this.loading.delete(k);
         }
+    }
+
+    // Remember failed keys so _select skips re-queueing them for FAIL_BACKOFF_MS.
+    _markFailed(keys) {
+        const now = performance.now();
+        for (const k of keys) this._failedAt.set(k, now);
     }
 
     _unloadChunk(chunkId) {

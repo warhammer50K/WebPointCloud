@@ -21,6 +21,7 @@ import os
 import queue
 import contextlib
 import threading
+import uuid
 
 import numpy as np
 
@@ -216,6 +217,13 @@ def _estimate_norm_scales(reader, has_rgb):
     return intensity_max, rgb_scale
 
 
+# Paths whose octree warm-up thread is currently running — repeated meta
+# requests during a long build would otherwise pile up threads all blocking
+# on the same entry lock.
+_warming = set()
+_warming_lock = threading.Lock()
+
+
 def warm_octree_async(path):
     """Kick off the (one-time, ~seconds) octree build in the background.
 
@@ -223,12 +231,22 @@ def warm_octree_async(path):
     walk (tens of seconds on big files) while the user stares at an empty view.
     Calling this when meta is served — well before the client asks for the
     hierarchy — lets the build overlap the round-trip so it's usually cached by
-    the time it's needed. Safe to call repeatedly: _get_octree double-checks."""
+    the time it's needed. Safe to call repeatedly: a build already in progress
+    is skipped, and _get_octree double-checks the cache."""
+    key = os.path.realpath(path)
+    with _warming_lock:
+        if key in _warming:
+            return
+        _warming.add(key)
+
     def run():
         try:
             _get_octree(open_copc(path))
         except Exception:
             pass
+        finally:
+            with _warming_lock:
+                _warming.discard(key)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -513,7 +531,9 @@ def ensure_copc(src_path, dst_path=None, progress=None):
     # check above, and two concurrent conversions would corrupt each other.
     # (.copc.laz suffix kept so PDAL's extension-based writer inference still
     # picks writers.copc for the temp output.)
-    tmp_path = f'{dst_path}.{os.getpid()}.tmp.copc.laz'
+    # pid alone collides when two threads of the same process convert the same
+    # source concurrently — add a random tail so each build gets its own temp.
+    tmp_path = f'{dst_path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp.copc.laz'
     try:
         # 1) PDAL CLI with writers.copc (PDAL >= 2.4)
         converted = False

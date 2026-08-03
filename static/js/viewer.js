@@ -397,7 +397,7 @@ export class Viewer {
             const s = t * t * (3 - 2 * t); // smoothstep
             this.camera.position.lerpVectors(a.startPos, a.targetPos, s);
             this.controls.target.lerpVectors(a.startTarget, a.targetTarget, s);
-            this.controls.update();
+            // (controls.update() runs once below for every frame — no extra call here)
             this._dirty = true;
             if (t >= 1) this._cameraAnim = null;
         }
@@ -1147,6 +1147,7 @@ export class Viewer {
         if (layer === 'map') {
             if (this.pointCloud) { this.pointCloud.visible = show; }
             if (this.mapCloud) { this.mapCloud.visible = show; }
+            if (this.copcManager && this.copcManager.lodGroup) { this.copcManager.lodGroup.visible = show; }
         } else if (layer === 'kfrm') {
             this.kfrmClouds.forEach(c => { c.visible = show; });
         } else {
@@ -1255,9 +1256,14 @@ export class Viewer {
     /* ── Constraint Graph ── */
     addConstraintEdge(id0, id1, src, score, err) {
         const edge = { id0: parseInt(id0), id1: parseInt(id1), src, score: parseFloat(score), err: parseFloat(err) };
-        // S-4: cap at 50000 edges — remove oldest when limit reached
+        // S-4: cap at 50000 edges — batch-drop the oldest 10% when the limit is
+        // reached (one splice + one rebuild, instead of a per-append shift that
+        // also left stale edges in the filtered list / GPU buffer).
         if (this._constraintEdgesAll.length >= 50000) {
-            this._constraintEdgesAll.shift();
+            const removed = this._constraintEdgesAll.splice(0, Math.ceil(this._constraintEdgesAll.length * 0.1));
+            const removedSet = new Set(removed);
+            this._constraintEdges = this._constraintEdges.filter(e => !removedSet.has(e));
+            this._rebuildConstraintGraph();
         }
         this._constraintEdgesAll.push(edge);
         // Try incremental append if filter passes
@@ -1482,6 +1488,9 @@ export class Viewer {
         this.clearKfrmClouds();
         this.clearConstraintGraph();
         this.clearKfMarkers();
+        this.clearCopc();
+        this.clearGaussianSplat();
+        this.clearCompare();
     }
 
     clearKfMarkers() {
@@ -1641,6 +1650,7 @@ export class Viewer {
 
     updateStats() {
         const el = document.getElementById('viewer-stats');
+        if (!el) return;
         if (!this.bounds) { el.style.display = 'none'; return; }
         const b = this.bounds;
         let total = 0;
@@ -1772,6 +1782,8 @@ export class Viewer {
 
         const show = this.grid.visible;
         this.scene.remove(this.grid);
+        this.grid.geometry.dispose();
+        this.grid.material.dispose();
         this.grid = this._makeGrid(gridSize, divisions, cx, cy);
         this.grid.visible = show;
         this.scene.add(this.grid);

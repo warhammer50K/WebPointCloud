@@ -145,8 +145,14 @@ export async function loadLasFromPath(path, opts = {}) {
         body: JSON.stringify(body),
     });
     if (!resp.ok) {
-        const err = await resp.json();
-        throw new Error(err.error || 'Failed to load');
+        // Non-JSON error bodies (e.g. an HTML 5xx page) must not mask the failure
+        // with a SyntaxError — fall back to the HTTP status text.
+        let msg = resp.statusText || 'Failed to load';
+        try {
+            const err = await resp.json();
+            msg = err.error || msg;
+        } catch {}
+        throw new Error(msg);
     }
     // COPC maps respond with JSON — ready-to-stream meta, or a 202 "converting"
     // job to poll (large non-COPC maps convert in the background here too).
@@ -179,7 +185,10 @@ export async function uploadLasFile(file, onProgress) {
                 // Server percent-encodes the header (HTTP headers are latin-1;
                 // raw non-ASCII filenames would kill the response).
                 const rawSaved = xhr.getResponseHeader('X-Saved-Path');
-                const savedPath = rawSaved ? decodeURIComponent(rawSaved) : rawSaved;
+                let savedPath = rawSaved;
+                if (rawSaved) {
+                    try { savedPath = decodeURIComponent(rawSaved); } catch { savedPath = rawSaved; }
+                }
                 // COPC: server returns JSON — either ready-to-stream meta, or a
                 // 202 "converting" job to poll.
                 if (ct.includes('application/json')) {

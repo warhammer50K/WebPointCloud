@@ -27,15 +27,32 @@ def load_or_create_secret_key() -> str:
 class RateLimiter:
     """Per-IP sliding-window rate limiter (no external deps)."""
 
+    # Full-dict prune runs at most once per this many requests, so the
+    # steady-state cost stays O(1) while stale IPs still get dropped.
+    _PRUNE_EVERY = 1024
+
     def __init__(self, max_requests: int = 60, window_seconds: int = 60):
         self._max = max_requests
         self._window = window_seconds
         self._hits: dict[str, list[float]] = defaultdict(list)
         self._lock = threading.Lock()
+        self._prune_countdown = self._PRUNE_EVERY
+
+    def _prune_locked(self, now: float) -> None:
+        """Drop IPs whose last hit is ancient (10× the window) so _hits doesn't
+        grow forever. Caller must hold self._lock."""
+        cutoff = now - self._window * 10
+        for ip in [ip for ip, ts in self._hits.items()
+                   if not ts or ts[-1] < cutoff]:
+            del self._hits[ip]
 
     def is_allowed(self, ip: str) -> bool:
         now = time.monotonic()
         with self._lock:
+            self._prune_countdown -= 1
+            if self._prune_countdown <= 0:
+                self._prune_countdown = self._PRUNE_EVERY
+                self._prune_locked(now)
             timestamps = self._hits[ip]
             cutoff = now - self._window
             self._hits[ip] = [t for t in timestamps if t > cutoff]
