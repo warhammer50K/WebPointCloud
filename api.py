@@ -5,12 +5,13 @@ from werkzeug.exceptions import RequestEntityTooLarge
 import numpy as np
 import json
 import os
+import re
 import struct
 import io
 import glob
 import shutil
-import tempfile
 import threading
+import time
 import uuid
 import urllib.parse
 from datetime import datetime
@@ -33,11 +34,18 @@ def _get_map_lock(map_name: str) -> threading.Lock:
 
 
 # ── JSON Content-Type validation ───────────────────
+# JSON bodies are small control payloads; cap them well below MAX_CONTENT_LENGTH
+# (sized for file uploads) so a hostile 5GB JSON body can't exhaust memory.
+_MAX_JSON_BYTES = 64 * 1024 * 1024
+
+
 def _require_json():
-    """Return a 415 error response if the request Content-Type is not JSON, else None."""
+    """Return a 415/413 error response if the request isn't acceptable JSON, else None."""
     ct = request.content_type or ''
     if not ct.startswith('application/json'):
         return jsonify({'error': 'Content-Type must be application/json'}), 415
+    if (request.content_length or 0) > _MAX_JSON_BYTES:
+        return jsonify({'error': 'JSON body too large'}), 413
     return None
 
 
@@ -61,11 +69,20 @@ def _error_response(e: Exception, context: str = ''):
 
 
 # ── Path Traversal prevention ─────────────────────
+_MAP_NAME_RE = re.compile(r'^[\w.\- ]+$')
+
+
 def _safe_path(base_dir, name):
-    """Verify name resolves inside base_dir. Returns None on violation."""
+    """Verify name is a single safe path component strictly inside base_dir.
+
+    Returns None on violation. base_dir itself is never a valid result —
+    otherwise names like '.' would let callers rmtree/rename the whole tree.
+    """
+    if not name or name in ('.', '..') or not _MAP_NAME_RE.fullmatch(name):
+        return None
     resolved = os.path.realpath(os.path.join(base_dir, name))
     base = os.path.realpath(base_dir)
-    if not resolved.startswith(base + os.sep) and resolved != base:
+    if os.path.dirname(resolved) != base or resolved == base:
         return None
     return resolved
 
@@ -94,6 +111,12 @@ def list_maps():
                             with open(lf, 'rb') as fh:
                                 fh.seek(107)
                                 info['num_points'] = struct.unpack('<I', fh.read(4))[0]
+                            if info['num_points'] == 0:
+                                # LAS 1.4 (PDRF>=6) leaves the legacy count 0 —
+                                # fall back to the real header via laspy.
+                                import laspy
+                                with laspy.open(lf) as fh:
+                                    info['num_points'] = int(fh.header.point_count)
                         else:
                             # LAZ/COPC (often LAS 1.4): read header via laspy.
                             import laspy
@@ -129,9 +152,12 @@ def delete_map(name):
     with lock:
         try:
             shutil.rmtree(safe)
-            return jsonify({'status': 'ok'})
         except Exception as e:
             return _error_response(e, 'delete_map')
+    # Map is gone — drop its lock so _map_locks doesn't grow unboundedly.
+    with _map_locks_guard:
+        _map_locks.pop(name, None)
+    return jsonify({'status': 'ok'})
 
 
 @api_bp.route('/api/maps/<name>/rename', methods=['POST'])
@@ -168,9 +194,12 @@ def rename_map(name):
 # ══════════════════════════════════════════════════════
 def _upload_tmp_dir():
     """Temp dir for drag&drop uploads — outside the maps tree so dropped files
-    never accumulate as multi-GB copies there (cleared on reboot anyway)."""
-    d = os.path.join(tempfile.gettempdir(), 'webpc_uploads')
-    os.makedirs(d, exist_ok=True)
+    never accumulate as multi-GB copies there. Lives under DATA_DIR (mode 0700),
+    not a predictable world-writable /tmp name another local user could
+    pre-create and control."""
+    import config
+    d = os.path.join(config.DATA_DIR, 'uploads')
+    os.makedirs(d, mode=0o700, exist_ok=True)
     return d
 
 
@@ -181,6 +210,16 @@ def load_pointcloud():
     try:
         path = None
         saved_path = None
+        # preview_points > 0: caller wants a bounded raw point payload even for
+        # COPC files (compare overlay) instead of streaming meta.
+        preview_pts = 0
+        if request.is_json:
+            try:
+                preview_pts = min(int(request.json.get('preview_points') or 0),
+                                  10_000_000)
+            except (TypeError, ValueError):
+                preview_pts = 0
+
         if request.is_json and 'path' in request.json:
             path = request.json['path']
             saved_path = path
@@ -192,8 +231,8 @@ def load_pointcloud():
             orig_name = f.filename or 'upload.las'
             suffix = os.path.splitext(orig_name)[1].lower() or '.las'
             # Drag&drop only gives us the bytes, so dropped files are uploaded to
-            # an OS temp dir (NOT under the maps tree) and removed once the COPC
-            # exists — no multi-GB copy accumulates. See _upload_tmp_dir().
+            # a private temp dir (NOT under the maps tree) and removed once the
+            # COPC exists — no multi-GB copy accumulates. See _upload_tmp_dir().
             upload_dir = _upload_tmp_dir()
             # Fail clearly (not a generic 500 mid-write) if the disk can't hold it.
             need = request.content_length or 0
@@ -217,10 +256,13 @@ def load_pointcloud():
         if ext not in SUPPORTED_EXTENSIONS:
             return jsonify({'error': f'Unsupported format: {ext}'}), 400
 
+        # is_copc opens the file via CopcReader (~0.3s) — call it once and reuse.
+        file_is_copc = ext in ('.las', '.laz') and copc_io.is_copc(path)
+
         # Large non-COPC LAS/LAZ: convert to COPC in the background and return a
         # job id immediately so the client can show conversion progress. Small
         # files fall through to the legacy whole-cloud path.
-        if ext in ('.las', '.laz') and not copc_io.is_copc(path):
+        if ext in ('.las', '.laz') and not file_is_copc:
             import config
             threshold = getattr(config, 'COPC_STREAM_MIN_POINTS', 2_000_000)
             if _point_count(path) >= threshold:
@@ -234,8 +276,13 @@ def load_pointcloud():
 
         # COPC: stream via octree LOD (JSON meta) instead of a whole-cloud binary.
         # The frontend distinguishes by Content-Type and switches into copc mode.
-        if copc_io.is_copc(path):
-            resp = jsonify(copc_io.copc_meta(path))
+        if file_is_copc:
+            if preview_pts > 0:
+                binary = copc_io.copc_preview_binary(path, max_points=preview_pts)
+                resp = send_file(io.BytesIO(binary),
+                                 mimetype='application/octet-stream')
+            else:
+                resp = jsonify(copc_io.copc_meta(path))
             if saved_path:
                 resp.headers['X-Saved-Path'] = urllib.parse.quote(saved_path)
             return resp
@@ -279,6 +326,17 @@ def load_las():
 _convert_jobs = {}                       # job_id -> {status, percent, copc_path, error}
 _convert_src_jobs = {}                   # src realpath -> job_id of a RUNNING conversion
 _convert_jobs_lock = threading.Lock()
+_CONVERT_JOB_TTL = 3600                  # finished jobs pruned an hour after completion
+
+
+def _prune_convert_jobs_locked():
+    """Drop finished jobs whose result nobody can still care about (TTL passed).
+    Caller must hold _convert_jobs_lock."""
+    now = time.monotonic()
+    for jid in [jid for jid, j in _convert_jobs.items()
+                if j.get('status') in ('done', 'error')
+                and now - j.get('finished_at', now) > _CONVERT_JOB_TTL]:
+        del _convert_jobs[jid]
 
 
 def _point_count(path):
@@ -299,6 +357,7 @@ def _start_convert_job(src_path, logger=None, cleanup_src=False):
     src_key = os.path.realpath(src_path)
     job_id = uuid.uuid4().hex[:12]
     with _convert_jobs_lock:
+        _prune_convert_jobs_locked()
         # Same source already converting (double-click, page reload): join that
         # job instead of racing a second writer onto the same output file.
         existing = _convert_src_jobs.get(src_key)
@@ -325,12 +384,14 @@ def _start_convert_job(src_path, logger=None, cleanup_src=False):
                     pass
             with _convert_jobs_lock:
                 _convert_jobs[job_id].update(
-                    status='done', percent=100, copc_path=copc_path)
+                    status='done', percent=100, copc_path=copc_path,
+                    finished_at=time.monotonic())
         except Exception as e:
             if logger:
                 logger.warning(f"COPC convert job {job_id} failed: {e}")
             with _convert_jobs_lock:
-                _convert_jobs[job_id].update(status='error', error=str(e))
+                _convert_jobs[job_id].update(status='error', error=str(e),
+                                             finished_at=time.monotonic())
         finally:
             with _convert_jobs_lock:
                 if _convert_src_jobs.get(src_key) == job_id:
@@ -435,6 +496,38 @@ def copc_nodes():
 # ══════════════════════════════════════════════════════
 #  Merge & Save (Map A + transformed Map B)
 # ══════════════════════════════════════════════════════
+def _make_save_dir(maps_dir, tag):
+    """Create a unique '<timestamp>_<tag>' directory under maps_dir.
+
+    Two requests landing in the same second would otherwise write into the
+    same directory — create with exist_ok=False and retry once with a short
+    random suffix on collision. Returns (save_dir, name)."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    name = f'{timestamp}_{tag}'
+    save_dir = os.path.join(maps_dir, name)
+    try:
+        os.makedirs(save_dir, exist_ok=False)
+    except FileExistsError:
+        name = f'{timestamp}_{tag}_{uuid.uuid4().hex[:6]}'
+        save_dir = os.path.join(maps_dir, name)
+        os.makedirs(save_dir, exist_ok=False)
+    return save_dir, name
+
+
+def _euler_xyz_matrix(rx_deg, ry_deg, rz_deg):
+    """R = Rx·Ry·Rz — the composition three.js uses for Euler order 'XYZ',
+    which is what the viewer applies via object.rotation. Column-vector
+    convention: P' = R @ P."""
+    rx_r, ry_r, rz_r = np.radians([float(rx_deg), float(ry_deg), float(rz_deg)])
+    cx, sx = np.cos(rx_r), np.sin(rx_r)
+    cy, sy = np.cos(ry_r), np.sin(ry_r)
+    cz, sz = np.cos(rz_r), np.sin(rz_r)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rx @ Ry @ Rz
+
+
 @api_bp.route('/api/save_compare_b', methods=['POST'])
 def save_compare_b():
     err = _require_json()
@@ -446,6 +539,11 @@ def save_compare_b():
         path_b = data.get('path', '') or data.get('path_b', '')
         ox, oy, oz = data.get('ox', 0), data.get('oy', 0), data.get('oz', 0)
         rx, ry, rz = data.get('rx', 0), data.get('ry', 0), data.get('rz', 0)
+        # Pivot = B's centering offset in the viewer (three.js rotates the
+        # object about its local origin, which is exactly this point). Without
+        # it we fall back to B's bbox midpoint — close, but only the client
+        # knows the exact offset its geometry was centered with.
+        pivot = data.get('pivot')
 
         maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
         for p in [path_a, path_b]:
@@ -460,19 +558,25 @@ def save_compare_b():
 
         # ── Read Map B and apply transform ──
         d_b = read_pointcloud(path_b)
+        if d_b.get('type') == 'gaussian':
+            return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                            'cannot be merged — a point cloud is required'}), 400
         bx, by, bz = d_b['x'].astype(np.float64), d_b['y'].astype(np.float64), d_b['z'].astype(np.float64)
 
         if rx != 0 or ry != 0 or rz != 0:
-            rx_r, ry_r, rz_r = np.radians(rx), np.radians(ry), np.radians(rz)
-            cx, sx = np.cos(rx_r), np.sin(rx_r)
-            cy, sy = np.cos(ry_r), np.sin(ry_r)
-            cz, sz = np.cos(rz_r), np.sin(rz_r)
-            Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-            Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-            R = Rz @ Ry @ Rx
-            pts = R @ np.vstack([bx, by, bz])
-            bx, by, bz = pts[0], pts[1], pts[2]
+            # Match the viewer exactly: three.js Euler 'XYZ' (R = Rx·Ry·Rz)
+            # about pivot c → P' = R·(P − c) + c + t
+            R = _euler_xyz_matrix(rx, ry, rz)
+            if pivot is not None:
+                px, py, pz = (float(pivot[0]), float(pivot[1]), float(pivot[2]))
+            elif len(bx):
+                px = (float(bx.min()) + float(bx.max())) / 2.0
+                py = (float(by.min()) + float(by.max())) / 2.0
+                pz = (float(bz.min()) + float(bz.max())) / 2.0
+            else:
+                px = py = pz = 0.0
+            pts = R @ np.vstack([bx - px, by - py, bz - pz])
+            bx, by, bz = pts[0] + px, pts[1] + py, pts[2] + pz
 
         bx += ox; by += oy; bz += oz
 
@@ -482,6 +586,9 @@ def save_compare_b():
         # ── Read Map A ──
         if path_a:
             d_a = read_pointcloud(path_a)
+            if d_a.get('type') == 'gaussian':
+                return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                                'cannot be merged — a point cloud is required'}), 400
             ax, ay, az = d_a['x'].astype(np.float64), d_a['y'].astype(np.float64), d_a['z'].astype(np.float64)
             a_intensity = d_a['intensity']
             a_r, a_g, a_b = d_a['r'], d_a['g'], d_a['b']
@@ -513,9 +620,7 @@ def save_compare_b():
         else:
             m_cls = None
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(maps_dir, f'{timestamp}_merged')
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir, save_name = _make_save_dir(maps_dir, 'merged')
         save_path = os.path.join(save_dir, 'map.las')
 
         n_total = len(mx)
@@ -530,7 +635,7 @@ def save_compare_b():
             'points': n_total,
             'points_a': len(ax),
             'points_b': len(bx),
-            'name': f'{timestamp}_merged',
+            'name': save_name,
         })
 
     except Exception as e:
@@ -582,37 +687,6 @@ def save_screenshot():
 # ══════════════════════════════════════════════════════
 #  Analysis API
 # ══════════════════════════════════════════════════════
-
-def _load_points_from_request():
-    """Load point cloud from request JSON path or uploaded file. Returns (x, y, z, intensity) numpy arrays."""
-    tmp_path = None
-    try:
-        path = None
-        if request.is_json and 'path' in request.json:
-            path = request.json['path']
-            maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
-            if not os.path.realpath(path).startswith(maps_dir + os.sep):
-                return None, 'Access denied'
-        elif 'file' in request.files:
-            f = request.files['file']
-            fd, tmp_path = tempfile.mkstemp(suffix='.las')
-            os.close(fd)
-            f.save(tmp_path)
-            path = tmp_path
-
-        if not path or not os.path.isfile(path):
-            return None, 'File not found'
-
-        d = read_pointcloud(path)
-        x, y, z = d['x'].astype(np.float64), d['y'].astype(np.float64), d['z'].astype(np.float64)
-        intensity = d['intensity'].astype(np.float64) if d['intensity'] is not None else np.zeros(len(x))
-
-        return {'x': x, 'y': y, 'z': z, 'intensity': intensity, 'n': len(x),
-                'r': d['r'], 'g': d['g'], 'b': d['b']}, None
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
 
 @api_bp.route('/api/analysis/statistics', methods=['POST'])
 def analysis_statistics():
@@ -680,8 +754,15 @@ def analysis_sor():
 
         data = request.json
         path = data.get('path', '')
-        k = data.get('k', 20)
-        std_ratio = data.get('std_ratio', 2.0)
+        try:
+            k = int(data.get('k', 20))
+            std_ratio = float(data.get('std_ratio', 2.0))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'k and std_ratio must be numeric'}), 400
+        if not 1 <= k <= 200:
+            return jsonify({'error': 'k must be between 1 and 200'}), 400
+        if not std_ratio > 0:
+            return jsonify({'error': 'std_ratio must be > 0'}), 400
 
         if not path:
             return jsonify({'error': 'Path required'}), 400
@@ -695,6 +776,9 @@ def analysis_sor():
         from scipy.spatial import cKDTree
 
         pc = read_pointcloud(path)
+        if pc.get('type') == 'gaussian':
+            return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                            'are not supported for SOR — a point cloud is required'}), 400
         x, y, z = pc['x'].astype(np.float64), pc['y'].astype(np.float64), pc['z'].astype(np.float64)
         n = len(x)
 
@@ -714,9 +798,7 @@ def analysis_sor():
         n_removed = int((~inlier_mask).sum())
 
         # Save filtered result
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(maps_dir, f'{timestamp}_sor')
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir, save_name = _make_save_dir(maps_dir, 'sor')
         save_path = os.path.join(save_dir, 'map.las')
 
         write_las(
@@ -740,7 +822,7 @@ def analysis_sor():
             'removed_points': n_removed,
             'threshold': round(threshold, 6),
             'saved_path': save_path,
-            'saved_name': f'{timestamp}_sor',
+            'saved_name': save_name,
         })
 
     except Exception as e:
@@ -759,7 +841,12 @@ def analysis_cross_section():
         path = data.get('path', '')
         axis = data.get('axis', 'z')  # 'x', 'y', or 'z'
         center = data.get('center', 0.0)
-        thickness = data.get('thickness', 1.0)
+        try:
+            thickness = float(data.get('thickness', 1.0))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'thickness must be numeric'}), 400
+        if not thickness > 0:
+            return jsonify({'error': 'thickness must be > 0'}), 400
 
         if not path:
             return jsonify({'error': 'Path required'}), 400
@@ -773,6 +860,9 @@ def analysis_cross_section():
             return jsonify({'error': 'File not found'}), 404
 
         pc = read_pointcloud(path)
+        if pc.get('type') == 'gaussian':
+            return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                            'are not supported for cross-section — a point cloud is required'}), 400
         x, y, z = pc['x'].astype(np.float64), pc['y'].astype(np.float64), pc['z'].astype(np.float64)
 
         axis_data = {'x': x, 'y': y, 'z': z}[axis]
@@ -781,9 +871,7 @@ def analysis_cross_section():
         n_selected = int(mask.sum())
 
         # Save cross-section
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(maps_dir, f'{timestamp}_section')
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir, save_name = _make_save_dir(maps_dir, 'section')
         save_path = os.path.join(save_dir, 'map.las')
 
         write_las(
@@ -804,7 +892,7 @@ def analysis_cross_section():
             'center': center,
             'thickness': thickness,
             'saved_path': save_path,
-            'saved_name': f'{timestamp}_section',
+            'saved_name': save_name,
         })
 
     except Exception as e:
@@ -821,7 +909,12 @@ def analysis_volume():
 
         data = request.json
         path = data.get('path', '')
-        grid_size = data.get('grid_size', 0.5)
+        try:
+            grid_size = float(data.get('grid_size', 0.5))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'grid_size must be numeric'}), 400
+        if not 0.01 <= grid_size <= 1000:
+            return jsonify({'error': 'grid_size must be between 0.01 and 1000'}), 400
 
         if not path:
             return jsonify({'error': 'Path required'}), 400
@@ -841,25 +934,23 @@ def analysis_volume():
 
         z_min = z.min()
 
-        # Create 2D grid
+        # Create 2D grid — group points per cell and reduce with numpy instead
+        # of a Python loop over every point (ix/iy ≥ 0, so a flat key is safe).
         ix = ((x - x.min()) / grid_size).astype(int)
         iy = ((y - y.min()) / grid_size).astype(int)
 
-        from collections import defaultdict
-        grid = defaultdict(list)
-        for i in range(n):
-            grid[(ix[i], iy[i])].append(z[i])
+        keys = ix.astype(np.int64) * (np.int64(iy.max()) + 1) + iy
+        uniq, inv = np.unique(keys, return_inverse=True)
+        z_max_cells = np.full(len(uniq), -np.inf)
+        np.maximum.at(z_max_cells, inv, z)
 
         cell_area = grid_size * grid_size
-        volume = 0.0
-        for cell_z_vals in grid.values():
-            z_max_cell = max(cell_z_vals)
-            volume += (z_max_cell - z_min) * cell_area
+        volume = float(((z_max_cells - z_min) * cell_area).sum())
 
         return jsonify({
             'volume_m3': round(volume, 4),
             'grid_size': grid_size,
-            'num_cells': len(grid),
+            'num_cells': len(uniq),
             'z_range': [round(float(z_min), 4), round(float(z.max()), 4)],
         })
 
@@ -949,6 +1040,9 @@ def save_transformed():
         path = data.get('path', '')
         ox, oy, oz = data.get('ox', 0), data.get('oy', 0), data.get('oz', 0)
         rx, ry, rz = data.get('rx', 0), data.get('ry', 0), data.get('rz', 0)
+        # Viewer rotates the cloud about its centering offset (coordOffset) —
+        # see save_compare_b for the convention.
+        pivot = data.get('pivot')
 
         maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
         if not path or not os.path.realpath(path).startswith(maps_dir + os.sep):
@@ -957,25 +1051,28 @@ def save_transformed():
             return jsonify({'error': 'File not found'}), 404
 
         d = read_pointcloud(path)
+        if d.get('type') == 'gaussian':
+            return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                            'cannot be saved as LAS — a point cloud is required'}), 400
         x, y, z = d['x'].astype(np.float64), d['y'].astype(np.float64), d['z'].astype(np.float64)
 
         if rx != 0 or ry != 0 or rz != 0:
-            rx_r, ry_r, rz_r = np.radians(rx), np.radians(ry), np.radians(rz)
-            cx, sx = np.cos(rx_r), np.sin(rx_r)
-            cy, sy = np.cos(ry_r), np.sin(ry_r)
-            cz, sz = np.cos(rz_r), np.sin(rz_r)
-            Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-            Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-            R = Rz @ Ry @ Rx
-            pts = R @ np.vstack([x, y, z])
-            x, y, z = pts[0], pts[1], pts[2]
+            # Same convention as the viewer: P' = R_xyz·(P − c) + c + t
+            R = _euler_xyz_matrix(rx, ry, rz)
+            if pivot is not None:
+                px, py, pz = (float(pivot[0]), float(pivot[1]), float(pivot[2]))
+            elif len(x):
+                px = (float(x.min()) + float(x.max())) / 2.0
+                py = (float(y.min()) + float(y.max())) / 2.0
+                pz = (float(z.min()) + float(z.max())) / 2.0
+            else:
+                px = py = pz = 0.0
+            pts = R @ np.vstack([x - px, y - py, z - pz])
+            x, y, z = pts[0] + px, pts[1] + py, pts[2] + pz
 
         x += ox; y += oy; z += oz
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(maps_dir, f'{timestamp}_transformed')
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir, save_name = _make_save_dir(maps_dir, 'transformed')
         save_path = os.path.join(save_dir, 'map.las')
 
         n = len(x)
@@ -988,7 +1085,7 @@ def save_transformed():
             log.info(f"[Transform] {n} pts -> {save_path} "
                      f"T=({ox},{oy},{oz}) R=({rx},{ry},{rz})")
 
-        return jsonify({'path': save_path, 'points': n, 'name': f'{timestamp}_transformed'})
+        return jsonify({'path': save_path, 'points': n, 'name': save_name})
 
     except Exception as e:
         return _error_response(e, 'save_transformed')
@@ -999,16 +1096,16 @@ def save_transformed():
 # ══════════════════════════════════════════════════════
 
 def _rotation_matrix_to_euler(R):
-    """Convert 3x3 rotation matrix to Euler angles (degrees) in XYZ order."""
-    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-    singular = sy < 1e-6
-    if not singular:
-        rx = np.arctan2(R[2, 1], R[2, 2])
-        ry = np.arctan2(-R[2, 0], sy)
-        rz = np.arctan2(R[1, 0], R[0, 0])
+    """3x3 rotation matrix → Euler degrees for three.js order 'XYZ'
+    (R = Rx·Ry·Rz), so the values drop straight into object.rotation.
+    Mirrors THREE.Euler.setFromRotationMatrix."""
+    m13 = float(np.clip(R[0, 2], -1.0, 1.0))
+    ry = np.arcsin(m13)
+    if abs(m13) < 0.9999999:
+        rx = np.arctan2(-R[1, 2], R[2, 2])
+        rz = np.arctan2(-R[0, 1], R[0, 0])
     else:
-        rx = np.arctan2(-R[1, 2], R[1, 1])
-        ry = np.arctan2(-R[2, 0], sy)
+        rx = np.arctan2(R[2, 1], R[1, 1])
         rz = 0.0
     return np.degrees(rx), np.degrees(ry), np.degrees(rz)
 
@@ -1027,8 +1124,8 @@ def _icp(pts_a, pts_b, max_iter=50, tolerance=1e-6, max_distance=None):
     t_total = np.zeros(3)
     prev_error = np.inf
 
+    tree = cKDTree(pts_a)   # target never moves — build once, not per iteration
     for i in range(max_iter):
-        tree = cKDTree(pts_a)
         distances, indices = tree.query(src, k=1)
 
         # Filter by max correspondence distance
@@ -1099,9 +1196,14 @@ def analysis_icp():
                 max_distance = None
         downsample = float(data.get('downsample', 1.0))
 
-        # Initial pose from Compare panel sliders
+        # Initial pose from Compare panel sliders — in the VIEWER's convention:
+        # P' = R_xyz(init_r)·(P − pivot) + pivot + init_t, pivot = B's
+        # centering offset (see save_compare_b). The response (rotation,
+        # translation) is returned in the same convention so the client can
+        # apply it verbatim to the compare object.
         init_t = data.get('init_translation', [0, 0, 0])
         init_r = data.get('init_rotation', [0, 0, 0])
+        pivot = data.get('pivot')
 
         if not path_a or not path_b:
             return jsonify({'error': 'Both path_a and path_b required'}), 400
@@ -1119,27 +1221,27 @@ def analysis_icp():
         pts_a = np.column_stack([d_a['x'], d_a['y'], d_a['z']]).astype(np.float64)
         pts_b = np.column_stack([d_b['x'], d_b['y'], d_b['z']]).astype(np.float64)
 
-        # Apply initial pose to Map B before ICP
+        # Apply initial pose to Map B before ICP (viewer convention, see above)
         i_rx, i_ry, i_rz = float(init_r[0]), float(init_r[1]), float(init_r[2])
         i_tx, i_ty, i_tz = float(init_t[0]), float(init_t[1]), float(init_t[2])
+        t_init = np.array([i_tx, i_ty, i_tz])
+
+        if pivot is not None:
+            c_b = np.array([float(pivot[0]), float(pivot[1]), float(pivot[2])])
+        elif len(pts_b):
+            c_b = (pts_b.min(axis=0) + pts_b.max(axis=0)) / 2.0
+        else:
+            c_b = np.zeros(3)
 
         if i_rx != 0 or i_ry != 0 or i_rz != 0:
-            rx_r, ry_r, rz_r = np.radians(i_rx), np.radians(i_ry), np.radians(i_rz)
-            cx, sx = np.cos(rx_r), np.sin(rx_r)
-            cy, sy = np.cos(ry_r), np.sin(ry_r)
-            cz, sz = np.cos(rz_r), np.sin(rz_r)
-            Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-            Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-            R_init = Rz @ Ry @ Rx
-            pts_b = (R_init @ pts_b.T).T
+            R_init = _euler_xyz_matrix(i_rx, i_ry, i_rz)
+            pts_b = (R_init @ (pts_b - c_b).T).T + c_b
         else:
             R_init = np.eye(3)
+        pts_b = pts_b + t_init
 
-        pts_b[:, 0] += i_tx
-        pts_b[:, 1] += i_ty
-        pts_b[:, 2] += i_tz
-        t_init = np.array([i_tx, i_ty, i_tz])
+        # Absolute-frame equivalent (P' = R·P + t_abs) for composing with ICP
+        t_init_abs = t_init + c_b - R_init @ c_b
 
         # Optional downsampling for performance
         if 0 < downsample < 1.0:
@@ -1157,13 +1259,17 @@ def analysis_icp():
             tolerance=tolerance, max_distance=max_distance,
         )
 
-        # Combine: final = R_icp @ (R_init @ pt + t_init) + t_icp
-        #        = (R_icp @ R_init) @ pt + (R_icp @ t_init + t_icp)
+        # Compose in the absolute frame:
+        #   final = R_icp @ (R_init @ pt + t_init_abs) + t_icp
+        #         = (R_icp @ R_init) @ pt + (R_icp @ t_init_abs + t_icp)
         R_final = R_icp @ R_init
-        t_final = R_icp @ t_init + t_icp
+        t_final_abs = R_icp @ t_init_abs + t_icp
+
+        # Back to the viewer's pivot convention:
+        #   P' = R_final·(P − c_b) + c_b + t  ⇒  t = t_abs + R_final·c_b − c_b
+        t = t_final_abs + R_final @ c_b - c_b
 
         rx, ry, rz = _rotation_matrix_to_euler(R_final)
-        t = t_final
 
         log = current_app.config.get('LOGGER')
         if log:

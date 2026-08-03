@@ -37,5 +37,5 @@ export function initUI(viewer, legend, deps) {
     initFloatingPanel(deps, _uiState);
     initFileManagement(viewer, legend, deps, _uiState);
     initKeyboardShortcuts(viewer, legend, deps, _uiState);
-    initAnalysis(viewer, deps, _uiState);
+    initAnalysis(viewer, legend, deps, _uiState);
 }

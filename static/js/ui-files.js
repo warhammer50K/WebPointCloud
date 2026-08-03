@@ -4,12 +4,12 @@
    Compare Map Controls
    ═══════════════════════════════════════════════════════ */
 import { $, formatFileSize, formatDate, formatPoints } from './utils.js';
-import { showToast, customConfirm, showLoading, hideLoading, withLoading } from './ui-notifications.js';
+import { showToast, customConfirm, showLoading, hideLoading, updateLoading, withLoading } from './ui-notifications.js';
 import { appendLog } from './ui-panels.js';
 import { pollConvert } from './data.js';
 
 /** Conversion overlay label by phase. */
-function convLabel(name, pct, phase) {
+export function convLabel(name, pct, phase) {
     if (phase === 'reading') return `Reading ${name}…`;
     if (phase === 'building') return `Building octree… ${pct}%`;
     return `Converting ${name} to COPC… ${pct}%`;
@@ -21,7 +21,7 @@ function convLabel(name, pct, phase) {
  * converting to COPC, polls the job (reporting % via onConvertPct) first.
  * @returns {Promise<{bounds:Object, offsetZ:number, count:number, label:string}>}
  */
-async function dispatchLoad(viewer, data, onConvertPct) {
+export async function dispatchLoad(viewer, data, onConvertPct) {
     if (data.mode === 'converting') {
         const { meta, path } = await pollConvert(data.job, onConvertPct);
         viewer.loadCopc(meta, path);
@@ -79,7 +79,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         list.innerHTML = '<div style="color:var(--text-dim)">Loading...</div>';
         try {
             const resp = await fetch('/api/maps');
+            if (!resp.ok) throw new Error(`Failed to load map list (${resp.status})`);
             const maps = await resp.json();
+            if (!Array.isArray(maps)) throw new Error('Invalid map list response');
             list.innerHTML = '';
             if (maps.length === 0) {
                 list.innerHTML = '<div style="color:var(--text-dim)">No maps found. Place a LAS/LAZ/COPC file in the maps directory.</div>';
@@ -131,7 +133,23 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                             $('st-main').textContent = `Loading compare map: ${mapName}/${f}...`;
                             showLoading(`Loading compare map...`);
                             try {
-                                const data = await loadLasFromPath(fullPath);
+                                // COPC maps stream via LOD and have no whole-cloud
+                                // payload — ask for a bounded preview sample instead.
+                                const PREVIEW_PTS = 3_000_000;
+                                let data = await loadLasFromPath(fullPath, { previewPoints: PREVIEW_PTS });
+                                if (data.mode === 'converting') {
+                                    const { path: copcPath } = await pollConvert(data.job, (pct, phase) => {
+                                        updateLoading(convLabel(f, pct, phase));
+                                    });
+                                    updateLoading('Loading compare map...');
+                                    data = await loadLasFromPath(copcPath, { previewPoints: PREVIEW_PTS });
+                                }
+                                if (data.mode === 'copc' || data.mode === 'converting') {
+                                    throw new Error('Compare map is still streaming-only — try again');
+                                }
+                                if (data.type === 'gaussian') {
+                                    throw new Error('Gaussian splat files are not supported as a compare map');
+                                }
                                 viewer.loadCompareCloud(data);
                                 console.log('[Compare] After loadCompareCloud:',
                                     'pointCloud in scene:', viewer.pointCloud ? viewer.scene.children.includes(viewer.pointCloud) : false,
@@ -158,7 +176,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                         try {
                             const data = await loadLasFromPath(fullPath);
                             const info = await dispatchLoad(viewer, data, (pct, phase) => {
-                                showLoading(convLabel(f, pct, phase));
+                                updateLoading(convLabel(f, pct, phase));
                             });
                             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
                             $('compare-a-name').textContent = `${mapName}/${f}`;
@@ -188,6 +206,41 @@ export function initFileManagement(viewer, legend, deps, uiState) {
 
     // Expose refreshMapList for cross-module use
     uiState.refreshMapList = refreshMapList;
+
+    // ── Sidebar Files tab: saved map list ──
+    async function refreshSidebarMapList() {
+        const listEl = $('sidebar-map-list');
+        const emptyEl = $('map-list-empty');
+        if (!listEl) return;
+        try {
+            const resp = await fetch('/api/maps');
+            if (!resp.ok) throw new Error(`Failed to load map list (${resp.status})`);
+            const maps = await resp.json();
+            if (!Array.isArray(maps)) throw new Error('Invalid map list response');
+            listEl.innerHTML = '';
+            const withFiles = maps.filter(m => m.las_files && m.las_files.length > 0);
+            if (emptyEl) emptyEl.style.display = withFiles.length === 0 ? '' : 'none';
+            for (const m of withFiles) {
+                const item = document.createElement('div');
+                item.className = 'modal-item';
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'name';
+                nameSpan.textContent = m.name;
+                item.appendChild(nameSpan);
+                // Minimal behavior: open the Load modal to pick the file.
+                item.addEventListener('click', openModal);
+                listEl.appendChild(item);
+            }
+        } catch (err) {
+            listEl.innerHTML = '';
+            if (emptyEl) { emptyEl.style.display = ''; emptyEl.textContent = err.message; }
+        }
+    }
+    {
+        const refreshBtn = $('btn-refresh-maps');
+        if (refreshBtn) refreshBtn.addEventListener('click', refreshSidebarMapList);
+    }
+    refreshSidebarMapList();
 
     // 4A: Map search filter
     $('map-search').addEventListener('input', e => {
@@ -272,15 +325,19 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         dragCounter = 0;
         dropOverlay.style.display = 'none';
         const file = e.dataTransfer.files[0];
-        if (!file || !file.name.match(/\.(las|laz|ply|xyz|txt|csv|pcd|pts|splat)$/i)) return;
+        if (!file) return;
+        if (!file.name.match(/\.(las|laz|ply|xyz|txt|csv|pcd|pts|splat)$/i)) {
+            showToast(`Unsupported file type: ${file.name} (supported: las, laz, ply, xyz, txt, csv, pcd, pts, splat)`, 'warn');
+            return;
+        }
         $('st-main').textContent = `Loading ${file.name}...`;
         showLoading(`Loading ${file.name}...`);
         try {
             const data = await uploadLasFile(file, pct => {
-                showLoading(`Uploading ${file.name}… ${pct}%`);
+                updateLoading(`Uploading ${file.name}… ${pct}%`);
             });
             const info = await dispatchLoad(viewer, data, (pct, phase) => {
-                showLoading(convLabel(file.name, pct, phase));
+                updateLoading(convLabel(file.name, pct, phase));
             });
             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
             $('compare-a-name').textContent = file.name;
@@ -349,8 +406,13 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         });
         header.addEventListener('pointermove', e => {
             if (!dragging) return;
-            panel.style.left = (e.clientX - dx) + 'px';
-            panel.style.top = (e.clientY - dy) + 'px';
+            // Clamp so the panel can't be dragged fully off-screen (keep at
+            // least a grabbable sliver of the header visible).
+            const minVisible = 60;
+            const left = Math.min(Math.max(e.clientX - dx, minVisible - panel.offsetWidth), window.innerWidth - minVisible);
+            const top = Math.min(Math.max(e.clientY - dy, 0), window.innerHeight - 40);
+            panel.style.left = left + 'px';
+            panel.style.top = top + 'px';
         });
         header.addEventListener('pointerup', () => { dragging = false; });
     }
@@ -375,7 +437,11 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                 const resp = await fetch('/api/save_compare_b', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path_a: pathA || '', path_b: pathB, ox, oy, oz, rx, ry, rz }),
+                    body: JSON.stringify({
+                        path_a: pathA || '', path_b: pathB, ox, oy, oz, rx, ry, rz,
+                        // rotation pivot: B's centering offset (three.js local origin)
+                        pivot: viewer._compareOffset || undefined,
+                    }),
                 });
                 const result = await resp.json();
                 if (!resp.ok) throw new Error(result.error || 'Save failed');
@@ -431,6 +497,8 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                     downsample,
                     init_translation: [initOx, initOy, initOz],
                     init_rotation: [initRx, initRy, initRz],
+                    // rotation pivot: B's centering offset (three.js local origin)
+                    pivot: viewer._compareOffset || undefined,
                 }),
             });
             const result = await res.json();

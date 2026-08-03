@@ -21,6 +21,7 @@ import os
 import queue
 import contextlib
 import threading
+import uuid
 
 import numpy as np
 
@@ -62,40 +63,96 @@ def open_copc(path):
 
     realpath = os.path.realpath(path)
     mtime = os.path.getmtime(realpath)
+    evicted = []
+    is_owner = False
     with _readers_lock:
         entry = _readers.get(realpath)
-        if entry and entry['mtime'] == mtime:
-            return entry
+        if entry and entry['mtime'] != mtime:
+            # File replaced on disk: retire the stale entry like an eviction.
+            _readers.pop(realpath)
+            entry['stale'] = True
+            evicted.append(entry)
+            entry = None
+        if entry is None:
+            # Only a placeholder is registered under the lock — the actual
+            # open (~0.3s) and scale estimate (seconds) run OUTSIDE it, so
+            # concurrent opens of other files aren't serialized behind I/O.
+            # Late arrivals for the same path wait on 'ready' instead.
+            is_owner = True
+            entry = {
+                'realpath': realpath,
+                'mtime': mtime,
+                'ready': threading.Event(),  # set once reader/scales are filled in
+                'error': None,               # open failure, re-raised to waiters
+                'stale': False,              # evicted: close handles on return, not reuse
+                'lock': threading.Lock(),   # guards one-time octree build + pool growth
+                'reader_pool': queue.Queue(),  # idle CopcReader handles, borrowed per fetch
+                'pool_count': 0,            # handles created so far (≤ pool_max)
+                'pool_max': 16,             # cap concurrent handles (≈ server cores)
+                'thread_readers': [],       # all handles spawned (borrowed ones close lazily)
+            }
+            # Evict oldest if over capacity. Only mark it stale here; idle
+            # handles are closed outside the lock, and handles currently
+            # borrowed by other threads are closed when they're returned
+            # (see _borrow_reader) — never while a read is in flight.
+            if len(_readers) >= _CACHE_MAX:
+                old_key = next(iter(_readers))
+                old = _readers.pop(old_key)
+                old['stale'] = True
+                evicted.append(old)
+            _readers[realpath] = entry
 
+    for old in evicted:
+        _close_evicted(old)
+
+    if not is_owner:
+        entry['ready'].wait()
+        if entry['error'] is not None:
+            raise entry['error']
+        return entry
+
+    try:
         reader = CopcReader.open(open(realpath, 'rb'))
         dims = set(reader.header.point_format.dimension_names)
         has_rgb = {'red', 'green', 'blue'} <= dims
         intensity_max, rgb_scale = _estimate_norm_scales(reader, has_rgb)
+    except Exception as e:
+        entry['error'] = e
+        with _readers_lock:
+            if _readers.get(realpath) is entry:
+                del _readers[realpath]
+        entry['ready'].set()
+        raise
+    entry['reader'] = reader           # used only for header/octree build (single-threaded)
+    entry['has_rgb'] = has_rgb
+    entry['intensity_max'] = intensity_max
+    entry['rgb_scale'] = rgb_scale
+    entry['ready'].set()
+    return entry
 
-        entry = {
-            'reader': reader,           # used only for header/octree build (single-threaded)
-            'realpath': realpath,
-            'mtime': mtime,
-            'has_rgb': has_rgb,
-            'intensity_max': intensity_max,
-            'rgb_scale': rgb_scale,
-            'lock': threading.Lock(),   # guards one-time octree build + pool growth
-            'reader_pool': queue.Queue(),  # idle CopcReader handles, borrowed per fetch
-            'pool_count': 0,            # handles created so far (≤ pool_max)
-            'pool_max': 16,             # cap concurrent handles (≈ server cores)
-            'thread_readers': [],       # all handles spawned, so eviction can close them
-        }
-        # Evict oldest if over capacity (close every handle it opened).
-        if len(_readers) >= _CACHE_MAX:
-            old_key = next(iter(_readers))
-            old = _readers.pop(old_key)
-            for r in [old['reader'], *old.get('thread_readers', [])]:
-                try:
-                    r.close()
-                except Exception:
-                    pass
-        _readers[realpath] = entry
-        return entry
+
+def _close_evicted(old):
+    """Close an evicted entry's IDLE handles (the ones sitting in the pool).
+
+    Borrowed handles are mid-read on other threads — closing them here would
+    corrupt those reads, so _borrow_reader closes them on return via the
+    stale flag set at eviction time."""
+    pool = old.get('reader_pool')
+    while pool is not None:
+        try:
+            pool.get_nowait().close()
+        except queue.Empty:
+            break
+        except Exception:
+            pass
+    reader = old.get('reader')
+    if reader is not None:
+        # entry lock: don't yank the header reader out from under an octree build.
+        with old['lock']:
+            try:
+                reader.close()
+            except Exception:
+                pass
 
 
 @contextlib.contextmanager
@@ -127,7 +184,15 @@ def _borrow_reader(entry):
     try:
         yield reader
     finally:
-        pool.put(reader)
+        if entry.get('stale'):
+            # Entry was evicted while we were reading: close instead of
+            # returning to a pool nobody will drain again.
+            try:
+                reader.close()
+            except Exception:
+                pass
+        else:
+            pool.put(reader)
 
 
 def _estimate_norm_scales(reader, has_rgb):
@@ -152,6 +217,13 @@ def _estimate_norm_scales(reader, has_rgb):
     return intensity_max, rgb_scale
 
 
+# Paths whose octree warm-up thread is currently running — repeated meta
+# requests during a long build would otherwise pile up threads all blocking
+# on the same entry lock.
+_warming = set()
+_warming_lock = threading.Lock()
+
+
 def warm_octree_async(path):
     """Kick off the (one-time, ~seconds) octree build in the background.
 
@@ -159,12 +231,22 @@ def warm_octree_async(path):
     walk (tens of seconds on big files) while the user stares at an empty view.
     Calling this when meta is served — well before the client asks for the
     hierarchy — lets the build overlap the round-trip so it's usually cached by
-    the time it's needed. Safe to call repeatedly: _get_octree double-checks."""
+    the time it's needed. Safe to call repeatedly: a build already in progress
+    is skipped, and _get_octree double-checks the cache."""
+    key = os.path.realpath(path)
+    with _warming_lock:
+        if key in _warming:
+            return
+        _warming.add(key)
+
     def run():
         try:
             _get_octree(open_copc(path))
         except Exception:
             pass
+        finally:
+            with _warming_lock:
+                _warming.discard(key)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -347,6 +429,33 @@ def _pack_node_points(pts, entry, center):
     )
 
 
+def copc_preview_binary(path, max_points=3_000_000):
+    """Coarse whole-extent sample as ONE legacy viewer binary.
+
+    Walks octree levels top-down, keeping whole levels while the running total
+    fits max_points (level 0 is always included). The compare overlay renders
+    this as a static cloud — it needs full spatial coverage at bounded size,
+    not the streamed LOD."""
+    entry = open_copc(path)
+    octree = _get_octree(entry)
+    per_level = {}
+    for nd in octree.values():
+        if nd.point_count > 0:
+            per_level[nd.key.level] = per_level.get(nd.key.level, 0) + nd.point_count
+    total, max_level = 0, -1
+    for lvl in sorted(per_level):
+        if max_level >= 0 and total + per_level[lvl] > int(max_points):
+            break
+        total += per_level[lvl]
+        max_level = lvl
+    sel = [nd for nd in octree.values()
+           if nd.point_count > 0 and nd.key.level <= max_level]
+    with _borrow_reader(entry) as reader:  # pooled handle: no shared-seek race
+        pts = reader._fetch_and_decompress_points_of_nodes(sel)
+        center = reader.copc_info.center
+    return _pack_node_points(pts, entry, center)
+
+
 def copc_nodes_binary(path, keys):
     """Points for the requested node *keys* as one combined viewer binary."""
     entry = open_copc(path)
@@ -422,16 +531,25 @@ def ensure_copc(src_path, dst_path=None, progress=None):
     # check above, and two concurrent conversions would corrupt each other.
     # (.copc.laz suffix kept so PDAL's extension-based writer inference still
     # picks writers.copc for the temp output.)
-    tmp_path = f'{dst_path}.{os.getpid()}.tmp.copc.laz'
+    # pid alone collides when two threads of the same process convert the same
+    # source concurrently — add a random tail so each build gets its own temp.
+    tmp_path = f'{dst_path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp.copc.laz'
     try:
         # 1) PDAL CLI with writers.copc (PDAL >= 2.4)
+        converted = False
         if _pdal_has_copc_writer():
             import subprocess
-            subprocess.run(
-                ['pdal', 'translate', src_path, tmp_path, '--writers.copc'],
-                check=True, capture_output=True,
-            )
-        else:
+            try:
+                subprocess.run(
+                    ['pdal', 'translate', src_path, tmp_path, '-w', 'writers.copc'],
+                    check=True, capture_output=True,
+                )
+                converted = True
+            except subprocess.CalledProcessError:
+                # pdal accepted the drivers query but rejected the translate
+                # (arg parsing, version quirks) — fall through to copclib.
+                pass
+        if not converted:
             # 2) copclib octree builder (self-contained, bulk Unpack)
             try:
                 from tools.las_to_copc import las_to_copc

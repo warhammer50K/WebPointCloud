@@ -12,6 +12,11 @@ let srcScales     = null;  // Float32Array(n*3)
 let srcRotations  = null;  // Float32Array(n*4)
 let srcOpacities  = null;  // Float32Array(n)
 
+// Ping-pong output buffers: the main thread transfers the previous result's
+// arrays back ('recycle') so each sort reuses them instead of allocating
+// fresh n×14-float arrays.
+let spareBuffers = null;
+
 /**
  * Radix sort float32 depths (descending = back-to-front).
  * 4 passes × 8-bit buckets. ~15ms for 1M items.
@@ -62,9 +67,8 @@ function radixSortIndicesByDepth(depths, n) {
     return indices;
 }
 
-/** Reorder a Float32Array by sorted indices */
-function reorder(src, indices, n, itemSize) {
-    const dst = new Float32Array(n * itemSize);
+/** Reorder a Float32Array by sorted indices into dst */
+function reorder(src, dst, indices, n, itemSize) {
     for (let i = 0; i < n; i++) {
         const s = indices[i] * itemSize;
         const d = i * itemSize;
@@ -85,6 +89,19 @@ self.onmessage = function(e) {
         srcScales    = new Float32Array(e.data.scales);
         srcRotations = new Float32Array(e.data.rotations);
         srcOpacities = new Float32Array(e.data.opacities);
+        spareBuffers = null;   // sizes may have changed
+        return;
+    }
+
+    if (type === 'recycle') {
+        // Buffers returned by the main thread — reuse them for the next sort.
+        spareBuffers = {
+            positions: e.data.positions,
+            colors:    e.data.colors,
+            scales:    e.data.scales,
+            rotations: e.data.rotations,
+            opacities: e.data.opacities,
+        };
         return;
     }
 
@@ -105,12 +122,23 @@ self.onmessage = function(e) {
 
         const indices = radixSortIndicesByDepth(depths, n);
 
-        // Reorder all attribute arrays in this worker (off main thread)
-        const positions = reorder(srcPositions, indices, n, 3);
-        const colors    = reorder(srcColors, indices, n, 3);
-        const scales    = reorder(srcScales, indices, n, 3);
-        const rotations = reorder(srcRotations, indices, n, 4);
-        const opacities = reorder(srcOpacities, indices, n, 1);
+        // Reorder all attribute arrays in this worker (off main thread),
+        // reusing recycled output buffers when available (ping-pong).
+        const out = (spareBuffers && spareBuffers.positions.length === n * 3)
+            ? spareBuffers
+            : {
+                positions: new Float32Array(n * 3),
+                colors:    new Float32Array(n * 3),
+                scales:    new Float32Array(n * 3),
+                rotations: new Float32Array(n * 4),
+                opacities: new Float32Array(n),
+            };
+        spareBuffers = null;
+        const positions = reorder(srcPositions, out.positions, indices, n, 3);
+        const colors    = reorder(srcColors, out.colors, indices, n, 3);
+        const scales    = reorder(srcScales, out.scales, indices, n, 3);
+        const rotations = reorder(srcRotations, out.rotations, indices, n, 4);
+        const opacities = reorder(srcOpacities, out.opacities, indices, n, 1);
 
         self.postMessage(
             { positions, colors, scales, rotations, opacities },

@@ -158,8 +158,20 @@ export class GaussianSplat {
 
         this.viewer._dirty = true;
 
-        // If camera moved during sort, re-sort immediately
-        if (this._sortNeeded) {
+        // Ping-pong: hand the received buffers back to the worker for reuse,
+        // so each sort doesn't allocate + transfer fresh n×14-float arrays.
+        this.sortWorker.postMessage(
+            { type: 'recycle', positions: data.positions, colors: data.colors,
+              scales: data.scales, rotations: data.rotations, opacities: data.opacities },
+            [data.positions.buffer, data.colors.buffer, data.scales.buffer,
+             data.rotations.buffer, data.opacities.buffer]
+        );
+
+        // If camera moved during sort, re-sort — but honor SORT_INTERVAL.
+        // When the interval hasn't elapsed yet, update() (called every frame)
+        // re-dispatches once it has.
+        if (this._sortNeeded &&
+            (performance.now() - this._lastSortTime > this.SORT_INTERVAL)) {
             this._dispatchSort();
         }
     }

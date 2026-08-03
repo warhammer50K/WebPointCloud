@@ -96,6 +96,12 @@ function _nextWorker() {
 
 _createWorker();
 
+// Scale worker timeouts with payload size: 200ms per MB, 30s floor. Fixed
+// timeouts falsely killed large parses on slow machines.
+function _timeoutFor(byteLength) {
+    return Math.max(30000, Math.ceil(byteLength / (1 << 20)) * 200);
+}
+
 export function workerParseBinary(buffer) {
     if (_workerNotSupported) {
         alert('Web Workers are not supported in this browser. Point cloud processing is unavailable.');
@@ -107,7 +113,7 @@ export function workerParseBinary(buffer) {
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-        }, 10000);
+        }, _timeoutFor(buffer.byteLength));
         _workerCallbacks.set(id, { resolve, reject, timeout, worker });
         worker.postMessage({ id, type: 'binary', buffer }, [buffer]);
     });
@@ -122,21 +128,31 @@ export function workerParseMultiblob(buffer) {
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-        }, 15000);
+        }, _timeoutFor(buffer.byteLength));
         _workerCallbacks.set(id, { resolve, reject, timeout, worker });
         worker.postMessage({ id, type: 'copc-multiblob', buffer }, [buffer]);
     });
 }
 
-export async function loadLasFromPath(path) {
+export async function loadLasFromPath(path, opts = {}) {
+    // opts.previewPoints > 0 asks the server for a bounded raw payload even
+    // for COPC files (compare overlay) instead of streaming meta.
+    const body = { path };
+    if (opts.previewPoints > 0) body.preview_points = opts.previewPoints;
     const resp = await fetch('/api/load_pointcloud', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
+        body: JSON.stringify(body),
     });
     if (!resp.ok) {
-        const err = await resp.json();
-        throw new Error(err.error || 'Failed to load');
+        // Non-JSON error bodies (e.g. an HTML 5xx page) must not mask the failure
+        // with a SyntaxError — fall back to the HTTP status text.
+        let msg = resp.statusText || 'Failed to load';
+        try {
+            const err = await resp.json();
+            msg = err.error || msg;
+        } catch {}
+        throw new Error(msg);
     }
     // COPC maps respond with JSON — ready-to-stream meta, or a 202 "converting"
     // job to poll (large non-COPC maps convert in the background here too).
@@ -169,7 +185,10 @@ export async function uploadLasFile(file, onProgress) {
                 // Server percent-encodes the header (HTTP headers are latin-1;
                 // raw non-ASCII filenames would kill the response).
                 const rawSaved = xhr.getResponseHeader('X-Saved-Path');
-                const savedPath = rawSaved ? decodeURIComponent(rawSaved) : rawSaved;
+                let savedPath = rawSaved;
+                if (rawSaved) {
+                    try { savedPath = decodeURIComponent(rawSaved); } catch { savedPath = rawSaved; }
+                }
                 // COPC: server returns JSON — either ready-to-stream meta, or a
                 // 202 "converting" job to poll.
                 if (ct.includes('application/json')) {
@@ -230,7 +249,7 @@ export function workerFilterPoints(positions, intensities, colors, mvpMatrix, vi
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-        }, 10000);
+        }, _timeoutFor(positions.byteLength));
         _workerCallbacks.set(id, { resolve, reject, timeout, worker });
         worker.postMessage({
             id, type: 'filter',

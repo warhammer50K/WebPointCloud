@@ -72,6 +72,18 @@ if __name__ == '__main__':
     logger.info(f"  Log dir  : {config.LOG_DIR}")
     logger.info(f"  URL      : http://localhost:{config.WEB_PORT}")
     logger.info("═══════════════════════════════════════")
+    # Debug mode ships Werkzeug's interactive debugger — remote code execution
+    # for anyone who can reach the port — so never expose it beyond loopback
+    # unless explicitly opted in via WPC_ALLOW_REMOTE_DEBUG=1.
+    _host = '0.0.0.0'
+    if _is_debug:
+        if os.environ.get('WPC_ALLOW_REMOTE_DEBUG', '0') == '1':
+            logger.warning("FLASK_DEBUG=1 on 0.0.0.0 (WPC_ALLOW_REMOTE_DEBUG=1): "
+                           "Werkzeug debugger is RCE for anyone who can reach the port")
+        else:
+            _host = '127.0.0.1'
+            logger.warning("FLASK_DEBUG=1: forcing host to 127.0.0.1 "
+                           "(set WPC_ALLOW_REMOTE_DEBUG=1 to bind 0.0.0.0)")
     # threaded=True so COPC node fetches (many small concurrent requests while
     # streaming) are served in parallel instead of one-at-a-time.
-    app.run(host='0.0.0.0', port=config.WEB_PORT, debug=_is_debug, threaded=True)
+    app.run(host=_host, port=config.WEB_PORT, debug=_is_debug, threaded=True)

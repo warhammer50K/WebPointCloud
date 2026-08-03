@@ -397,7 +397,7 @@ export class Viewer {
             const s = t * t * (3 - 2 * t); // smoothstep
             this.camera.position.lerpVectors(a.startPos, a.targetPos, s);
             this.controls.target.lerpVectors(a.startTarget, a.targetTarget, s);
-            this.controls.update();
+            // (controls.update() runs once below for every frame — no extra call here)
             this._dirty = true;
             if (t >= 1) this._cameraAnim = null;
         }
@@ -925,21 +925,43 @@ export class Viewer {
         }
     }
 
+    // Geometry over the kfrm backing arrays (which carry spare capacity);
+    // drawRange limits rendering to the valid prefix.
+    _buildKfrmGeometry(count) {
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute('position', new THREE.BufferAttribute(this._kfrmPositions, 3));
+        geom.setAttribute('intensity', new THREE.BufferAttribute(this._kfrmIntensities, 1));
+        geom.setAttribute('rgb', new THREE.BufferAttribute(this._kfrmColors, 3));
+        geom.setAttribute('classification', new THREE.BufferAttribute(this._kfrmClassifications, 1));
+        geom.setDrawRange(0, count);
+        return geom;
+    }
+
     _appendKfrmCloud(data) {
         // merge into a single geometry instead of individual clouds (1 draw call)
         const n = data.numPoints;
         if (n <= 0) return;
 
         const MAX_KFRM_PTS = 3_000_000; // GUI accumulated point limit
+        // sources without classification render as class 0 (matches _buildGeometry)
+        const cls = (data.classifications && data.classifications.length === n)
+            ? data.classifications : null;
 
         if (!this._kfrmMergedCloud) {
-            // first time: create new merged cloud
-            this._kfrmPositions = new Float32Array(data.positions);
-            this._kfrmIntensities = new Float32Array(data.intensities);
-            this._kfrmColors = new Float32Array(data.colors);
+            // first time: allocate with spare capacity so appends are incremental
+            const capacity = Math.ceil(n * 1.5);
+            this._kfrmCapacity = capacity;
+            this._kfrmPositions = new Float32Array(capacity * 3);
+            this._kfrmPositions.set(data.positions);
+            this._kfrmIntensities = new Float32Array(capacity);
+            this._kfrmIntensities.set(data.intensities);
+            this._kfrmColors = new Float32Array(capacity * 3);
+            this._kfrmColors.set(data.colors);
+            this._kfrmClassifications = new Float32Array(capacity);
+            if (cls) this._kfrmClassifications.set(cls);
             this._kfrmCount = n;
 
-            const geom = this._buildGeometry(data);
+            const geom = this._buildKfrmGeometry(n);
             const mat = this._makeMaterial();
             this._kfrmMergedCloud = new THREE.Points(geom, mat);
             this._kfrmMergedCloud.frustumCulled = false;
@@ -948,57 +970,64 @@ export class Viewer {
             this.scene.add(this._kfrmMergedCloud);
             this.kfrmClouds = [this._kfrmMergedCloud];
         } else {
-            // downsample existing data by half when exceeding limit
+            // downsample existing data by half (in place) when exceeding limit
             if (this._kfrmCount + n > MAX_KFRM_PTS) {
                 const half = Math.ceil(this._kfrmCount / 2);
-                const tPos = new Float32Array(half * 3);
-                const tInt = new Float32Array(half);
-                const tCol = new Float32Array(half * 3);
                 for (let i = 0, j = 0; j < half; i += 2, j++) {
                     const i3 = i * 3, j3 = j * 3;
-                    tPos[j3] = this._kfrmPositions[i3];
-                    tPos[j3+1] = this._kfrmPositions[i3+1];
-                    tPos[j3+2] = this._kfrmPositions[i3+2];
-                    tInt[j] = this._kfrmIntensities[i];
-                    tCol[j3] = this._kfrmColors[i3];
-                    tCol[j3+1] = this._kfrmColors[i3+1];
-                    tCol[j3+2] = this._kfrmColors[i3+2];
+                    this._kfrmPositions[j3] = this._kfrmPositions[i3];
+                    this._kfrmPositions[j3+1] = this._kfrmPositions[i3+1];
+                    this._kfrmPositions[j3+2] = this._kfrmPositions[i3+2];
+                    this._kfrmIntensities[j] = this._kfrmIntensities[i];
+                    this._kfrmColors[j3] = this._kfrmColors[i3];
+                    this._kfrmColors[j3+1] = this._kfrmColors[i3+1];
+                    this._kfrmColors[j3+2] = this._kfrmColors[i3+2];
+                    this._kfrmClassifications[j] = this._kfrmClassifications[i];
                 }
-                this._kfrmPositions = tPos;
-                this._kfrmIntensities = tInt;
-                this._kfrmColors = tCol;
                 this._kfrmCount = half;
             }
 
-            // append to existing merged geometry
             const oldCount = this._kfrmCount;
             const newCount = oldCount + n;
+            let rebuilt = false;
 
-            const newPos = new Float32Array(newCount * 3);
-            const newInt = new Float32Array(newCount);
-            const newCol = new Float32Array(newCount * 3);
+            // grow backing arrays (1.5×) only when capacity is exceeded
+            if (newCount > this._kfrmCapacity) {
+                const capacity = Math.ceil(newCount * 1.5);
+                const grow = (src, comps) => {
+                    const dst = new Float32Array(capacity * comps);
+                    dst.set(src.subarray(0, oldCount * comps));
+                    return dst;
+                };
+                this._kfrmPositions = grow(this._kfrmPositions, 3);
+                this._kfrmIntensities = grow(this._kfrmIntensities, 1);
+                this._kfrmColors = grow(this._kfrmColors, 3);
+                this._kfrmClassifications = grow(this._kfrmClassifications, 1);
+                this._kfrmCapacity = capacity;
+                rebuilt = true;
+            }
 
-            newPos.set(this._kfrmPositions);
-            newPos.set(data.positions, oldCount * 3);
-            newInt.set(this._kfrmIntensities);
-            newInt.set(data.intensities, oldCount);
-            newCol.set(this._kfrmColors);
-            newCol.set(data.colors, oldCount * 3);
-
-            this._kfrmPositions = newPos;
-            this._kfrmIntensities = newInt;
-            this._kfrmColors = newCol;
+            this._kfrmPositions.set(data.positions, oldCount * 3);
+            this._kfrmIntensities.set(data.intensities, oldCount);
+            this._kfrmColors.set(data.colors, oldCount * 3);
+            if (cls) this._kfrmClassifications.set(cls, oldCount);
+            else this._kfrmClassifications.fill(0, oldCount, newCount);
             this._kfrmCount = newCount;
 
-            // replace geometry
-            const oldGeom = this._kfrmMergedCloud.geometry;
-            const geom = new THREE.BufferGeometry();
-            geom.setAttribute('position', new THREE.BufferAttribute(newPos, 3));
-            geom.setAttribute('intensity', new THREE.BufferAttribute(newInt, 1));
-            geom.setAttribute('rgb', new THREE.BufferAttribute(newCol, 3));
-            geom.setDrawRange(0, newCount);
-            this._kfrmMergedCloud.geometry = geom;
-            oldGeom.dispose();
+            if (rebuilt) {
+                // capacity exceeded: rebuild geometry over the new backing arrays
+                const oldGeom = this._kfrmMergedCloud.geometry;
+                this._kfrmMergedCloud.geometry = this._buildKfrmGeometry(newCount);
+                oldGeom.dispose();
+            } else {
+                // in-place append: just re-upload buffers and extend the draw range
+                const geom = this._kfrmMergedCloud.geometry;
+                geom.getAttribute('position').needsUpdate = true;
+                geom.getAttribute('intensity').needsUpdate = true;
+                geom.getAttribute('rgb').needsUpdate = true;
+                geom.getAttribute('classification').needsUpdate = true;
+                geom.setDrawRange(0, newCount);
+            }
         }
         this._dirty = true;
     }
@@ -1013,7 +1042,9 @@ export class Viewer {
         this._kfrmPositions = null;
         this._kfrmIntensities = null;
         this._kfrmColors = null;
+        this._kfrmClassifications = null;
         this._kfrmCount = 0;
+        this._kfrmCapacity = 0;
         this.kfrmClouds.length = 0;
         this.clearTrajectory();
         this._dirty = true;
@@ -1038,11 +1069,15 @@ export class Viewer {
         }
 
         document.getElementById('no-data-msg').style.display = 'none';
-        if (!this.bounds) {
-            this.bounds = data.bounds;
-            this._fitCamera();
-        } else {
-            this._expandBounds(data.bounds);
+        // Empty frames carry ±Infinity bounds — adopting them poisons the camera with NaN
+        const validBounds = data.numPoints > 0 && data.bounds && isFinite(data.bounds.xMin);
+        if (validBounds) {
+            if (!this.bounds) {
+                this.bounds = data.bounds;
+                this._fitCamera();
+            } else {
+                this._expandBounds(data.bounds);
+            }
         }
 
         let total = 0;
@@ -1112,6 +1147,7 @@ export class Viewer {
         if (layer === 'map') {
             if (this.pointCloud) { this.pointCloud.visible = show; }
             if (this.mapCloud) { this.mapCloud.visible = show; }
+            if (this.copcManager && this.copcManager.lodGroup) { this.copcManager.lodGroup.visible = show; }
         } else if (layer === 'kfrm') {
             this.kfrmClouds.forEach(c => { c.visible = show; });
         } else {
@@ -1220,9 +1256,14 @@ export class Viewer {
     /* ── Constraint Graph ── */
     addConstraintEdge(id0, id1, src, score, err) {
         const edge = { id0: parseInt(id0), id1: parseInt(id1), src, score: parseFloat(score), err: parseFloat(err) };
-        // S-4: cap at 50000 edges — remove oldest when limit reached
+        // S-4: cap at 50000 edges — batch-drop the oldest 10% when the limit is
+        // reached (one splice + one rebuild, instead of a per-append shift that
+        // also left stale edges in the filtered list / GPU buffer).
         if (this._constraintEdgesAll.length >= 50000) {
-            this._constraintEdgesAll.shift();
+            const removed = this._constraintEdgesAll.splice(0, Math.ceil(this._constraintEdgesAll.length * 0.1));
+            const removedSet = new Set(removed);
+            this._constraintEdges = this._constraintEdges.filter(e => !removedSet.has(e));
+            this._rebuildConstraintGraph();
         }
         this._constraintEdgesAll.push(edge);
         // Try incremental append if filter passes
@@ -1239,8 +1280,8 @@ export class Viewer {
 
         const idx = this._constraintDrawCount;
         if (idx >= this._cgBufCapacity) {
-            // Buffer overflow — grow and rebuild
-            this._cgBufCapacity *= 2;
+            // Buffer full — rebuild reallocates from _constraintEdges.length
+            // (the new edge is already in the list, so it gets drawn too)
             this._rebuildConstraintGraph();
             return;
         }
@@ -1285,6 +1326,10 @@ export class Viewer {
         this._kfTooltip.style.display = 'none';
         this.container.appendChild(this._kfTooltip);
 
+        // Reused per-mousemove scratch objects (avoid per-event allocation)
+        this._kfRaycaster = new THREE.Raycaster();
+        this._kfMouse = new THREE.Vector2();
+
         let lastHoverTime = 0;
         this.renderer.domElement.addEventListener('mousemove', e => {
             const now = performance.now();
@@ -1303,11 +1348,11 @@ export class Viewer {
             return;
         }
         const rect = this.renderer.domElement.getBoundingClientRect();
-        const mouse = new THREE.Vector2(
+        const mouse = this._kfMouse.set(
             ((e.clientX - rect.left) / rect.width) * 2 - 1,
             -((e.clientY - rect.top) / rect.height) * 2 + 1
         );
-        const raycaster = new THREE.Raycaster();
+        const raycaster = this._kfRaycaster;
         raycaster.params.Points.threshold = Math.max(0.5, this.pointSize * 8);
         raycaster.setFromCamera(mouse, this.camera);
         const hits = raycaster.intersectObject(this._kfMarkers);
@@ -1376,10 +1421,16 @@ export class Viewer {
     }
 
     _clearKfHover() {
+        // Only re-render when a tooltip/highlight was actually showing — otherwise
+        // every throttled mousemove would redraw the whole scene for nothing.
+        const wasActive =
+            (this._kfTooltip && this._kfTooltip.style.display !== 'none') ||
+            (this._kfHighlight && this._kfHighlight.visible) ||
+            !!this._kfHoverLines;
         if (this._kfTooltip) this._kfTooltip.style.display = 'none';
         if (this._kfHighlight) this._kfHighlight.visible = false;
         this._clearKfHoverLines();
-        this._dirty = true;
+        if (wasActive) this._dirty = true;
     }
 
     _clearKfHoverLines() {
@@ -1437,6 +1488,9 @@ export class Viewer {
         this.clearKfrmClouds();
         this.clearConstraintGraph();
         this.clearKfMarkers();
+        this.clearCopc();
+        this.clearGaussianSplat();
+        this.clearCompare();
     }
 
     clearKfMarkers() {
@@ -1596,6 +1650,7 @@ export class Viewer {
 
     updateStats() {
         const el = document.getElementById('viewer-stats');
+        if (!el) return;
         if (!this.bounds) { el.style.display = 'none'; return; }
         const b = this.bounds;
         let total = 0;
@@ -1727,6 +1782,8 @@ export class Viewer {
 
         const show = this.grid.visible;
         this.scene.remove(this.grid);
+        this.grid.geometry.dispose();
+        this.grid.material.dispose();
         this.grid = this._makeGrid(gridSize, divisions, cx, cy);
         this.grid.visible = show;
         this.scene.add(this.grid);

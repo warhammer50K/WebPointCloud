@@ -10,11 +10,16 @@ export function initPostProcessing(viewer, w, h) {
     const rw = Math.floor(w * dpr);
     const rh = Math.floor(h * dpr);
 
+    // WebGL2: multisample the scene target so enabling post-processing doesn't
+    // lose the canvas MSAA (r160 resolves color+depth into the depth texture).
+    const samples = viewer.renderer.capabilities.isWebGL2 ? 4 : 0;
+
     viewer._rt = new THREE.WebGLRenderTarget(rw, rh, {
         minFilter: THREE.NearestFilter,
         magFilter: THREE.NearestFilter,
         depthBuffer: true,
         depthTexture: new THREE.DepthTexture(rw, rh, THREE.UnsignedIntType),
+        samples,
     });
 
     viewer._postScene = new THREE.Scene();

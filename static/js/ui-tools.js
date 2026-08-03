@@ -15,7 +15,13 @@ export function initToolControls(viewer, legend, deps, uiState) {
 
     // ── Point info, Measure, Polygon Select & Screenshot ──
     $('ckb-point-info').addEventListener('change', e => viewer.enablePointInfo(e.target.checked));
-    $('ckb-measure').addEventListener('change', e => viewer.enableMeasureMode(e.target.checked));
+    $('ckb-measure').addEventListener('change', e => {
+        viewer.enableMeasureMode(e.target.checked);
+        if (e.target.checked) {
+            $('ckb-poly-select').checked = false;
+            viewer.enablePolySelect(false);
+        }
+    });
     $('ckb-poly-select').addEventListener('change', e => {
         viewer.enablePolySelect(e.target.checked);
         if (e.target.checked) {
@@ -53,6 +59,20 @@ export function initToolControls(viewer, legend, deps, uiState) {
         }
     });
     $('btn-screenshot').addEventListener('click', () => viewer.takeScreenshot());
+
+    // Fullscreen toggle (header)
+    {
+        const fsBtn = $('btn-fullscreen');
+        if (fsBtn) {
+            fsBtn.addEventListener('click', () => {
+                if (document.fullscreenElement) {
+                    document.exitFullscreen();
+                } else {
+                    document.documentElement.requestFullscreen();
+                }
+            });
+        }
+    }
 
     // 3A: Undo/Redo buttons
     $('btn-undo').addEventListener('click', () => viewer.undoFilter());
