@@ -103,9 +103,18 @@ export function initViewControls(viewer, legend, deps, uiState) {
     $('spb-clip-y-max').addEventListener('change', updateClipY);
 
     // ── Camera Bookmarks ──
+    // Corrupt localStorage JSON must not break init: drop the key and start fresh.
+    function _loadBookmarks() {
+        try {
+            return JSON.parse(safeGetItem('wpc_bookmarks', '{}') || '{}');
+        } catch {
+            try { localStorage.removeItem('wpc_bookmarks'); } catch {}
+            return {};
+        }
+    }
     function _refreshBookmarks() {
         const sel = $('sel-bookmark');
-        const bookmarks = JSON.parse(safeGetItem('wpc_bookmarks', '{}') || '{}');
+        const bookmarks = _loadBookmarks();
         sel.innerHTML = '<option value="">-</option>';
         for (const name of Object.keys(bookmarks)) {
             sel.add(new Option(name, name));
@@ -115,14 +124,14 @@ export function initViewControls(viewer, legend, deps, uiState) {
     $('sel-bookmark').addEventListener('change', e => {
         const name = e.target.value;
         if (!name) { return; }
-        const bookmarks = JSON.parse(safeGetItem('wpc_bookmarks', '{}') || '{}');
+        const bookmarks = _loadBookmarks();
         if (bookmarks[name]) { viewer.loadCameraBookmark(bookmarks[name]); }
     });
     $('btn-bm-save').addEventListener('click', async () => {
         const name = await customPrompt('Bookmark name:', `BM${Date.now() % 10000}`);
         if (!name) { return; }
         const bm = viewer.saveCameraBookmark(name);
-        const bookmarks = JSON.parse(safeGetItem('wpc_bookmarks', '{}') || '{}');
+        const bookmarks = _loadBookmarks();
         bookmarks[name] = bm;
         safeSetItem('wpc_bookmarks', JSON.stringify(bookmarks));
         _refreshBookmarks();
@@ -132,7 +141,7 @@ export function initViewControls(viewer, legend, deps, uiState) {
     $('btn-bm-del').addEventListener('click', () => {
         const name = $('sel-bookmark').value;
         if (!name) { return; }
-        const bookmarks = JSON.parse(safeGetItem('wpc_bookmarks', '{}') || '{}');
+        const bookmarks = _loadBookmarks();
         delete bookmarks[name];
         safeSetItem('wpc_bookmarks', JSON.stringify(bookmarks));
         _refreshBookmarks();

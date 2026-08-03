@@ -24,8 +24,10 @@ window.showToast = showToast;
 // Low resolution auto point size adjustment
 if (window.innerWidth <= 1280 || window.innerHeight <= 720) {
     viewer.setPointSize(0.3);
-    const spb = document.getElementById('spb-pt-size');
-    if (spb) { spb.value = '0.3'; }
+    const slider = document.getElementById('pt-size-slider');
+    const spin = document.getElementById('pt-size-spin');
+    if (slider) { slider.value = '0.3'; }
+    if (spin) { spin.value = '0.3'; }
 }
 
 appendLog('WebPointCloud initialized', 'info');

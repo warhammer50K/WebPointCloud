@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════
    Analysis: SOR, Statistics, Cross-Section, Volume, C2C
    ═══════════════════════════════════════════════════════ */
-import { showToast, showLoading, hideLoading } from './ui-notifications.js';
+import { showToast, showLoading, hideLoading, updateLoading } from './ui-notifications.js';
 import { appendLog } from './ui-panels.js';
 import { $ } from './utils.js';
 import { dispatchLoad, convLabel } from './ui-files.js';
@@ -31,7 +31,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
         try {
             const data = await deps.loadLasFromPath(savedPath);
             const info = await dispatchLoad(viewer, data, (pct, phase) => {
-                showLoading(convLabel(name, pct, phase));
+                updateLoading(convLabel(name, pct, phase));
             });
             if (legend) legend.update(viewer.colorMode, info.bounds, info.offsetZ);
             setCurrentPath(savedPath);

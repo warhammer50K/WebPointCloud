@@ -676,6 +676,7 @@ def _read_pcd(path):
         if not counts:
             counts = [1] * len(fields)
 
+        struct_raw = None   # structured array (binary mode) for bit-exact field reads
         if data_mode == 'ascii':
             raw = np.loadtxt(f, max_rows=n)
             if raw.ndim == 1:
@@ -694,12 +695,16 @@ def _read_pcd(path):
             data_raw = np.frombuffer(f.read(n * np_dtype.itemsize), dtype=np_dtype, count=n)
             # Flatten to column array
             expanded_fields = []
+            expanded_types = []
             for i, field in enumerate(fields):
                 c = counts[i]
                 for ci in range(c):
                     expanded_fields.append(field if c == 1 else f'{field}_{ci}')
+                    expanded_types.append(types[i])
             raw = np.column_stack([data_raw[name].astype(np.float64) for name in [d[0] for d in dt_list]])
             fields = expanded_fields
+            types = expanded_types
+            struct_raw = data_raw
         else:
             raise ValueError(f'Unsupported PCD data mode: {data_mode}')
 
@@ -720,13 +725,30 @@ def _read_pcd(path):
 
     n = len(x)
 
-    # Handle packed RGB field (common in PCL)
-    rgb_packed = _col(['rgb', 'rgba'])
-    if rgb_packed is not None:
-        rgb_int = rgb_packed.view(np.int32)
-        r = ((rgb_int >> 16) & 0xFF).astype(np.float32) / 255.0
-        g = ((rgb_int >> 8) & 0xFF).astype(np.float32) / 255.0
-        b = (rgb_int & 0xFF).astype(np.float32) / 255.0
+    # Handle packed RGB field (common in PCL). The color lives in the field's
+    # raw BITS (float32 bits = 0x00RRGGBB / 0xAARRGGBB), so read it bit-exact:
+    # a value-based float64 round trip reinterprets TYPE U integers as the
+    # wrong bits and can mangle F4 NaN-pattern payloads (alpha=255 → 0xFFxxxxxx).
+    rgb_bits = None
+    for name in ('rgb', 'rgba'):
+        if name not in fields:
+            continue
+        idx = fields.index(name)
+        tchar = types[idx] if idx < len(types) else 'F'
+        if struct_raw is not None:
+            # binary: reinterpret the stored 4 bytes directly (F4/U4/I4 alike)
+            rgb_bits = struct_raw[name].view(np.uint32)
+        elif idx < raw.shape[1]:
+            # ascii: the text held the float's decimal form (F) or the integer (U/I)
+            if tchar == 'F':
+                rgb_bits = raw[:, idx].astype(np.float32).view(np.uint32)
+            else:
+                rgb_bits = raw[:, idx].astype(np.int64).astype(np.uint32)
+        break
+    if rgb_bits is not None:
+        r = ((rgb_bits >> 16) & 0xFF).astype(np.float32) / 255.0
+        g = ((rgb_bits >> 8) & 0xFF).astype(np.float32) / 255.0
+        b = (rgb_bits & 0xFF).astype(np.float32) / 255.0
         has_rgb = True
     else:
         r_raw = _col(['r', 'red'])

@@ -96,6 +96,12 @@ function _nextWorker() {
 
 _createWorker();
 
+// Scale worker timeouts with payload size: 200ms per MB, 30s floor. Fixed
+// timeouts falsely killed large parses on slow machines.
+function _timeoutFor(byteLength) {
+    return Math.max(30000, Math.ceil(byteLength / (1 << 20)) * 200);
+}
+
 export function workerParseBinary(buffer) {
     if (_workerNotSupported) {
         alert('Web Workers are not supported in this browser. Point cloud processing is unavailable.');
@@ -107,7 +113,7 @@ export function workerParseBinary(buffer) {
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-        }, 10000);
+        }, _timeoutFor(buffer.byteLength));
         _workerCallbacks.set(id, { resolve, reject, timeout, worker });
         worker.postMessage({ id, type: 'binary', buffer }, [buffer]);
     });
@@ -122,7 +128,7 @@ export function workerParseMultiblob(buffer) {
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-        }, 15000);
+        }, _timeoutFor(buffer.byteLength));
         _workerCallbacks.set(id, { resolve, reject, timeout, worker });
         worker.postMessage({ id, type: 'copc-multiblob', buffer }, [buffer]);
     });
@@ -234,7 +240,7 @@ export function workerFilterPoints(positions, intensities, colors, mvpMatrix, vi
         const timeout = setTimeout(() => {
             _workerCallbacks.delete(id);
             reject(new Error('Worker request timed out'));
-        }, 10000);
+        }, _timeoutFor(positions.byteLength));
         _workerCallbacks.set(id, { resolve, reject, timeout, worker });
         worker.postMessage({
             id, type: 'filter',

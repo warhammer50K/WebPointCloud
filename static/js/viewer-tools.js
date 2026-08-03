@@ -469,6 +469,7 @@ export async function applyPolyFilter(viewer, keep) {
     }
 
     clearPolySelect(viewer);
+    updateUndoRedoButtons(viewer);
 
     // P1-1: recalculate bounds after filtering
     viewer._recalcBounds();
@@ -493,8 +494,10 @@ export async function applyPolyFilter(viewer, keep) {
 export function initUndoRedo(viewer) {
     document.addEventListener('keydown', e => {
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
-        if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undoFilter(viewer); }
-        if ((e.ctrlKey || e.metaKey) && (e.key === 'Z' || (e.key === 'z' && e.shiftKey))) { e.preventDefault(); redoFilter(viewer); }
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+            e.preventDefault();
+            if (e.shiftKey) redoFilter(viewer); else undoFilter(viewer);
+        }
     });
 }
 

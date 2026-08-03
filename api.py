@@ -34,11 +34,18 @@ def _get_map_lock(map_name: str) -> threading.Lock:
 
 
 # ── JSON Content-Type validation ───────────────────
+# JSON bodies are small control payloads; cap them well below MAX_CONTENT_LENGTH
+# (sized for file uploads) so a hostile 5GB JSON body can't exhaust memory.
+_MAX_JSON_BYTES = 64 * 1024 * 1024
+
+
 def _require_json():
-    """Return a 415 error response if the request Content-Type is not JSON, else None."""
+    """Return a 415/413 error response if the request isn't acceptable JSON, else None."""
     ct = request.content_type or ''
     if not ct.startswith('application/json'):
         return jsonify({'error': 'Content-Type must be application/json'}), 415
+    if (request.content_length or 0) > _MAX_JSON_BYTES:
+        return jsonify({'error': 'JSON body too large'}), 413
     return None
 
 
@@ -178,9 +185,12 @@ def rename_map(name):
 # ══════════════════════════════════════════════════════
 def _upload_tmp_dir():
     """Temp dir for drag&drop uploads — outside the maps tree so dropped files
-    never accumulate as multi-GB copies there (cleared on reboot anyway)."""
-    d = os.path.join(tempfile.gettempdir(), 'webpc_uploads')
-    os.makedirs(d, exist_ok=True)
+    never accumulate as multi-GB copies there. Lives under DATA_DIR (mode 0700),
+    not a predictable world-writable /tmp name another local user could
+    pre-create and control."""
+    import config
+    d = os.path.join(config.DATA_DIR, 'uploads')
+    os.makedirs(d, mode=0o700, exist_ok=True)
     return d
 
 
@@ -212,8 +222,8 @@ def load_pointcloud():
             orig_name = f.filename or 'upload.las'
             suffix = os.path.splitext(orig_name)[1].lower() or '.las'
             # Drag&drop only gives us the bytes, so dropped files are uploaded to
-            # an OS temp dir (NOT under the maps tree) and removed once the COPC
-            # exists — no multi-GB copy accumulates. See _upload_tmp_dir().
+            # a private temp dir (NOT under the maps tree) and removed once the
+            # COPC exists — no multi-GB copy accumulates. See _upload_tmp_dir().
             upload_dir = _upload_tmp_dir()
             # Fail clearly (not a generic 500 mid-write) if the disk can't hold it.
             need = request.content_length or 0
@@ -504,6 +514,9 @@ def save_compare_b():
 
         # ── Read Map B and apply transform ──
         d_b = read_pointcloud(path_b)
+        if d_b.get('type') == 'gaussian':
+            return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                            'cannot be merged — a point cloud is required'}), 400
         bx, by, bz = d_b['x'].astype(np.float64), d_b['y'].astype(np.float64), d_b['z'].astype(np.float64)
 
         if rx != 0 or ry != 0 or rz != 0:
@@ -529,6 +542,9 @@ def save_compare_b():
         # ── Read Map A ──
         if path_a:
             d_a = read_pointcloud(path_a)
+            if d_a.get('type') == 'gaussian':
+                return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                                'cannot be merged — a point cloud is required'}), 400
             ax, ay, az = d_a['x'].astype(np.float64), d_a['y'].astype(np.float64), d_a['z'].astype(np.float64)
             a_intensity = d_a['intensity']
             a_r, a_g, a_b = d_a['r'], d_a['g'], d_a['b']
@@ -727,8 +743,15 @@ def analysis_sor():
 
         data = request.json
         path = data.get('path', '')
-        k = data.get('k', 20)
-        std_ratio = data.get('std_ratio', 2.0)
+        try:
+            k = int(data.get('k', 20))
+            std_ratio = float(data.get('std_ratio', 2.0))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'k and std_ratio must be numeric'}), 400
+        if not 1 <= k <= 200:
+            return jsonify({'error': 'k must be between 1 and 200'}), 400
+        if not std_ratio > 0:
+            return jsonify({'error': 'std_ratio must be > 0'}), 400
 
         if not path:
             return jsonify({'error': 'Path required'}), 400
@@ -742,6 +765,9 @@ def analysis_sor():
         from scipy.spatial import cKDTree
 
         pc = read_pointcloud(path)
+        if pc.get('type') == 'gaussian':
+            return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                            'are not supported for SOR — a point cloud is required'}), 400
         x, y, z = pc['x'].astype(np.float64), pc['y'].astype(np.float64), pc['z'].astype(np.float64)
         n = len(x)
 
@@ -806,7 +832,12 @@ def analysis_cross_section():
         path = data.get('path', '')
         axis = data.get('axis', 'z')  # 'x', 'y', or 'z'
         center = data.get('center', 0.0)
-        thickness = data.get('thickness', 1.0)
+        try:
+            thickness = float(data.get('thickness', 1.0))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'thickness must be numeric'}), 400
+        if not thickness > 0:
+            return jsonify({'error': 'thickness must be > 0'}), 400
 
         if not path:
             return jsonify({'error': 'Path required'}), 400
@@ -820,6 +851,9 @@ def analysis_cross_section():
             return jsonify({'error': 'File not found'}), 404
 
         pc = read_pointcloud(path)
+        if pc.get('type') == 'gaussian':
+            return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                            'are not supported for cross-section — a point cloud is required'}), 400
         x, y, z = pc['x'].astype(np.float64), pc['y'].astype(np.float64), pc['z'].astype(np.float64)
 
         axis_data = {'x': x, 'y': y, 'z': z}[axis]
@@ -868,7 +902,12 @@ def analysis_volume():
 
         data = request.json
         path = data.get('path', '')
-        grid_size = data.get('grid_size', 0.5)
+        try:
+            grid_size = float(data.get('grid_size', 0.5))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'grid_size must be numeric'}), 400
+        if not 0.01 <= grid_size <= 1000:
+            return jsonify({'error': 'grid_size must be between 0.01 and 1000'}), 400
 
         if not path:
             return jsonify({'error': 'Path required'}), 400
@@ -888,25 +927,23 @@ def analysis_volume():
 
         z_min = z.min()
 
-        # Create 2D grid
+        # Create 2D grid — group points per cell and reduce with numpy instead
+        # of a Python loop over every point (ix/iy ≥ 0, so a flat key is safe).
         ix = ((x - x.min()) / grid_size).astype(int)
         iy = ((y - y.min()) / grid_size).astype(int)
 
-        from collections import defaultdict
-        grid = defaultdict(list)
-        for i in range(n):
-            grid[(ix[i], iy[i])].append(z[i])
+        keys = ix.astype(np.int64) * (np.int64(iy.max()) + 1) + iy
+        uniq, inv = np.unique(keys, return_inverse=True)
+        z_max_cells = np.full(len(uniq), -np.inf)
+        np.maximum.at(z_max_cells, inv, z)
 
         cell_area = grid_size * grid_size
-        volume = 0.0
-        for cell_z_vals in grid.values():
-            z_max_cell = max(cell_z_vals)
-            volume += (z_max_cell - z_min) * cell_area
+        volume = float(((z_max_cells - z_min) * cell_area).sum())
 
         return jsonify({
             'volume_m3': round(volume, 4),
             'grid_size': grid_size,
-            'num_cells': len(grid),
+            'num_cells': len(uniq),
             'z_range': [round(float(z_min), 4), round(float(z.max()), 4)],
         })
 
@@ -1007,6 +1044,9 @@ def save_transformed():
             return jsonify({'error': 'File not found'}), 404
 
         d = read_pointcloud(path)
+        if d.get('type') == 'gaussian':
+            return jsonify({'error': 'Gaussian splat files (.splat / 3DGS .ply) '
+                            'cannot be saved as LAS — a point cloud is required'}), 400
         x, y, z = d['x'].astype(np.float64), d['y'].astype(np.float64), d['z'].astype(np.float64)
 
         if rx != 0 or ry != 0 or rz != 0:

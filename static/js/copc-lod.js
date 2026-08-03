@@ -41,6 +41,7 @@ export class CopcLodManager {
         this.sseThreshold = DEFAULT_SSE_THRESHOLD;
         this.pointBudget = meta.pointBudget || 25_000_000;
         this._disposed = false;
+        this._abortCtrl = new AbortController();  // cancels in-flight fetches on dispose
 
         this.nodeByKey = new Map();                   // key -> {key,level,pointCount,box}
         this.rootKeys = [];                           // level-0 node keys
@@ -89,7 +90,8 @@ export class CopcLodManager {
     async _init() {
         try {
             const resp = await fetch(
-                `/api/copc/hierarchy?path=${encodeURIComponent(this.path)}`);
+                `/api/copc/hierarchy?path=${encodeURIComponent(this.path)}`,
+                { signal: this._abortCtrl.signal });
             if (!resp.ok || this._disposed) return;
             const { nodes } = await resp.json();
             const [ox, oy, oz] = this.coordOffset;
@@ -105,6 +107,7 @@ export class CopcLodManager {
             this._forceUpdate = true;
             this.maybeUpdate();
         } catch (err) {
+            if (err && err.name === 'AbortError') return;   // disposed mid-fetch
             console.error('[COPC] init failed:', err);
         }
     }
@@ -305,7 +308,14 @@ export class CopcLodManager {
                 if (batch.length === 0) break;
                 this._pending += batch.length;
                 this._updateHud();
-                await this._fetchChunk(batch);
+                try {
+                    await this._fetchChunk(batch);
+                } catch (err) {
+                    // Keep the worker loop alive; keys were released in _fetchChunk.
+                    if (!this._disposed && (!err || err.name !== 'AbortError')) {
+                        console.warn('[COPC] chunk load failed', err);
+                    }
+                }
             }
         } finally {
             this._activeWorkers--;
@@ -313,65 +323,74 @@ export class CopcLodManager {
     }
 
     async _fetchChunk(keys) {
-        let buf;
         try {
-            const resp = await fetch('/api/copc/nodes', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path: this.path, keys }),
-            });
-            if (!resp.ok || this._disposed) return;
-            buf = await resp.arrayBuffer();
+            let buf;
+            try {
+                const resp = await fetch('/api/copc/nodes', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: this.path, keys }),
+                    signal: this._abortCtrl.signal,
+                });
+                if (!resp.ok || this._disposed) return;
+                buf = await resp.arrayBuffer();
+            } finally {
+                this._pending = Math.max(0, this._pending - keys.length);
+            }
+            if (this._disposed || !buf) return;
+
+            const merged = await workerParseMultiblob(buf);
+            if (this._disposed || !merged || merged.numPoints === 0) return;
+
+            // Drop nodes that are already loaded (raced) or no longer wanted; if any
+            // remain that aren't in this merged set we just render what we got — the
+            // next _select will fill gaps. Keep only keys still relevant.
+            const keepKeys = merged.nodeKeys.filter(
+                k => this.desired.has(k) && !this.nodeToChunk.has(k));
+            if (keepKeys.length === 0) return;
+
+            // Node identity is fixed before filtering (the filter only thins points).
+            const keySet = new Set(merged.nodeKeys);
+
+            // Replay any polygon-delete edits onto this fresh chunk so deletions
+            // survive eviction/refetch and apply uniformly across LOD levels.
+            const filtered = await this._replayDeleteOps(merged);
+            if (this._disposed) return;
+            const chunkId = ++this._chunkSeq;
+
+            let points = null;
+            if (filtered.numPoints > 0) {
+                const geom = this.viewer._buildGeometry(filtered);
+                points = new THREE.Points(geom, this.material);
+                points.frustumCulled = false;
+                points.userData.chunkId = chunkId;
+                this.lodGroup.add(points);
+            }
+
+            // Record every node carried by this chunk (even ones not in keepKeys —
+            // they're rendered anyway, and tracking them avoids a duplicate refetch).
+            // A chunk fully erased by edits is still registered (points: null) so its
+            // nodes count as loaded and aren't re-fetched every cut.
+            this.chunks.set(chunkId, { points, keys: keySet, pointCount: filtered.numPoints,
+                                       lastWanted: this._selectSeq,
+                                       lastWantedTime: performance.now() });
+            for (const k of merged.nodeKeys) this.nodeToChunk.set(k, chunkId);
+            this.loadedPointCount += filtered.numPoints;
+
+            this._syncMaterial();
+            this._updateHud();
+            this.viewer._dirty = true;
         } catch (err) {
-            if (!this._disposed) console.warn('[COPC] chunk fetch failed', err);
-            return;
+            if (!this._disposed && (!err || err.name !== 'AbortError')) {
+                console.warn('[COPC] chunk fetch failed', err);
+            }
         } finally {
+            // Keys stay in `loading` until their node is registered in nodeToChunk
+            // (or the batch is discarded/errored) — releasing them right after the
+            // network fetch let a re-_select queue the same node again mid-parse,
+            // double-fetching and double-rendering it.
             for (const k of keys) this.loading.delete(k);
-            this._pending = Math.max(0, this._pending - keys.length);
         }
-        if (this._disposed || !buf) return;
-
-        const merged = await workerParseMultiblob(buf);
-        if (this._disposed || !merged || merged.numPoints === 0) return;
-
-        // Drop nodes that are already loaded (raced) or no longer wanted; if any
-        // remain that aren't in this merged set we just render what we got — the
-        // next _select will fill gaps. Keep only keys still relevant.
-        const keepKeys = merged.nodeKeys.filter(
-            k => this.desired.has(k) && !this.nodeToChunk.has(k));
-        if (keepKeys.length === 0) return;
-
-        // Node identity is fixed before filtering (the filter only thins points).
-        const keySet = new Set(merged.nodeKeys);
-
-        // Replay any polygon-delete edits onto this fresh chunk so deletions
-        // survive eviction/refetch and apply uniformly across LOD levels.
-        const filtered = await this._replayDeleteOps(merged);
-        if (this._disposed) return;
-        const chunkId = ++this._chunkSeq;
-
-        let points = null;
-        if (filtered.numPoints > 0) {
-            const geom = this.viewer._buildGeometry(filtered);
-            points = new THREE.Points(geom, this.material);
-            points.frustumCulled = false;
-            points.userData.chunkId = chunkId;
-            this.lodGroup.add(points);
-        }
-
-        // Record every node carried by this chunk (even ones not in keepKeys —
-        // they're rendered anyway, and tracking them avoids a duplicate refetch).
-        // A chunk fully erased by edits is still registered (points: null) so its
-        // nodes count as loaded and aren't re-fetched every cut.
-        this.chunks.set(chunkId, { points, keys: keySet, pointCount: filtered.numPoints,
-                                   lastWanted: this._selectSeq,
-                                   lastWantedTime: performance.now() });
-        for (const k of merged.nodeKeys) this.nodeToChunk.set(k, chunkId);
-        this.loadedPointCount += filtered.numPoints;
-
-        this._syncMaterial();
-        this._updateHud();
-        this.viewer._dirty = true;
     }
 
     _unloadChunk(chunkId) {
@@ -494,6 +513,7 @@ export class CopcLodManager {
 
     dispose() {
         this._disposed = true;
+        this._abortCtrl.abort();
         for (const chunk of this.chunks.values()) {
             if (!chunk.points) continue;
             this.lodGroup.remove(chunk.points);

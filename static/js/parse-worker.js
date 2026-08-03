@@ -220,16 +220,21 @@ function filterPoints(data) {
     const mvp = mvpMatrix; // Float64Array(16), column-major
 
     // MVP transform helper: multiply 4x4 * vec4(x,y,z,1) → clip coords → NDC → viewport
-    const newPos = [];
-    const newInt = [];
-    const newRgb = [];
-    const newCls = [];
+    // Preallocate outputs at input size and write through a cursor — plain JS
+    // array push blows up temporary memory at millions of points.
+    const newPos = new Float32Array(n * 3);
+    const newInt = new Float32Array(n);
+    const newRgb = colors ? new Float32Array(n * 3) : null;
+    const newCls = classifications ? new Float32Array(n) : null;
+    let w = 0;
 
     const takePoint = (i, x, y, z) => {
-        newPos.push(x, y, z);
-        newInt.push(intensities[i]);
-        if (colors) newRgb.push(colors[i*3], colors[i*3+1], colors[i*3+2]);
-        if (classifications) newCls.push(classifications[i]);
+        const w3 = w * 3;
+        newPos[w3] = x; newPos[w3+1] = y; newPos[w3+2] = z;
+        newInt[w] = intensities[i];
+        if (newRgb) { newRgb[w3] = colors[i*3]; newRgb[w3+1] = colors[i*3+1]; newRgb[w3+2] = colors[i*3+2]; }
+        if (newCls) newCls[w] = classifications[i];
+        w++;
     };
 
     for (let i = 0; i < n; i++) {
@@ -262,11 +267,12 @@ function filterPoints(data) {
         if ((keep && inside) || (!keep && !inside)) takePoint(i, x, y, z);
     }
 
-    const outN = newPos.length / 3;
-    const outPositions = new Float32Array(newPos);
-    const outIntensities = new Float32Array(newInt);
-    const outColors = colors ? new Float32Array(newRgb) : null;
-    const outClassifications = classifications ? new Float32Array(newCls) : null;
+    // Trim to the surviving count (exact-size copies, oversized scratch is GC'd)
+    const outN = w;
+    const outPositions = newPos.slice(0, outN * 3);
+    const outIntensities = newInt.slice(0, outN);
+    const outColors = newRgb ? newRgb.slice(0, outN * 3) : null;
+    const outClassifications = newCls ? newCls.slice(0, outN) : null;
 
     // Compute bounds
     const bounds = computeBounds(outPositions, outN);

@@ -4,7 +4,7 @@
    Compare Map Controls
    ═══════════════════════════════════════════════════════ */
 import { $, formatFileSize, formatDate, formatPoints } from './utils.js';
-import { showToast, customConfirm, showLoading, hideLoading, withLoading } from './ui-notifications.js';
+import { showToast, customConfirm, showLoading, hideLoading, updateLoading, withLoading } from './ui-notifications.js';
 import { appendLog } from './ui-panels.js';
 import { pollConvert } from './data.js';
 
@@ -137,9 +137,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                                 let data = await loadLasFromPath(fullPath, { previewPoints: PREVIEW_PTS });
                                 if (data.mode === 'converting') {
                                     const { path: copcPath } = await pollConvert(data.job, (pct, phase) => {
-                                        showLoading(convLabel(f, pct, phase));
+                                        updateLoading(convLabel(f, pct, phase));
                                     });
-                                    showLoading('Loading compare map...');
+                                    updateLoading('Loading compare map...');
                                     data = await loadLasFromPath(copcPath, { previewPoints: PREVIEW_PTS });
                                 }
                                 if (data.mode === 'copc' || data.mode === 'converting') {
@@ -174,7 +174,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                         try {
                             const data = await loadLasFromPath(fullPath);
                             const info = await dispatchLoad(viewer, data, (pct, phase) => {
-                                showLoading(convLabel(f, pct, phase));
+                                updateLoading(convLabel(f, pct, phase));
                             });
                             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
                             $('compare-a-name').textContent = `${mapName}/${f}`;
@@ -204,6 +204,39 @@ export function initFileManagement(viewer, legend, deps, uiState) {
 
     // Expose refreshMapList for cross-module use
     uiState.refreshMapList = refreshMapList;
+
+    // ── Sidebar Files tab: saved map list ──
+    async function refreshSidebarMapList() {
+        const listEl = $('sidebar-map-list');
+        const emptyEl = $('map-list-empty');
+        if (!listEl) return;
+        try {
+            const resp = await fetch('/api/maps');
+            const maps = await resp.json();
+            listEl.innerHTML = '';
+            const withFiles = maps.filter(m => m.las_files && m.las_files.length > 0);
+            if (emptyEl) emptyEl.style.display = withFiles.length === 0 ? '' : 'none';
+            for (const m of withFiles) {
+                const item = document.createElement('div');
+                item.className = 'modal-item';
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'name';
+                nameSpan.textContent = m.name;
+                item.appendChild(nameSpan);
+                // Minimal behavior: open the Load modal to pick the file.
+                item.addEventListener('click', openModal);
+                listEl.appendChild(item);
+            }
+        } catch (err) {
+            listEl.innerHTML = '';
+            if (emptyEl) { emptyEl.style.display = ''; emptyEl.textContent = err.message; }
+        }
+    }
+    {
+        const refreshBtn = $('btn-refresh-maps');
+        if (refreshBtn) refreshBtn.addEventListener('click', refreshSidebarMapList);
+    }
+    refreshSidebarMapList();
 
     // 4A: Map search filter
     $('map-search').addEventListener('input', e => {
@@ -293,10 +326,10 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         showLoading(`Loading ${file.name}...`);
         try {
             const data = await uploadLasFile(file, pct => {
-                showLoading(`Uploading ${file.name}… ${pct}%`);
+                updateLoading(`Uploading ${file.name}… ${pct}%`);
             });
             const info = await dispatchLoad(viewer, data, (pct, phase) => {
-                showLoading(convLabel(file.name, pct, phase));
+                updateLoading(convLabel(file.name, pct, phase));
             });
             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
             $('compare-a-name').textContent = file.name;
