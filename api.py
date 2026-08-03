@@ -5,6 +5,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 import numpy as np
 import json
 import os
+import re
 import struct
 import io
 import glob
@@ -61,11 +62,20 @@ def _error_response(e: Exception, context: str = ''):
 
 
 # ── Path Traversal prevention ─────────────────────
+_MAP_NAME_RE = re.compile(r'^[\w.\- ]+$')
+
+
 def _safe_path(base_dir, name):
-    """Verify name resolves inside base_dir. Returns None on violation."""
+    """Verify name is a single safe path component strictly inside base_dir.
+
+    Returns None on violation. base_dir itself is never a valid result —
+    otherwise names like '.' would let callers rmtree/rename the whole tree.
+    """
+    if not name or name in ('.', '..') or not _MAP_NAME_RE.fullmatch(name):
+        return None
     resolved = os.path.realpath(os.path.join(base_dir, name))
     base = os.path.realpath(base_dir)
-    if not resolved.startswith(base + os.sep) and resolved != base:
+    if os.path.dirname(resolved) != base or resolved == base:
         return None
     return resolved
 
@@ -181,6 +191,16 @@ def load_pointcloud():
     try:
         path = None
         saved_path = None
+        # preview_points > 0: caller wants a bounded raw point payload even for
+        # COPC files (compare overlay) instead of streaming meta.
+        preview_pts = 0
+        if request.is_json:
+            try:
+                preview_pts = min(int(request.json.get('preview_points') or 0),
+                                  10_000_000)
+            except (TypeError, ValueError):
+                preview_pts = 0
+
         if request.is_json and 'path' in request.json:
             path = request.json['path']
             saved_path = path
@@ -235,7 +255,12 @@ def load_pointcloud():
         # COPC: stream via octree LOD (JSON meta) instead of a whole-cloud binary.
         # The frontend distinguishes by Content-Type and switches into copc mode.
         if copc_io.is_copc(path):
-            resp = jsonify(copc_io.copc_meta(path))
+            if preview_pts > 0:
+                binary = copc_io.copc_preview_binary(path, max_points=preview_pts)
+                resp = send_file(io.BytesIO(binary),
+                                 mimetype='application/octet-stream')
+            else:
+                resp = jsonify(copc_io.copc_meta(path))
             if saved_path:
                 resp.headers['X-Saved-Path'] = urllib.parse.quote(saved_path)
             return resp
@@ -435,6 +460,20 @@ def copc_nodes():
 # ══════════════════════════════════════════════════════
 #  Merge & Save (Map A + transformed Map B)
 # ══════════════════════════════════════════════════════
+def _euler_xyz_matrix(rx_deg, ry_deg, rz_deg):
+    """R = Rx·Ry·Rz — the composition three.js uses for Euler order 'XYZ',
+    which is what the viewer applies via object.rotation. Column-vector
+    convention: P' = R @ P."""
+    rx_r, ry_r, rz_r = np.radians([float(rx_deg), float(ry_deg), float(rz_deg)])
+    cx, sx = np.cos(rx_r), np.sin(rx_r)
+    cy, sy = np.cos(ry_r), np.sin(ry_r)
+    cz, sz = np.cos(rz_r), np.sin(rz_r)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rx @ Ry @ Rz
+
+
 @api_bp.route('/api/save_compare_b', methods=['POST'])
 def save_compare_b():
     err = _require_json()
@@ -446,6 +485,11 @@ def save_compare_b():
         path_b = data.get('path', '') or data.get('path_b', '')
         ox, oy, oz = data.get('ox', 0), data.get('oy', 0), data.get('oz', 0)
         rx, ry, rz = data.get('rx', 0), data.get('ry', 0), data.get('rz', 0)
+        # Pivot = B's centering offset in the viewer (three.js rotates the
+        # object about its local origin, which is exactly this point). Without
+        # it we fall back to B's bbox midpoint — close, but only the client
+        # knows the exact offset its geometry was centered with.
+        pivot = data.get('pivot')
 
         maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
         for p in [path_a, path_b]:
@@ -463,16 +507,19 @@ def save_compare_b():
         bx, by, bz = d_b['x'].astype(np.float64), d_b['y'].astype(np.float64), d_b['z'].astype(np.float64)
 
         if rx != 0 or ry != 0 or rz != 0:
-            rx_r, ry_r, rz_r = np.radians(rx), np.radians(ry), np.radians(rz)
-            cx, sx = np.cos(rx_r), np.sin(rx_r)
-            cy, sy = np.cos(ry_r), np.sin(ry_r)
-            cz, sz = np.cos(rz_r), np.sin(rz_r)
-            Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-            Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-            R = Rz @ Ry @ Rx
-            pts = R @ np.vstack([bx, by, bz])
-            bx, by, bz = pts[0], pts[1], pts[2]
+            # Match the viewer exactly: three.js Euler 'XYZ' (R = Rx·Ry·Rz)
+            # about pivot c → P' = R·(P − c) + c + t
+            R = _euler_xyz_matrix(rx, ry, rz)
+            if pivot is not None:
+                px, py, pz = (float(pivot[0]), float(pivot[1]), float(pivot[2]))
+            elif len(bx):
+                px = (float(bx.min()) + float(bx.max())) / 2.0
+                py = (float(by.min()) + float(by.max())) / 2.0
+                pz = (float(bz.min()) + float(bz.max())) / 2.0
+            else:
+                px = py = pz = 0.0
+            pts = R @ np.vstack([bx - px, by - py, bz - pz])
+            bx, by, bz = pts[0] + px, pts[1] + py, pts[2] + pz
 
         bx += ox; by += oy; bz += oz
 
@@ -949,6 +996,9 @@ def save_transformed():
         path = data.get('path', '')
         ox, oy, oz = data.get('ox', 0), data.get('oy', 0), data.get('oz', 0)
         rx, ry, rz = data.get('rx', 0), data.get('ry', 0), data.get('rz', 0)
+        # Viewer rotates the cloud about its centering offset (coordOffset) —
+        # see save_compare_b for the convention.
+        pivot = data.get('pivot')
 
         maps_dir = os.path.realpath(current_app.config['MAPS_DIR'])
         if not path or not os.path.realpath(path).startswith(maps_dir + os.sep):
@@ -960,16 +1010,18 @@ def save_transformed():
         x, y, z = d['x'].astype(np.float64), d['y'].astype(np.float64), d['z'].astype(np.float64)
 
         if rx != 0 or ry != 0 or rz != 0:
-            rx_r, ry_r, rz_r = np.radians(rx), np.radians(ry), np.radians(rz)
-            cx, sx = np.cos(rx_r), np.sin(rx_r)
-            cy, sy = np.cos(ry_r), np.sin(ry_r)
-            cz, sz = np.cos(rz_r), np.sin(rz_r)
-            Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-            Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-            R = Rz @ Ry @ Rx
-            pts = R @ np.vstack([x, y, z])
-            x, y, z = pts[0], pts[1], pts[2]
+            # Same convention as the viewer: P' = R_xyz·(P − c) + c + t
+            R = _euler_xyz_matrix(rx, ry, rz)
+            if pivot is not None:
+                px, py, pz = (float(pivot[0]), float(pivot[1]), float(pivot[2]))
+            elif len(x):
+                px = (float(x.min()) + float(x.max())) / 2.0
+                py = (float(y.min()) + float(y.max())) / 2.0
+                pz = (float(z.min()) + float(z.max())) / 2.0
+            else:
+                px = py = pz = 0.0
+            pts = R @ np.vstack([x - px, y - py, z - pz])
+            x, y, z = pts[0] + px, pts[1] + py, pts[2] + pz
 
         x += ox; y += oy; z += oz
 
@@ -999,16 +1051,16 @@ def save_transformed():
 # ══════════════════════════════════════════════════════
 
 def _rotation_matrix_to_euler(R):
-    """Convert 3x3 rotation matrix to Euler angles (degrees) in XYZ order."""
-    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-    singular = sy < 1e-6
-    if not singular:
-        rx = np.arctan2(R[2, 1], R[2, 2])
-        ry = np.arctan2(-R[2, 0], sy)
-        rz = np.arctan2(R[1, 0], R[0, 0])
+    """3x3 rotation matrix → Euler degrees for three.js order 'XYZ'
+    (R = Rx·Ry·Rz), so the values drop straight into object.rotation.
+    Mirrors THREE.Euler.setFromRotationMatrix."""
+    m13 = float(np.clip(R[0, 2], -1.0, 1.0))
+    ry = np.arcsin(m13)
+    if abs(m13) < 0.9999999:
+        rx = np.arctan2(-R[1, 2], R[2, 2])
+        rz = np.arctan2(-R[0, 1], R[0, 0])
     else:
-        rx = np.arctan2(-R[1, 2], R[1, 1])
-        ry = np.arctan2(-R[2, 0], sy)
+        rx = np.arctan2(R[2, 1], R[1, 1])
         rz = 0.0
     return np.degrees(rx), np.degrees(ry), np.degrees(rz)
 
@@ -1027,8 +1079,8 @@ def _icp(pts_a, pts_b, max_iter=50, tolerance=1e-6, max_distance=None):
     t_total = np.zeros(3)
     prev_error = np.inf
 
+    tree = cKDTree(pts_a)   # target never moves — build once, not per iteration
     for i in range(max_iter):
-        tree = cKDTree(pts_a)
         distances, indices = tree.query(src, k=1)
 
         # Filter by max correspondence distance
@@ -1099,9 +1151,14 @@ def analysis_icp():
                 max_distance = None
         downsample = float(data.get('downsample', 1.0))
 
-        # Initial pose from Compare panel sliders
+        # Initial pose from Compare panel sliders — in the VIEWER's convention:
+        # P' = R_xyz(init_r)·(P − pivot) + pivot + init_t, pivot = B's
+        # centering offset (see save_compare_b). The response (rotation,
+        # translation) is returned in the same convention so the client can
+        # apply it verbatim to the compare object.
         init_t = data.get('init_translation', [0, 0, 0])
         init_r = data.get('init_rotation', [0, 0, 0])
+        pivot = data.get('pivot')
 
         if not path_a or not path_b:
             return jsonify({'error': 'Both path_a and path_b required'}), 400
@@ -1119,27 +1176,27 @@ def analysis_icp():
         pts_a = np.column_stack([d_a['x'], d_a['y'], d_a['z']]).astype(np.float64)
         pts_b = np.column_stack([d_b['x'], d_b['y'], d_b['z']]).astype(np.float64)
 
-        # Apply initial pose to Map B before ICP
+        # Apply initial pose to Map B before ICP (viewer convention, see above)
         i_rx, i_ry, i_rz = float(init_r[0]), float(init_r[1]), float(init_r[2])
         i_tx, i_ty, i_tz = float(init_t[0]), float(init_t[1]), float(init_t[2])
+        t_init = np.array([i_tx, i_ty, i_tz])
+
+        if pivot is not None:
+            c_b = np.array([float(pivot[0]), float(pivot[1]), float(pivot[2])])
+        elif len(pts_b):
+            c_b = (pts_b.min(axis=0) + pts_b.max(axis=0)) / 2.0
+        else:
+            c_b = np.zeros(3)
 
         if i_rx != 0 or i_ry != 0 or i_rz != 0:
-            rx_r, ry_r, rz_r = np.radians(i_rx), np.radians(i_ry), np.radians(i_rz)
-            cx, sx = np.cos(rx_r), np.sin(rx_r)
-            cy, sy = np.cos(ry_r), np.sin(ry_r)
-            cz, sz = np.cos(rz_r), np.sin(rz_r)
-            Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-            Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-            R_init = Rz @ Ry @ Rx
-            pts_b = (R_init @ pts_b.T).T
+            R_init = _euler_xyz_matrix(i_rx, i_ry, i_rz)
+            pts_b = (R_init @ (pts_b - c_b).T).T + c_b
         else:
             R_init = np.eye(3)
+        pts_b = pts_b + t_init
 
-        pts_b[:, 0] += i_tx
-        pts_b[:, 1] += i_ty
-        pts_b[:, 2] += i_tz
-        t_init = np.array([i_tx, i_ty, i_tz])
+        # Absolute-frame equivalent (P' = R·P + t_abs) for composing with ICP
+        t_init_abs = t_init + c_b - R_init @ c_b
 
         # Optional downsampling for performance
         if 0 < downsample < 1.0:
@@ -1157,13 +1214,17 @@ def analysis_icp():
             tolerance=tolerance, max_distance=max_distance,
         )
 
-        # Combine: final = R_icp @ (R_init @ pt + t_init) + t_icp
-        #        = (R_icp @ R_init) @ pt + (R_icp @ t_init + t_icp)
+        # Compose in the absolute frame:
+        #   final = R_icp @ (R_init @ pt + t_init_abs) + t_icp
+        #         = (R_icp @ R_init) @ pt + (R_icp @ t_init_abs + t_icp)
         R_final = R_icp @ R_init
-        t_final = R_icp @ t_init + t_icp
+        t_final_abs = R_icp @ t_init_abs + t_icp
+
+        # Back to the viewer's pivot convention:
+        #   P' = R_final·(P − c_b) + c_b + t  ⇒  t = t_abs + R_final·c_b − c_b
+        t = t_final_abs + R_final @ c_b - c_b
 
         rx, ry, rz = _rotation_matrix_to_euler(R_final)
-        t = t_final
 
         log = current_app.config.get('LOGGER')
         if log:

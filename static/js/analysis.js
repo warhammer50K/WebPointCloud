@@ -1,9 +1,10 @@
 /* ═══════════════════════════════════════════════════════
    Analysis: SOR, Statistics, Cross-Section, Volume, C2C
    ═══════════════════════════════════════════════════════ */
-import { showToast } from './ui-notifications.js';
+import { showToast, showLoading, hideLoading } from './ui-notifications.js';
 import { appendLog } from './ui-panels.js';
 import { $ } from './utils.js';
+import { dispatchLoad, convLabel } from './ui-files.js';
 
 let _viewer = null;
 let _currentPath = null;
@@ -18,8 +19,26 @@ export function setCurrentPath(path) {
 
 export function getCurrentPath() { return _currentPath; }
 
-export function initAnalysis(viewer, deps, uiState) {
+export function initAnalysis(viewer, legend, deps, uiState) {
     _viewer = viewer;
+
+    // Load an analysis result file into the viewer (COPC auto-convert included)
+    // and point follow-up analyses at it.
+    async function loadResult(savedPath) {
+        if (!deps.loadLasFromPath) return;
+        const name = savedPath.split('/').pop();
+        showLoading(`Loading ${name}…`);
+        try {
+            const data = await deps.loadLasFromPath(savedPath);
+            const info = await dispatchLoad(viewer, data, (pct, phase) => {
+                showLoading(convLabel(name, pct, phase));
+            });
+            if (legend) legend.update(viewer.colorMode, info.bounds, info.offsetZ);
+            setCurrentPath(savedPath);
+        } finally {
+            hideLoading();
+        }
+    }
 
     // ── Statistics ──
     const btnStats = $('btn-analysis-stats');
@@ -75,11 +94,7 @@ export function initAnalysis(viewer, deps, uiState) {
                 }
                 showToast(`SOR: removed ${data.removed_points.toLocaleString()} outliers`, 'success');
                 appendLog(`SOR filter: ${data.original_points} → ${data.remaining_points} pts (k=${k}, std=${stdRatio})`, 'info');
-                // Optionally load the result
-                if (deps.loadLasFromPath) {
-                    deps.loadLasFromPath(data.saved_path, viewer);
-                    _currentPath = data.saved_path;
-                }
+                await loadResult(data.saved_path);
             } catch (e) {
                 showToast(`SOR error: ${e.message}`, 'error');
             } finally {
@@ -113,10 +128,7 @@ export function initAnalysis(viewer, deps, uiState) {
                 }
                 showToast(`Section: ${data.selected_points.toLocaleString()} pts extracted`, 'success');
                 appendLog(`Cross-section ${axis}=${center}±${thickness / 2}: ${data.selected_points} pts`, 'info');
-                if (deps.loadLasFromPath) {
-                    deps.loadLasFromPath(data.saved_path, viewer);
-                    _currentPath = data.saved_path;
-                }
+                await loadResult(data.saved_path);
             } catch (e) {
                 showToast(`Section error: ${e.message}`, 'error');
             } finally {

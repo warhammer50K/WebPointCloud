@@ -128,11 +128,15 @@ export function workerParseMultiblob(buffer) {
     });
 }
 
-export async function loadLasFromPath(path) {
+export async function loadLasFromPath(path, opts = {}) {
+    // opts.previewPoints > 0 asks the server for a bounded raw payload even
+    // for COPC files (compare overlay) instead of streaming meta.
+    const body = { path };
+    if (opts.previewPoints > 0) body.preview_points = opts.previewPoints;
     const resp = await fetch('/api/load_pointcloud', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
+        body: JSON.stringify(body),
     });
     if (!resp.ok) {
         const err = await resp.json();

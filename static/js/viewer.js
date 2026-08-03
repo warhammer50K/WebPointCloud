@@ -1038,11 +1038,15 @@ export class Viewer {
         }
 
         document.getElementById('no-data-msg').style.display = 'none';
-        if (!this.bounds) {
-            this.bounds = data.bounds;
-            this._fitCamera();
-        } else {
-            this._expandBounds(data.bounds);
+        // Empty frames carry ±Infinity bounds — adopting them poisons the camera with NaN
+        const validBounds = data.numPoints > 0 && data.bounds && isFinite(data.bounds.xMin);
+        if (validBounds) {
+            if (!this.bounds) {
+                this.bounds = data.bounds;
+                this._fitCamera();
+            } else {
+                this._expandBounds(data.bounds);
+            }
         }
 
         let total = 0;
@@ -1239,8 +1243,8 @@ export class Viewer {
 
         const idx = this._constraintDrawCount;
         if (idx >= this._cgBufCapacity) {
-            // Buffer overflow — grow and rebuild
-            this._cgBufCapacity *= 2;
+            // Buffer full — rebuild reallocates from _constraintEdges.length
+            // (the new edge is already in the list, so it gets drawn too)
             this._rebuildConstraintGraph();
             return;
         }

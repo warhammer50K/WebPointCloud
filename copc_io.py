@@ -347,6 +347,33 @@ def _pack_node_points(pts, entry, center):
     )
 
 
+def copc_preview_binary(path, max_points=3_000_000):
+    """Coarse whole-extent sample as ONE legacy viewer binary.
+
+    Walks octree levels top-down, keeping whole levels while the running total
+    fits max_points (level 0 is always included). The compare overlay renders
+    this as a static cloud — it needs full spatial coverage at bounded size,
+    not the streamed LOD."""
+    entry = open_copc(path)
+    octree = _get_octree(entry)
+    per_level = {}
+    for nd in octree.values():
+        if nd.point_count > 0:
+            per_level[nd.key.level] = per_level.get(nd.key.level, 0) + nd.point_count
+    total, max_level = 0, -1
+    for lvl in sorted(per_level):
+        if max_level >= 0 and total + per_level[lvl] > int(max_points):
+            break
+        total += per_level[lvl]
+        max_level = lvl
+    sel = [nd for nd in octree.values()
+           if nd.point_count > 0 and nd.key.level <= max_level]
+    with _borrow_reader(entry) as reader:  # pooled handle: no shared-seek race
+        pts = reader._fetch_and_decompress_points_of_nodes(sel)
+        center = reader.copc_info.center
+    return _pack_node_points(pts, entry, center)
+
+
 def copc_nodes_binary(path, keys):
     """Points for the requested node *keys* as one combined viewer binary."""
     entry = open_copc(path)

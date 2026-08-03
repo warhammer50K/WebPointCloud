@@ -9,7 +9,7 @@ import { appendLog } from './ui-panels.js';
 import { pollConvert } from './data.js';
 
 /** Conversion overlay label by phase. */
-function convLabel(name, pct, phase) {
+export function convLabel(name, pct, phase) {
     if (phase === 'reading') return `Reading ${name}…`;
     if (phase === 'building') return `Building octree… ${pct}%`;
     return `Converting ${name} to COPC… ${pct}%`;
@@ -21,7 +21,7 @@ function convLabel(name, pct, phase) {
  * converting to COPC, polls the job (reporting % via onConvertPct) first.
  * @returns {Promise<{bounds:Object, offsetZ:number, count:number, label:string}>}
  */
-async function dispatchLoad(viewer, data, onConvertPct) {
+export async function dispatchLoad(viewer, data, onConvertPct) {
     if (data.mode === 'converting') {
         const { meta, path } = await pollConvert(data.job, onConvertPct);
         viewer.loadCopc(meta, path);
@@ -131,7 +131,23 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                             $('st-main').textContent = `Loading compare map: ${mapName}/${f}...`;
                             showLoading(`Loading compare map...`);
                             try {
-                                const data = await loadLasFromPath(fullPath);
+                                // COPC maps stream via LOD and have no whole-cloud
+                                // payload — ask for a bounded preview sample instead.
+                                const PREVIEW_PTS = 3_000_000;
+                                let data = await loadLasFromPath(fullPath, { previewPoints: PREVIEW_PTS });
+                                if (data.mode === 'converting') {
+                                    const { path: copcPath } = await pollConvert(data.job, (pct, phase) => {
+                                        showLoading(convLabel(f, pct, phase));
+                                    });
+                                    showLoading('Loading compare map...');
+                                    data = await loadLasFromPath(copcPath, { previewPoints: PREVIEW_PTS });
+                                }
+                                if (data.mode === 'copc' || data.mode === 'converting') {
+                                    throw new Error('Compare map is still streaming-only — try again');
+                                }
+                                if (data.type === 'gaussian') {
+                                    throw new Error('Gaussian splat files are not supported as a compare map');
+                                }
                                 viewer.loadCompareCloud(data);
                                 console.log('[Compare] After loadCompareCloud:',
                                     'pointCloud in scene:', viewer.pointCloud ? viewer.scene.children.includes(viewer.pointCloud) : false,
@@ -375,7 +391,11 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                 const resp = await fetch('/api/save_compare_b', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path_a: pathA || '', path_b: pathB, ox, oy, oz, rx, ry, rz }),
+                    body: JSON.stringify({
+                        path_a: pathA || '', path_b: pathB, ox, oy, oz, rx, ry, rz,
+                        // rotation pivot: B's centering offset (three.js local origin)
+                        pivot: viewer._compareOffset || undefined,
+                    }),
                 });
                 const result = await resp.json();
                 if (!resp.ok) throw new Error(result.error || 'Save failed');
@@ -431,6 +451,8 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                     downsample,
                     init_translation: [initOx, initOy, initOz],
                     init_rotation: [initRx, initRy, initRz],
+                    // rotation pivot: B's centering offset (three.js local origin)
+                    pivot: viewer._compareOffset || undefined,
                 }),
             });
             const result = await res.json();

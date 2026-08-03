@@ -228,7 +228,11 @@ export function initViewControls(viewer, legend, deps, uiState) {
                 const resp = await fetch('/api/save_transformed', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path, ox, oy, oz, rx, ry, rz }),
+                    body: JSON.stringify({
+                        path, ox, oy, oz, rx, ry, rz,
+                        // rotation pivot: the cloud's centering offset (three.js local origin)
+                        pivot: viewer.coordOffset || undefined,
+                    }),
                 });
                 const result = await resp.json();
                 if (!resp.ok) throw new Error(result.error || 'Save failed');
