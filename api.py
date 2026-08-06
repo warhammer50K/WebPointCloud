@@ -10,6 +10,7 @@ import struct
 import io
 import glob
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -640,6 +641,235 @@ def save_compare_b():
 
     except Exception as e:
         return _error_response(e, 'save_compare_b')
+
+
+# ══════════════════════════════════════════════════════
+#  Polygon Selection → LAS
+# ══════════════════════════════════════════════════════
+MAX_SELECTION_OPS = 64
+MAX_SELECTION_POLY_VERTS = 4096
+
+
+def _points_in_poly(px, py, poly):
+    """Vectorised even-odd ray cast — the numpy twin of isPointInPoly2D() in
+    viewer-tools.js. NaN screen coords (points on the camera plane) compare
+    false everywhere and land outside, which is what the JS does too."""
+    inside = np.zeros(px.shape, dtype=bool)
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        crosses = (yi > py) != (yj > py)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # yj == yi makes this inf/nan, but crosses is False there — masked out.
+            x_at_py = (xj - xi) * (py - yi) / (yj - yi) + xi
+        inside ^= crosses & (px < x_at_py)
+        j = i
+    return inside
+
+
+def _selection_survivors(xc, yc, zc, op):
+    """Boolean mask of the points a single lasso op keeps.
+
+    Mirrors filterPoints() in parse-worker.js exactly, including its treatment
+    of points outside the depth range: they survive a delete and are dropped by
+    a keep, since the lasso says nothing about what the camera cannot see."""
+    mvp = np.asarray(op['mvp'], dtype=np.float64)      # column-major, 16 elements
+    poly = op['poly']
+    keep = bool(op.get('keep'))
+
+    cx = mvp[0] * xc + mvp[4] * yc + mvp[8] * zc + mvp[12]
+    cy = mvp[1] * xc + mvp[5] * yc + mvp[9] * zc + mvp[13]
+    cz = mvp[2] * xc + mvp[6] * yc + mvp[10] * zc + mvp[14]
+    cw = mvp[3] * xc + mvp[7] * yc + mvp[11] * zc + mvp[15]
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ndc_x, ndc_y, ndc_z = cx / cw, cy / cw, cz / cw
+
+    offscreen = ~np.isfinite(ndc_z) | (ndc_z < -1) | (ndc_z > 1)
+    sx = (ndc_x * 0.5 + 0.5) * float(op['w'])
+    sy = (-ndc_y * 0.5 + 0.5) * float(op['h'])
+    inside = _points_in_poly(sx, sy, poly)
+    return np.where(offscreen, not keep, inside == keep)
+
+
+def _write_las_subset(las, mask, out_path):
+    """Write the masked points of an already-read laspy LasData to out_path.
+
+    Goes through laspy rather than write_las() so the export is a faithful
+    subset: original scales/offsets, point format, CRS and extra dimensions all
+    survive, and intensity/RGB keep their raw values instead of round-tripping
+    through read_pointcloud's 0-1 normalisation. COPC VLRs are dropped — the
+    output has no octree, and leaving them would make the file claim otherwise.
+    """
+    import laspy
+    header = laspy.LasHeader(version=las.header.version,
+                             point_format=las.header.point_format)
+    header.scales = las.header.scales
+    header.offsets = las.header.offsets
+    for vlr in las.header.vlrs:
+        if vlr.user_id.strip('\x00').lower() != 'copc':
+            header.vlrs.append(vlr)
+    out = laspy.LasData(header)
+    out.points = las.points[mask]
+    out.write(out_path)
+
+
+def _validate_selection_ops(raw_ops):
+    """Return (ops, error). Each op must be a full screen-space lasso record."""
+    if not isinstance(raw_ops, list) or not raw_ops:
+        return None, 'no polygon selection to save'
+    if len(raw_ops) > MAX_SELECTION_OPS:
+        return None, f'too many selection ops (max {MAX_SELECTION_OPS})'
+    ops = []
+    for op in raw_ops:
+        if not isinstance(op, dict):
+            return None, 'malformed selection op'
+        mvp = op.get('mvp')
+        poly = op.get('poly')
+        if not isinstance(mvp, list) or len(mvp) != 16:
+            return None, 'selection op needs a 16-element mvp matrix'
+        if not isinstance(poly, list) or len(poly) < 3:
+            return None, 'selection polygon needs at least 3 vertices'
+        if len(poly) > MAX_SELECTION_POLY_VERTS:
+            return None, f'selection polygon too complex (max {MAX_SELECTION_POLY_VERTS} vertices)'
+        try:
+            mvp_f = [float(v) for v in mvp]
+            poly_f = [(float(p[0]), float(p[1])) for p in poly]
+            w, h = float(op.get('w', 0)), float(op.get('h', 0))
+        except (TypeError, ValueError, IndexError):
+            return None, 'selection op contains non-numeric values'
+        if not (np.isfinite(mvp_f).all() and np.isfinite(poly_f).all()):
+            return None, 'selection op contains non-finite values'
+        if w <= 0 or h <= 0:
+            return None, 'selection op needs a positive viewport size'
+        ops.append({'mvp': mvp_f, 'poly': poly_f, 'w': w, 'h': h,
+                    'keep': bool(op.get('keep'))})
+    return ops, None
+
+
+@api_bp.route('/api/save_selection', methods=['POST'])
+def save_selection():
+    """Re-apply the viewer's polygon edits to the *full-resolution* source file
+    and stream the survivors back as a LAS download.
+
+    The viewer only ever holds a subset — a downsample for plain files, whatever
+    LOD is resident for COPC — so exporting its geometry would silently thin the
+    result. Each lasso is stored as a screen-space op (the same {mvp,w,h,poly,
+    keep} record COPC replays onto freshly streamed chunks), which replays just
+    as well against every point in the file."""
+    err = _require_json()
+    if err:
+        return err
+    tmp_path = None
+    try:
+        data = request.json
+        path = data.get('path', '')
+
+        if not path:
+            return jsonify({'error': 'no source file for this map — '
+                            'reload it from the map list and try again'}), 400
+        # Same roots as COPC streaming: the maps library plus the upload temp dir.
+        guard = _copc_guard(path)
+        if guard:
+            return guard
+
+        ops, op_err = _validate_selection_ops(data.get('ops'))
+        if op_err:
+            return jsonify({'error': op_err}), 400
+
+        # Viewer geometry is centred on this offset; the ops were captured in
+        # that frame, so project centred coords but write originals back out.
+        offset = data.get('coord_offset') or [0, 0, 0]
+        try:
+            ox, oy, oz = (float(offset[0]), float(offset[1]), float(offset[2]))
+        except (TypeError, ValueError, IndexError):
+            return jsonify({'error': 'invalid coord_offset'}), 400
+
+        # LAS/LAZ (and therefore COPC) is read once via laspy and written back
+        # out as a true subset; other formats go through read_pointcloud.
+        las = d = None
+        if os.path.splitext(path)[1].lower() in ('.las', '.laz'):
+            import laspy
+            las = laspy.read(path)
+            x = np.asarray(las.x, dtype=np.float64)
+            y = np.asarray(las.y, dtype=np.float64)
+            z = np.asarray(las.z, dtype=np.float64)
+        else:
+            d = read_pointcloud(path)
+            if d.get('type') == 'gaussian':
+                return jsonify({'error': 'Gaussian splat files cannot be exported as LAS'}), 400
+            x = d['x'].astype(np.float64)
+            y = d['y'].astype(np.float64)
+            z = d['z'].astype(np.float64)
+        total = len(x)
+
+        mask = np.ones(total, dtype=bool)
+        xc, yc, zc = x - ox, y - oy, z - oz
+        for op in ops:
+            # Only points still alive can be culled further — replaying on the
+            # survivors keeps this O(remaining) instead of O(total) per op.
+            idx = np.flatnonzero(mask)
+            if idx.size == 0:
+                break
+            mask[idx] = _selection_survivors(xc[idx], yc[idx], zc[idx], op)
+
+        kept = int(mask.sum())
+        if kept == 0:
+            return jsonify({'error': 'the selection leaves no points'}), 400
+
+        fd, tmp_path = tempfile.mkstemp(suffix='.las', prefix='selection_')
+        os.close(fd)
+        if las is not None:
+            _write_las_subset(las, mask, tmp_path)
+        else:
+            # PLY/XYZ/PCD/PTS have no LAS header to inherit — rebuild one. RGB is
+            # only written when the source actually had it (read_pointcloud
+            # substitutes mid grey otherwise, which would be invented data).
+            cls = d.get('classification')
+            has_rgb = d.get('has_rgb')
+            write_las(tmp_path, x[mask], y[mask], z[mask],
+                      intensity=d['intensity'][mask],
+                      r=d['r'][mask] if has_rgb else None,
+                      g=d['g'][mask] if has_rgb else None,
+                      b=d['b'][mask] if has_rgb else None,
+                      classification=cls[mask] if cls is not None else None)
+
+        log = current_app.config.get('LOGGER')
+        if log:
+            log.info(f"[Selection] {kept}/{total} pts from {path} "
+                     f"({len(ops)} op(s)) -> LAS download")
+
+        base = os.path.basename(path)
+        for ext in ('.copc.laz', '.laz', '.las'):
+            if base.lower().endswith(ext):
+                base = base[:-len(ext)]
+                break
+        else:
+            base = os.path.splitext(base)[0]
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        download_name = f'{base}_selection_{stamp}.las'
+
+        # Hand ownership of the temp file to the response so it is removed once
+        # the bytes are on the wire, whether or not the client hangs up.
+        fh = open(tmp_path, 'rb')
+        os.unlink(tmp_path)
+        tmp_path = None
+        resp = send_file(fh, mimetype='application/octet-stream',
+                         as_attachment=True, download_name=download_name)
+        resp.headers['X-Point-Count'] = str(kept)
+        resp.headers['X-Source-Point-Count'] = str(total)
+        return resp
+
+    except Exception as e:
+        return _error_response(e, 'save_selection')
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ══════════════════════════════════════════════════════

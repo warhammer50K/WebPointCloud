@@ -20,6 +20,8 @@ import {
     restoreSnapshot as _restoreSnapshot,
     undoFilter as _undoFilter, redoFilter as _redoFilter,
     updateUndoRedoButtons as _updateUndoRedoButtons,
+    saveSelectionLas as _saveSelectionLas,
+    selectionExportBlocker as _selectionExportBlocker,
 } from './viewer-tools.js';
 
 import { initPostProcessing, resizePostTargets } from './viewer-post.js';
@@ -55,6 +57,7 @@ export class Viewer {
         this._dsRatio = 1.0;          // current downsampling ratio (1.0 = original)
         this.bounds = null;
         this.coordOffset = null;      // Float64Array([ox,oy,oz]) — add back for original coords
+        this.sourcePath = null;       // file the current cloud came from (LAS export)
         this.pointCloud = null;
         this.gaussianSplat = null;
         this.copcManager = null;      // COPC octree LOD streaming (when active)
@@ -282,6 +285,14 @@ export class Viewer {
         this._redoStack = [];
         this._maxUndoLevels = 5;
         initUndoRedo(this);
+
+        // Applied lassos, in order, as replayable screen-space records
+        // ({mvp, w, h, poly, keep}) — the same shape CopcLodManager._deleteOps
+        // uses. Exporting the selection replays these server-side against the
+        // full-resolution source file, so they must track undo/redo. COPC keeps
+        // its own list on the manager; this one covers every other format.
+        this._polyOps = [];
+        this._polyOpsRedo = [];
 
         // Compare map
         this.compareCloud = null;
@@ -578,10 +589,14 @@ export class Viewer {
         this.cloudData = display;
         this.bounds = data.bounds;
         this.coordOffset = data.offset || null;
+        this.sourcePath = data.path || data.savedPath || null;
 
         // B-3: reset undo/redo stacks on map switch (prevent memory leak)
         this._undoStack.length = 0;
         this._redoStack.length = 0;
+        this._polyOps.length = 0;
+        this._polyOpsRedo.length = 0;
+        _updateUndoRedoButtons(this);
 
         if (this.pointCloud) {
             this.scene.remove(this.pointCloud);
@@ -638,8 +653,11 @@ export class Viewer {
         }
         this.cloudData = null;
         this._fullCloudData = null;
+        this.sourcePath = path;
         this._undoStack.length = 0;
         this._redoStack.length = 0;
+        this._polyOps.length = 0;
+        this._polyOpsRedo.length = 0;
 
         // Centered bounds (real-world minus the octree center) so this matches
         // the per-node geometry frame used by clipping / height coloring / fit.
@@ -663,6 +681,7 @@ export class Viewer {
         if (ptsEl) ptsEl.textContent = `Points: 0`;
 
         this.copcManager = new CopcLodManager(this, meta, path);
+        _updateUndoRedoButtons(this);
         this._fitCamera();
         this.updateStats();
         this._dirty = true;
@@ -699,6 +718,11 @@ export class Viewer {
 
         this.bounds = data.bounds;
         this.coordOffset = data.offset || null;
+        // Splats are not exportable as LAS — leave nothing for the export to grab.
+        this.sourcePath = null;
+        this._polyOps.length = 0;
+        this._polyOpsRedo.length = 0;
+        _updateUndoRedoButtons(this);
 
         document.getElementById('no-data-msg').style.display = 'none';
         const ptsEl = document.getElementById('viewer-pts');
@@ -801,9 +825,14 @@ export class Viewer {
         this._dsRatio = ratio;
 
         // Snapshots hold the pre-downsample array sizes; restoring one into the
-        // rebuilt (smaller) geometry would throw RangeError mid-undo.
+        // rebuilt (smaller) geometry would throw RangeError mid-undo. The
+        // geometry below is rebuilt from _fullCloudData, which also discards any
+        // polygon cuts — drop the op log with it so an export can't re-apply
+        // edits the viewer no longer shows.
         this._undoStack.length = 0;
         this._redoStack.length = 0;
+        this._polyOps.length = 0;
+        this._polyOpsRedo.length = 0;
         _updateUndoRedoButtons(this);
 
         const display = this._downsampleData(this._fullCloudData, ratio);
@@ -1870,6 +1899,8 @@ export class Viewer {
     _closePoly() { _closePoly(this); }
     _isPointInPoly2D(px, py, poly) { return _isPointInPoly2D(px, py, poly); }
     async applyPolyFilter(keep) { return _applyPolyFilter(this, keep); }
+    async saveSelectionLas() { return _saveSelectionLas(this); }
+    selectionExportBlocker() { return _selectionExportBlocker(this); }
 
     _recalcBounds() {
         let xMin = Infinity, xMax = -Infinity;
@@ -1896,6 +1927,7 @@ export class Viewer {
     /* ── Undo/Redo (delegation) ── */
     undoFilter() { _undoFilter(this); }
     redoFilter() { _redoFilter(this); }
+    updateUndoRedoButtons() { _updateUndoRedoButtons(this); }
 
     /* ── Cloud Transform ── */
     setCloudOffset(x, y, z) {

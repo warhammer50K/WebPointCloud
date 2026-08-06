@@ -444,6 +444,16 @@ export async function applyPolyFilter(viewer, keep) {
     if (viewer._undoStack.length > viewer._maxUndoLevels) viewer._undoStack.shift();
     viewer._redoStack.length = 0;
 
+    // Log the cut against pointCloud's frame — that is the cloud the source file
+    // on disk corresponds to, and the LAS export replays these ops against it.
+    // (The undo stack is capped, so it can be shorter than this list; that only
+    // limits how far back the user can rewind, never desyncs the two.)
+    if (viewer.pointCloud) {
+        viewer._polyOps.push({ mvp: Array.from(mvpFor(viewer.pointCloud)),
+                               w: rect.width, h: rect.height, poly, keep });
+        viewer._polyOpsRedo.length = 0;
+    }
+
     const clouds = [
         { obj: viewer.pointCloud, prop: 'pointCloud' },
         { obj: viewer.mapCloud, prop: 'mapCloud' },
@@ -566,6 +576,7 @@ export function undoFilter(viewer) {
     viewer._redoStack.push(snapshotGeometry(viewer));
     const snap = viewer._undoStack.pop();
     restoreSnapshot(viewer, snap);
+    if (viewer._polyOps.length) viewer._polyOpsRedo.push(viewer._polyOps.pop());
     updateUndoRedoButtons(viewer);
 }
 
@@ -575,12 +586,43 @@ export function redoFilter(viewer) {
     viewer._undoStack.push(snapshotGeometry(viewer));
     const snap = viewer._redoStack.pop();
     restoreSnapshot(viewer, snap);
+    if (viewer._polyOpsRedo.length) viewer._polyOps.push(viewer._polyOpsRedo.pop());
     updateUndoRedoButtons(viewer);
+}
+
+/** Applied lassos, newest last — COPC keeps its own list on the LOD manager. */
+export function appliedPolyOps(viewer) {
+    return viewer.copcManager ? viewer.copcManager._deleteOps : viewer._polyOps;
+}
+
+/** Why the LAS export has nothing to do yet, or '' when it is ready. The Save
+ *  button stays clickable and reports this instead of going disabled: a greyed
+ *  button that does nothing on click is a dead end for the user and leaves no
+ *  trace for anyone debugging it afterwards. */
+export function selectionExportBlocker(viewer) {
+    if (!viewer.sourcePath) {
+        return viewer.gaussianSplat
+            ? 'Gaussian splats cannot be exported as LAS'
+            : 'No source file on the server for this cloud — load it from the map list';
+    }
+    if (appliedPolyOps(viewer).length === 0) {
+        return 'Draw a polygon and apply Delete Sel or Keep Sel first';
+    }
+    return '';
 }
 
 export function updateUndoRedoButtons(viewer) {
     const undoBtn = document.getElementById('btn-undo');
     const redoBtn = document.getElementById('btn-redo');
+    // Exporting with no cut applied would just re-download the source file, so
+    // the button is only muted, never disabled — see selectionExportBlocker.
+    const saveBtn = document.getElementById('btn-sel-save');
+    if (saveBtn) {
+        const blocker = selectionExportBlocker(viewer);
+        saveBtn.disabled = false;
+        saveBtn.classList.toggle('needs-input', blocker !== '');
+        saveBtn.title = blocker || 'Export the polygon selection at full resolution';
+    }
     if (viewer.copcManager) {
         if (undoBtn) undoBtn.disabled = viewer.copcManager._deleteOps.length === 0;
         if (redoBtn) redoBtn.disabled = viewer.copcManager._redoOps.length === 0;
@@ -588,4 +630,54 @@ export function updateUndoRedoButtons(viewer) {
     }
     if (undoBtn) undoBtn.disabled = viewer._undoStack.length === 0;
     if (redoBtn) redoBtn.disabled = viewer._redoStack.length === 0;
+}
+
+
+/* ── Export selection as LAS ── */
+
+/** POST the applied lassos to the server, which replays them against the
+ *  full-resolution source file and streams back a LAS. Returns
+ *  { name, kept, total } or throws. */
+export async function saveSelectionLas(viewer) {
+    const blocker = selectionExportBlocker(viewer);
+    if (blocker) throw new Error(blocker);
+    const ops = appliedPolyOps(viewer);
+
+    const off = viewer.coordOffset;
+    const resp = await fetch('/api/save_selection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            path: viewer.sourcePath,
+            coord_offset: off ? [off[0], off[1], off[2]] : [0, 0, 0],
+            // Float64Array survives JSON.stringify as an object, not an array.
+            ops: ops.map(o => ({ mvp: Array.from(o.mvp), w: o.w, h: o.h,
+                                 poly: o.poly, keep: !!o.keep })),
+        }),
+    });
+    if (!resp.ok) {
+        let msg = resp.statusText || 'Export failed';
+        try { msg = (await resp.json()).error || msg; } catch {}
+        throw new Error(msg);
+    }
+
+    const kept = Number(resp.headers.get('X-Point-Count')) || 0;
+    const total = Number(resp.headers.get('X-Source-Point-Count')) || 0;
+    // Content-Disposition is the server's filename; fall back if it's stripped.
+    const cd = resp.headers.get('Content-Disposition') || '';
+    const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+    const name = m ? decodeURIComponent(m[1]) : 'selection.las';
+
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoke on the next tick — Firefox aborts the download if the URL dies first.
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+
+    return { name, kept, total };
 }

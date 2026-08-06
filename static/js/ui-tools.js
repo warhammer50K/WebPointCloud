@@ -52,6 +52,28 @@ export function initToolControls(viewer, legend, deps, uiState) {
         finally { hideLoading(); }
     });
     $('btn-sel-clear').addEventListener('click', () => viewer.clearPolySelect());
+    // Export the result of the applied cuts. The server replays them against the
+    // source file, so this is the full-resolution cloud — not the LOD/downsample
+    // the viewer is showing — which is why it can take a moment on big maps.
+    $('btn-sel-save').addEventListener('click', async () => {
+        const btn = $('btn-sel-save');
+        // Nothing to export yet is a normal state, not an error — say what is
+        // missing rather than letting the click do nothing.
+        const blocker = viewer.selectionExportBlocker();
+        if (blocker) { showToast(blocker, 'info'); return; }
+        btn.disabled = true;
+        showLoading('Exporting selection to LAS...');
+        try {
+            const { name, kept, total } = await viewer.saveSelectionLas();
+            showToast(`Saved ${name} — ${kept.toLocaleString()} of `
+                      + `${total.toLocaleString()} pts`, 'info');
+        } catch (e) {
+            showToast(`Export error: ${e.message}`, 'error');
+        } finally {
+            hideLoading();
+            viewer.updateUndoRedoButtons();
+        }
+    });
     // 2D: Polygon close button
     $('btn-poly-close').addEventListener('click', () => {
         if (viewer._polyPoints && viewer._polyPoints.length >= 3 && !viewer._polyClosedOnce) {
@@ -59,6 +81,9 @@ export function initToolControls(viewer, legend, deps, uiState) {
         }
     });
     $('btn-screenshot').addEventListener('click', () => viewer.takeScreenshot());
+    // Set the edit buttons from live state rather than trusting the markup —
+    // nothing else runs until a map is loaded.
+    viewer.updateUndoRedoButtons();
 
     // Fullscreen toggle (header)
     {
