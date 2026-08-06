@@ -6,6 +6,25 @@ import * as THREE from 'three';
 import { workerFilterPoints } from './data.js';
 
 
+/* ── Raycast targets ── */
+
+/** Objects a picking ray may hit. COPC streams its points into the LOD manager's
+ *  lodGroup as one THREE.Points per chunk, so they have to be collected from
+ *  there — viewer.pointCloud is null in that mode and picking would find nothing.
+ *  Chunks carry an octree-node-sized bounding sphere, so the ray rejects almost
+ *  all of them before touching a single vertex. */
+function pickTargets(viewer) {
+    const targets = [viewer.pointCloud, viewer.mapCloud, viewer.rawCloud, viewer.curCloud,
+                     viewer.kf0Cloud, viewer.kf1Cloud, ...viewer.kfrmClouds]
+                     .filter(c => c && c.visible);
+    const lod = viewer.copcManager && viewer.copcManager.lodGroup;
+    if (lod && lod.visible) {
+        for (const c of lod.children) if (c.visible) targets.push(c);
+    }
+    return targets;
+}
+
+
 /* ── Measurement (polyline) ── */
 
 export function initMeasureInput(viewer) {
@@ -39,10 +58,7 @@ export function initMeasureInput(viewer) {
         raycaster.params.Points.threshold = Math.max(0.15, viewer.pointSize * 4);
         raycaster.setFromCamera(mouse, viewer.camera);
 
-        const targets = [viewer.pointCloud, viewer.mapCloud, viewer.rawCloud, viewer.curCloud,
-                         viewer.kf0Cloud, viewer.kf1Cloud, ...viewer.kfrmClouds]
-                         .filter(c => c && c.visible);
-        const hits = raycaster.intersectObjects(targets);
+        const hits = raycaster.intersectObjects(pickTargets(viewer));
         if (hits.length === 0) return;
 
         const pt = hits[0].point.clone();
@@ -185,10 +201,7 @@ export function initPointInfo(viewer) {
         const raycaster = new THREE.Raycaster();
         raycaster.params.Points.threshold = Math.max(0.15, viewer.pointSize * 4);
         raycaster.setFromCamera(mouse, viewer.camera);
-        const targets = [viewer.pointCloud, viewer.mapCloud, viewer.rawCloud, viewer.curCloud,
-                         viewer.kf0Cloud, viewer.kf1Cloud, ...viewer.kfrmClouds]
-                         .filter(c => c && c.visible);
-        const hits = raycaster.intersectObjects(targets);
+        const hits = raycaster.intersectObjects(pickTargets(viewer));
         if (hits.length === 0) { infoEl.style.display = 'none'; return; }
         const hit = hits[0];
         const pt = hit.point;
@@ -231,10 +244,7 @@ export function initPointInfo(viewer) {
         const baseThr = Math.max(0.15, viewer.pointSize * 4);
         raycaster.params.Points.threshold = baseThr * 2.5;
         raycaster.setFromCamera(mouse, viewer.camera);
-        const targets = [viewer.pointCloud, viewer.mapCloud, viewer.rawCloud, viewer.curCloud,
-                         viewer.kf0Cloud, viewer.kf1Cloud, ...viewer.kfrmClouds]
-                         .filter(c => c && c.visible);
-        const hits = raycaster.intersectObjects(targets);
+        const hits = raycaster.intersectObjects(pickTargets(viewer));
         if (hits.length === 0) return;
         const hit = hits[0];
         const pt = hit.point;
