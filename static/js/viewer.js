@@ -97,7 +97,11 @@ export class Viewer {
         // (the capture listener's stopImmediatePropagation blocks it in Chrome,
         // but that relies on subtle at-target listener ordering — this doesn't).
         this.controls.enableZoom = false;
-        this.controls.panSpeed = 0.1;        // calmer right/middle-drag pan (default 1.0)
+        // Pan is scaled per drag by _updatePanScale() so a pixel of drag moves the
+        // content under the cursor by a pixel, at any zoom level. panSpeed itself
+        // is just the correction factor it writes; panSpeedBase is the user knob.
+        this.panSpeedBase = 1.0;             // 1.0 = 1:1 grab-the-content feel
+        this.controls.panSpeed = this.panSpeedBase;
         // Left-drag = FIRST-PERSON look (camera stays put, the view direction
         // turns) instead of OrbitControls' orbit-around-target, which swings the
         // camera in a big arc. With rotate disabled, update()'s sphericalDelta is
@@ -160,8 +164,12 @@ export class Viewer {
                 this.controls.target.copy(this.camera.position)
                     .addScaledVector(_zoomDir, newDist);
             }
+            this._updatePanScale();          // pivot distance changed → re-scale pan
             this._dirty = true;
         }, { passive: false, capture: true });
+
+        // Keep pan in step with the view whenever a drag starts (mouse or touch).
+        this.renderer.domElement.addEventListener('pointerdown', () => this._updatePanScale());
 
         // First-person look: left-drag turns the view in place. Skipped while a
         // tool owns the left button (measure / polygon select / point info) or
@@ -320,6 +328,61 @@ export class Viewer {
         return p.x > b.xMin - m && p.x < b.xMax + m
             && p.y > b.yMin - m && p.y < b.yMax + m
             && p.z > b.zMin - m && p.z < b.zMax + m;
+    }
+
+    // Adaptive pan speed.
+    //
+    // OrbitControls scales a perspective pan by the pivot distance, but the wheel
+    // handler clamps that distance to [sceneSize*0.05, sceneSize*1.5] so the dolly
+    // keeps a usable speed. That clamp decouples the pivot from what the user is
+    // actually looking at: zoomed way out the pivot is far nearer than the data, so
+    // pan crawls; nosed right up to a surface it is far beyond it, so pan bolts.
+    //
+    // So scale pan by the distance to the content in front of the camera instead —
+    // where the view ray meets the data bounds — and hand OrbitControls the ratio
+    // as panSpeed. One AABB ray test, no raycast into the points.
+    _updatePanScale() {
+        const dist = this._panRefDistance();
+        const pivot = this.camera.position.distanceTo(this.controls.target);
+        this.controls.panSpeed = pivot > 1e-6
+            ? this.panSpeedBase * (dist / pivot)
+            : this.panSpeedBase;
+    }
+
+    // Distance to the content the camera is pointing at, approximated by the data
+    // bounds: the near face of the box when looking at it from outside, the pivot
+    // distance when immersed in it (surroundings are roughly pivot-far in every
+    // direction), the box centre when aimed away from the data entirely.
+    _panRefDistance() {
+        const pivot = this.camera.position.distanceTo(this.controls.target);
+        const b = this.bounds;
+        if (!b) return pivot;
+
+        this._panBox = this._panBox || new THREE.Box3();
+        this._panRay = this._panRay || new THREE.Ray();
+        this._panHit = this._panHit || new THREE.Vector3();
+        this._panBox.min.set(b.xMin, b.yMin, b.zMin);
+        this._panBox.max.set(b.xMax, b.yMax, b.zMax);
+
+        // Inside the data: the near face is metres away while the points around the
+        // camera are not, so the pivot is the better reference.
+        if (this._panBox.containsPoint(this.camera.position)) return pivot;
+
+        this._panRay.origin.copy(this.camera.position);
+        this._panRay.direction.subVectors(this.controls.target, this.camera.position);
+        if (this._panRay.direction.lengthSq() < 1e-12) return pivot;
+        this._panRay.direction.normalize();
+
+        const hit = this._panRay.intersectBox(this._panBox, this._panHit);
+        if (hit) {
+            // Mid-way between the near face and the pivot: panning along the very
+            // front face under-shoots for data with depth behind it.
+            return Math.max((hit.distanceTo(this.camera.position) + pivot) * 0.5, 1e-6);
+        }
+
+        // Looking off into empty space — fall back to the bulk of the data.
+        this._panBox.getCenter(this._panHit);
+        return Math.max(this.camera.position.distanceTo(this._panHit), 1e-6);
     }
 
     // Orbit: swing the camera around the pivot (controls.target), keeping the
