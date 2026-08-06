@@ -306,6 +306,9 @@ input[type=checkbox] { accent-color: var(--accent); width: 18px; height: 18px; m
 .btn:hover { background: var(--bg-hover); border-color: var(--accent); }
 .btn:active { background: var(--accent); color: #fff; }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+/* Muted like :disabled but still clickable — clicking reports what is missing
+   instead of doing nothing, which reads as a broken button. */
+.btn.needs-input { opacity: 0.45; }
 .btn.primary:disabled { opacity: 0.65; }
 .btn.loading { position: relative; color: transparent; pointer-events: none; }
 .btn.loading::after {

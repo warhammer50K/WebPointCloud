@@ -5,7 +5,7 @@ import os
 import logging
 from logging.handlers import RotatingFileHandler
 
-from flask import Flask, render_template
+from flask import Flask, render_template, request
 
 import config
 from security import load_or_create_secret_key, RateLimiter, init_security
@@ -23,6 +23,26 @@ _is_debug = os.environ.get('FLASK_DEBUG', '0') == '1'
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = (
     config.STATIC_MAX_AGE_DEBUG if _is_debug else config.STATIC_MAX_AGE_PROD)
 app.config['MAX_CONTENT_LENGTH'] = config.MAX_CONTENT_LENGTH
+
+
+@app.after_request
+def _revalidate_app_code(resp):
+    """Never let the browser serve JS/CSS blind from cache.
+
+    index.html is rendered fresh on every request, but static/* is cached for
+    STATIC_MAX_AGE_PROD. That mix serves new markup with old code — a control
+    added to the template shows up with nothing wired to it, and the page looks
+    broken in a way no amount of reloading explains. Versioned filenames would
+    be the usual answer, but the viewer's ES modules import each other by
+    relative path, so a query string on the entry point does not reach the
+    graph. 'no-cache' lets the browser keep the file and revalidate it (304, no
+    re-download); it only forbids using it without asking. Images/fonts keep
+    the full max-age.
+    """
+    if request.endpoint == 'static' and request.path.endswith(('.js', '.css')):
+        resp.headers['Cache-Control'] = 'no-cache'
+        resp.headers.pop('Expires', None)
+    return resp
 
 app.config['MAPS_DIR'] = config.MAPS_DIR
 os.makedirs(config.MAPS_DIR, exist_ok=True)

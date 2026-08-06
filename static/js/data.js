@@ -164,7 +164,11 @@ export async function loadLasFromPath(path, opts = {}) {
         }
         return { mode: 'copc', meta: obj, path };
     }
-    return workerParseBinary(await resp.arrayBuffer());
+    // Keep the source path with the parsed payload — the LAS export of a polygon
+    // selection replays the cut against the original file, not the display copy.
+    const parsed = await workerParseBinary(await resp.arrayBuffer());
+    parsed.path = path;
+    return parsed;
 }
 
 export async function uploadLasFile(file, onProgress) {

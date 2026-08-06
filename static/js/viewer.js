@@ -20,6 +20,8 @@ import {
     restoreSnapshot as _restoreSnapshot,
     undoFilter as _undoFilter, redoFilter as _redoFilter,
     updateUndoRedoButtons as _updateUndoRedoButtons,
+    saveSelectionLas as _saveSelectionLas,
+    selectionExportBlocker as _selectionExportBlocker,
 } from './viewer-tools.js';
 
 import { initPostProcessing, resizePostTargets } from './viewer-post.js';
@@ -55,6 +57,7 @@ export class Viewer {
         this._dsRatio = 1.0;          // current downsampling ratio (1.0 = original)
         this.bounds = null;
         this.coordOffset = null;      // Float64Array([ox,oy,oz]) — add back for original coords
+        this.sourcePath = null;       // file the current cloud came from (LAS export)
         this.pointCloud = null;
         this.gaussianSplat = null;
         this.copcManager = null;      // COPC octree LOD streaming (when active)
@@ -97,7 +100,11 @@ export class Viewer {
         // (the capture listener's stopImmediatePropagation blocks it in Chrome,
         // but that relies on subtle at-target listener ordering — this doesn't).
         this.controls.enableZoom = false;
-        this.controls.panSpeed = 0.1;        // calmer right/middle-drag pan (default 1.0)
+        // Pan is scaled per drag by _updatePanScale() so a pixel of drag moves the
+        // content under the cursor by a pixel, at any zoom level. panSpeed itself
+        // is just the correction factor it writes; panSpeedBase is the user knob.
+        this.panSpeedBase = 1.0;             // 1.0 = 1:1 grab-the-content feel
+        this.controls.panSpeed = this.panSpeedBase;
         // Left-drag = FIRST-PERSON look (camera stays put, the view direction
         // turns) instead of OrbitControls' orbit-around-target, which swings the
         // camera in a big arc. With rotate disabled, update()'s sphericalDelta is
@@ -160,8 +167,12 @@ export class Viewer {
                 this.controls.target.copy(this.camera.position)
                     .addScaledVector(_zoomDir, newDist);
             }
+            this._updatePanScale();          // pivot distance changed → re-scale pan
             this._dirty = true;
         }, { passive: false, capture: true });
+
+        // Keep pan in step with the view whenever a drag starts (mouse or touch).
+        this.renderer.domElement.addEventListener('pointerdown', () => this._updatePanScale());
 
         // First-person look: left-drag turns the view in place. Skipped while a
         // tool owns the left button (measure / polygon select / point info) or
@@ -275,6 +286,14 @@ export class Viewer {
         this._maxUndoLevels = 5;
         initUndoRedo(this);
 
+        // Applied lassos, in order, as replayable screen-space records
+        // ({mvp, w, h, poly, keep}) — the same shape CopcLodManager._deleteOps
+        // uses. Exporting the selection replays these server-side against the
+        // full-resolution source file, so they must track undo/redo. COPC keeps
+        // its own list on the manager; this one covers every other format.
+        this._polyOps = [];
+        this._polyOpsRedo = [];
+
         // Compare map
         this.compareCloud = null;
         this.compareOpacity = 0.5;
@@ -320,6 +339,61 @@ export class Viewer {
         return p.x > b.xMin - m && p.x < b.xMax + m
             && p.y > b.yMin - m && p.y < b.yMax + m
             && p.z > b.zMin - m && p.z < b.zMax + m;
+    }
+
+    // Adaptive pan speed.
+    //
+    // OrbitControls scales a perspective pan by the pivot distance, but the wheel
+    // handler clamps that distance to [sceneSize*0.05, sceneSize*1.5] so the dolly
+    // keeps a usable speed. That clamp decouples the pivot from what the user is
+    // actually looking at: zoomed way out the pivot is far nearer than the data, so
+    // pan crawls; nosed right up to a surface it is far beyond it, so pan bolts.
+    //
+    // So scale pan by the distance to the content in front of the camera instead —
+    // where the view ray meets the data bounds — and hand OrbitControls the ratio
+    // as panSpeed. One AABB ray test, no raycast into the points.
+    _updatePanScale() {
+        const dist = this._panRefDistance();
+        const pivot = this.camera.position.distanceTo(this.controls.target);
+        this.controls.panSpeed = pivot > 1e-6
+            ? this.panSpeedBase * (dist / pivot)
+            : this.panSpeedBase;
+    }
+
+    // Distance to the content the camera is pointing at, approximated by the data
+    // bounds: the near face of the box when looking at it from outside, the pivot
+    // distance when immersed in it (surroundings are roughly pivot-far in every
+    // direction), the box centre when aimed away from the data entirely.
+    _panRefDistance() {
+        const pivot = this.camera.position.distanceTo(this.controls.target);
+        const b = this.bounds;
+        if (!b) return pivot;
+
+        this._panBox = this._panBox || new THREE.Box3();
+        this._panRay = this._panRay || new THREE.Ray();
+        this._panHit = this._panHit || new THREE.Vector3();
+        this._panBox.min.set(b.xMin, b.yMin, b.zMin);
+        this._panBox.max.set(b.xMax, b.yMax, b.zMax);
+
+        // Inside the data: the near face is metres away while the points around the
+        // camera are not, so the pivot is the better reference.
+        if (this._panBox.containsPoint(this.camera.position)) return pivot;
+
+        this._panRay.origin.copy(this.camera.position);
+        this._panRay.direction.subVectors(this.controls.target, this.camera.position);
+        if (this._panRay.direction.lengthSq() < 1e-12) return pivot;
+        this._panRay.direction.normalize();
+
+        const hit = this._panRay.intersectBox(this._panBox, this._panHit);
+        if (hit) {
+            // Mid-way between the near face and the pivot: panning along the very
+            // front face under-shoots for data with depth behind it.
+            return Math.max((hit.distanceTo(this.camera.position) + pivot) * 0.5, 1e-6);
+        }
+
+        // Looking off into empty space — fall back to the bulk of the data.
+        this._panBox.getCenter(this._panHit);
+        return Math.max(this.camera.position.distanceTo(this._panHit), 1e-6);
     }
 
     // Orbit: swing the camera around the pivot (controls.target), keeping the
@@ -515,10 +589,14 @@ export class Viewer {
         this.cloudData = display;
         this.bounds = data.bounds;
         this.coordOffset = data.offset || null;
+        this.sourcePath = data.path || data.savedPath || null;
 
         // B-3: reset undo/redo stacks on map switch (prevent memory leak)
         this._undoStack.length = 0;
         this._redoStack.length = 0;
+        this._polyOps.length = 0;
+        this._polyOpsRedo.length = 0;
+        _updateUndoRedoButtons(this);
 
         if (this.pointCloud) {
             this.scene.remove(this.pointCloud);
@@ -575,8 +653,11 @@ export class Viewer {
         }
         this.cloudData = null;
         this._fullCloudData = null;
+        this.sourcePath = path;
         this._undoStack.length = 0;
         this._redoStack.length = 0;
+        this._polyOps.length = 0;
+        this._polyOpsRedo.length = 0;
 
         // Centered bounds (real-world minus the octree center) so this matches
         // the per-node geometry frame used by clipping / height coloring / fit.
@@ -600,6 +681,7 @@ export class Viewer {
         if (ptsEl) ptsEl.textContent = `Points: 0`;
 
         this.copcManager = new CopcLodManager(this, meta, path);
+        _updateUndoRedoButtons(this);
         this._fitCamera();
         this.updateStats();
         this._dirty = true;
@@ -636,6 +718,11 @@ export class Viewer {
 
         this.bounds = data.bounds;
         this.coordOffset = data.offset || null;
+        // Splats are not exportable as LAS — leave nothing for the export to grab.
+        this.sourcePath = null;
+        this._polyOps.length = 0;
+        this._polyOpsRedo.length = 0;
+        _updateUndoRedoButtons(this);
 
         document.getElementById('no-data-msg').style.display = 'none';
         const ptsEl = document.getElementById('viewer-pts');
@@ -738,9 +825,14 @@ export class Viewer {
         this._dsRatio = ratio;
 
         // Snapshots hold the pre-downsample array sizes; restoring one into the
-        // rebuilt (smaller) geometry would throw RangeError mid-undo.
+        // rebuilt (smaller) geometry would throw RangeError mid-undo. The
+        // geometry below is rebuilt from _fullCloudData, which also discards any
+        // polygon cuts — drop the op log with it so an export can't re-apply
+        // edits the viewer no longer shows.
         this._undoStack.length = 0;
         this._redoStack.length = 0;
+        this._polyOps.length = 0;
+        this._polyOpsRedo.length = 0;
         _updateUndoRedoButtons(this);
 
         const display = this._downsampleData(this._fullCloudData, ratio);
@@ -1807,6 +1899,8 @@ export class Viewer {
     _closePoly() { _closePoly(this); }
     _isPointInPoly2D(px, py, poly) { return _isPointInPoly2D(px, py, poly); }
     async applyPolyFilter(keep) { return _applyPolyFilter(this, keep); }
+    async saveSelectionLas() { return _saveSelectionLas(this); }
+    selectionExportBlocker() { return _selectionExportBlocker(this); }
 
     _recalcBounds() {
         let xMin = Infinity, xMax = -Infinity;
@@ -1833,6 +1927,7 @@ export class Viewer {
     /* ── Undo/Redo (delegation) ── */
     undoFilter() { _undoFilter(this); }
     redoFilter() { _redoFilter(this); }
+    updateUndoRedoButtons() { _updateUndoRedoButtons(this); }
 
     /* ── Cloud Transform ── */
     setCloudOffset(x, y, z) {
