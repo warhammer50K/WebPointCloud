@@ -62,12 +62,20 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 
 ## Quick Start
 
+**Requires Python 3.10 – 3.13.**
+
 ```bash
 git clone https://github.com/warhammer50K/WebPointCloud.git
 cd WebPointCloud
+
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
 pip install -r requirements.txt
 python app.py
 ```
+
+The virtual environment is not just a nicety — Ubuntu 24.04, Debian 12, and recent Fedora ship a [PEP 668](https://peps.python.org/pep-0668/) marked interpreter, so installing into the system Python fails outright with `error: externally-managed-environment`.
 
 Open **http://localhost:6001** in your browser, then drag & drop a point cloud file, or place files under the maps directory (default `~/maps`) and pick them from **Load Map**.
 
@@ -108,6 +116,15 @@ Small files are parsed and rendered whole. Large LAS/LAZ files (≥ 2M points by
 
 COPC maps are never loaded whole. The viewer streams octree nodes on demand from the current camera view — coarse levels for the whole scene, finer levels only where the camera is looking — under a resident point budget (25M points by default). Chunks that fall out of view or budget are evicted and re-fetched later. This is why a multi-GB, hundred-million-point map opens in seconds and stays smooth while navigating, where parsing the raw LAS up front would take minutes and exhaust GPU memory.
 
+### Conversion backends
+
+Conversion tries two backends in order, so no extra setup is needed for the common case:
+
+1. **PDAL** (`pdal translate -w writers.copc`) — used automatically if PDAL **>= 2.4** is on `PATH`. Optional; typically the fastest option on large files.
+2. **copclib** — the bundled multiprocess octree builder in `tools/las_to_copc.py`. Installed by `requirements.txt`, so this path always works out of the box.
+
+If neither is available, conversion is skipped and the file falls back to the legacy whole-cloud load path.
+
 `.copc.laz` files can also be produced offline with `tools/las_to_copc.py <input.las>` (multiprocess writer; see the `WPC_COPC_*` variables below).
 
 ## Classification Coloring
@@ -131,14 +148,50 @@ Notes:
 | `WEB_PORT` | `6001` | HTTP server port |
 | `WPC_DATA_DIR` | `~/webpointcloud` | Data directory (maps + logs) |
 | `WPC_MAPS_DIR` | `~/maps` | Point cloud storage directory |
-| `FLASK_DEBUG` | `0` | Enable Flask debug mode |
+| `FLASK_DEBUG` | `0` | Enable Flask debug mode (forces the bind address to `127.0.0.1` — see [Security](#security)) |
+| `WPC_ALLOW_REMOTE_DEBUG` | `0` | Set to `1` to let debug mode bind `0.0.0.0`. **Exposes the Werkzeug debugger — remote code execution for anyone who can reach the port.** |
 | `FLASK_SECRET_KEY` | auto-generated | Flask session secret key |
-| `WPC_PUBLIC` | `0` | Set to `1` to disable IP whitelist (for public deployments) |
+| `WPC_PUBLIC` | `0` | Set to `1` to disable the IP whitelist (see [Security](#security)) |
 | `WPC_MAX_UPLOAD_MB` | `5120` | Maximum upload size in MB |
 | `WPC_COPC_MIN_POINTS` | `2000000` | Point count above which LAS/LAZ auto-converts to COPC streaming |
 | `WPC_COPC_BUDGET` | `25000000` | Resident point budget for COPC streaming (~28 B/point on GPU) |
 | `WPC_COPC_WRITE_PROCS` | `8` | COPC converter: parallel write processes |
 | `WPC_COPC_MIN_NODE` | `2000` | COPC converter: collapse octree leaves below this point count |
+| `WPC_COPC_PARALLEL_MIN` | `2000000` | COPC converter: point count below which the build stays single-process |
+| `WPC_COPC_SPLIT_DEPTH` | `3` | COPC converter: octree depth at which subtrees fan out to worker processes |
+
+## Security
+
+WebPointCloud is built as a **LAN / workstation tool**, not as an internet-facing service. There is no user authentication — anyone allowed through the checks below can browse, upload, rename, and delete point clouds under the maps directory.
+
+The server binds `0.0.0.0:6001` so other machines on your network can reach it, and two `before_request` checks guard it:
+
+- **IP whitelist** — requests are accepted only from loopback and private ranges: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` (CGNAT / Tailscale), `::1`, `fe80::/10`. Anything else gets `403`.
+- **Rate limit** — 60 requests per 60 seconds per IP, then `429`. `/api/copc/*` is exempt, since octree streaming issues many node fetches per camera move; the IP whitelist still applies to it. `/static/` skips both checks.
+
+Two settings deliberately weaken this, and both are off by default:
+
+| Setting | What it does | Use only when |
+|---|---|---|
+| `WPC_PUBLIC=1` | Removes the IP whitelist entirely — every source IP is accepted | The app sits behind a reverse proxy that terminates TLS **and** enforces authentication |
+| `WPC_ALLOW_REMOTE_DEBUG=1` | Lets `FLASK_DEBUG=1` bind `0.0.0.0` instead of being forced to loopback | Never on a shared network — the Werkzeug interactive debugger is remote code execution for anyone who can reach the port |
+
+Also worth knowing:
+
+- `python app.py` runs Flask's **development server**. For anything beyond a trusted LAN, put it behind a production WSGI server (gunicorn, uWSGI) and a reverse proxy.
+- `FLASK_SECRET_KEY` is read from the environment; if unset, a random key is generated and persisted to `~/.mapper_secret_key` with mode `0600`. Set it explicitly for any multi-instance or long-lived deployment.
+- Upload size is capped at `WPC_MAX_UPLOAD_MB` (default 5 GB), and map filenames are constrained to paths inside the maps directory.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt   # requirements.txt + pytest
+pytest
+```
+
+The suite covers path-traversal handling and rotation math in `api.py`, the rate limiter, and 3DGS parsing / binary packing in `pointcloud_io.py`. No server or sample data is required — the tests run standalone from the repository root.
+
+`tests/make_utm_test_data.py` is a helper, not a test: run it to generate large-coordinate UTM sample files under `sample/` for manually checking float64 centering in the viewer.
 
 ## Architecture
 
@@ -161,6 +214,8 @@ Browser ──── HTTP ────── Flask (Python)
 | [laspy](https://github.com/laspy/laspy) | BSD-2 | LAS file I/O |
 | [NumPy](https://numpy.org/) | BSD-3 | Numerical computing |
 | [SciPy](https://scipy.org/) | BSD-3 | Spatial algorithms (KDTree, SOR) |
+| [copc-lib](https://github.com/RockRobotic/copc-lib) | BSD-3 | COPC octree writing (`copclib`) |
+| [PDAL](https://pdal.io/) *(optional)* | BSD-3 | Preferred COPC conversion backend when installed |
 
 ## Contributing
 
