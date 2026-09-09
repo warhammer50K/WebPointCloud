@@ -156,6 +156,44 @@
             </div>
         </div>
 
+        <!-- Live Stream -->
+        <div class="panel">
+            <div class="accordion-header collapsed" data-accordion="live">
+                <h3>Live Stream <span class="text-hint">ROS 2</span></h3>
+                <span class="accordion-arrow">&#9660;</span>
+            </div>
+            <div class="accordion-body collapsed" data-accordion-body="live">
+                <div class="btn-row">
+                    <button class="btn primary flex-1" id="btn-live-connect">Connect</button>
+                    <button class="btn" id="btn-live-clear" title="Remove streamed points from the scene">Clear</button>
+                </div>
+                <div class="ctrl-row"><label>Poll</label>
+                    <input type="range" id="live-poll" min="33" max="1000" step="1" value="100" class="flex-1">
+                    <span class="text-mono-sm" id="live-poll-label">10 Hz</span>
+                </div>
+                <hr class="sep">
+                <div class="sub-label">Layers</div>
+                <div class="ctrl-row compact"><input type="checkbox" id="ckb-live-cur" checked><label for="ckb-live-cur">Current scan</label></div>
+                <div class="ctrl-row compact"><input type="checkbox" id="ckb-live-raw" checked><label for="ckb-live-raw">Raw scan</label></div>
+                <div class="ctrl-row compact"><input type="checkbox" id="ckb-live-kfrm" checked><label for="ckb-live-kfrm">Accumulated</label></div>
+                <hr class="sep">
+                <div class="sub-label">Pose</div>
+                <div class="ctrl-row compact"><input type="checkbox" id="ckb-live-follow"><label for="ckb-live-follow">Follow the robot</label></div>
+                <div class="ctrl-row"><label class="narrow">Height</label>
+                    <input type="range" id="live-follow-height" min="2" max="200" step="1" value="30" class="flex-1">
+                    <span class="text-mono-sm" id="live-follow-height-label">30 m</span>
+                </div>
+                <div class="ctrl-row compact"><input type="checkbox" id="ckb-live-traj" checked><label for="ckb-live-traj">Trajectory</label></div>
+                <hr class="sep">
+                <div class="status-row"><span class="status-label">Status</span><span class="status-value" id="live-status">Idle</span></div>
+                <div class="status-row"><span class="status-label">Frames</span><span class="status-value" id="live-fps">&mdash;</span></div>
+                <div class="status-row"><span class="status-label">Points</span><span class="status-value" id="live-points">&mdash;</span></div>
+                <div class="status-row"><span class="status-label">Latency</span><span class="status-value" id="live-latency">&mdash;</span></div>
+                <div id="live-streams" class="text-mono-sm mt-6"></div>
+                <p class="text-hint mt-6">Publish a topic with<br><code>tools/ros2_bridge.py --topic /your_cloud</code></p>
+            </div>
+        </div>
+
         <!-- Tabs -->
         <div class="tab-bar">
             <button class="tab-btn active" data-tab="tab-analysis">Analysis</button>

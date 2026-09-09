@@ -1576,13 +1576,34 @@ export class Viewer {
     clearAll() {
         this.clearCloud('pointCloud');
         this.cloudData = null;
-        for (const key of ['rawCloud', 'curCloud', 'mapCloud']) this.clearCloud(key);
-        this.clearKfrmClouds();
+        this.clearLive();
         this.clearConstraintGraph();
         this.clearKfMarkers();
         this.clearCopc();
         this.clearGaussianSplat();
         this.clearCompare();
+    }
+
+    /* ── Live streaming ── */
+
+    /** Wipe everything a live stream put in the scene, file clouds untouched. */
+    clearLive() {
+        for (const key of ['rawCloud', 'curCloud', 'mapCloud']) this.clearCloud(key);
+        this.clearKfrmClouds();   // also clears the trajectory
+        this.clearPoseMarker();
+    }
+
+    clearPoseMarker() {
+        if (!this.poseMarker) return;
+        this.scene.remove(this.poseMarker);
+        // The marker is a Group of three axis cylinders — disposing the group
+        // itself frees nothing, so walk the children.
+        for (const child of this.poseMarker.children) {
+            child.geometry.dispose();
+            child.material.dispose();
+        }
+        this.poseMarker = null;
+        this._dirty = true;
     }
 
     clearKfMarkers() {

@@ -102,6 +102,11 @@ def init_security(app, logger, rate_limiter=None):
         # whitelist check above still applies.
         if request.path.startswith('/api/copc/'):
             return None
+        # Live streaming is the same story an order of magnitude worse: the
+        # bridge publishes at sensor rate and the viewer polls at frame rate,
+        # so a 60/minute limit would cut a working stream dead within seconds.
+        if request.path.startswith('/api/live/'):
+            return None
         if not rate_limiter.is_allowed(client_ip):
             logger.warning(f"[Security] Rate limit exceeded for {client_ip}")
             abort(429)

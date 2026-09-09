@@ -74,6 +74,9 @@ app.config['LOGGER'] = logger
 from api import api_bp  # noqa: E402
 app.register_blueprint(api_bp)
 
+from live import live_bp  # noqa: E402
+app.register_blueprint(live_bp)
+
 # ── Security middleware (IP whitelist + rate limiting) ─
 init_security(app, logger, _rate_limiter)
 

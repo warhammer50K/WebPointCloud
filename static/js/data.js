@@ -134,6 +134,25 @@ export function workerParseMultiblob(buffer) {
     });
 }
 
+/** Parse one live frame (fpp=7, optionally zlib-wrapped) in the worker.
+ *  Live frames arrive at sensor rate, so the timeout is a fixed short one
+ *  rather than the size-scaled budget a multi-gigabyte file parse gets: a
+ *  frame that takes seconds is already too late to draw and holding the
+ *  worker for it only delays the frames behind it. */
+export function workerParseRealtime(buffer, numPoints, compressed = false) {
+    if (_workerNotSupported) return Promise.reject(new Error('Web Worker API not supported'));
+    return new Promise((resolve, reject) => {
+        const id = ++_workerId;
+        const worker = _nextWorker();
+        const timeout = setTimeout(() => {
+            _workerCallbacks.delete(id);
+            reject(new Error('Live frame parse timed out'));
+        }, 10000);
+        _workerCallbacks.set(id, { resolve, reject, timeout, worker });
+        worker.postMessage({ id, type: 'realtime', n: numPoints, buffer, compressed }, [buffer]);
+    });
+}
+
 export async function loadLasFromPath(path, opts = {}) {
     // opts.previewPoints > 0 asks the server for a bounded raw payload even
     // for COPC files (compare overlay) instead of streaming meta.

@@ -43,6 +43,7 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 - **Large Coordinate Support** — UTM / survey coordinates handled with automatic float64 centering to prevent precision loss
 - **Clipping Planes** — X/Y/Z axis clipping
 - **Camera Bookmarks** — Save and restore camera positions
+- **Live Streaming** — View a ROS 2 `PointCloud2` topic in real time, with the robot pose and trajectory (see [Live Streaming](#live-streaming-ros-2))
 
 ### Analysis
 - **Statistics** — Point count, bounding box, density, height distribution histogram
@@ -127,6 +128,64 @@ If neither is available, conversion is skipped and the file falls back to the le
 
 `.copc.laz` files can also be produced offline with `tools/las_to_copc.py <input.las>` (multiprocess writer; see the `WPC_COPC_*` variables below).
 
+## Live Streaming (ROS 2)
+
+Besides files, the viewer can render a **live** point cloud pushed to it while it is running — a lidar scan, a SLAM map being built, anything published as `sensor_msgs/PointCloud2`.
+
+```bash
+# on the robot (or anywhere with the topic visible)
+source /opt/ros/humble/setup.bash
+python3 tools/ros2_bridge.py --topic /velodyne_points
+```
+
+Then open the viewer, expand **Live Stream** in the sidebar, and press **Connect**. The panel lists the active streams with their rate and point count.
+
+### How it fits together
+
+```
+ros2_bridge.py ──HTTP POST──▶ /api/live/publish ──polled──▶ browser
+ (needs rclpy)                  (Flask, no ROS)              (Three.js)
+```
+
+The bridge is the only piece that needs ROS. It decodes `PointCloud2`, thins the cloud to a rendering budget, and POSTs plain float32 frames; the server holds the newest frame per stream and hands it to whichever browsers ask. So the machine running `app.py` never needs a ROS install, and the bridge can run on the robot while the viewer runs on a laptop — point `--url` at it.
+
+### Bridge options
+
+| Flag | Default | What it is for |
+|---|---|---|
+| `--topic` | *(required)* | The `PointCloud2` topic to subscribe to |
+| `--url` | `http://localhost:6001` | Where `app.py` is listening |
+| `--layer` | `cur` | `cur`/`raw`/`map` replace the cloud each frame; `kfrm` **accumulates** frames into one growing map |
+| `--rate` | `10` | Max frames published per second (`0` = every frame) |
+| `--max-points` | `400000` | Thin each frame to this many points |
+| `--voxel` | `0` | Voxel size in metres to thin by first — much better than plain thinning for dense map clouds |
+| `--qos` | `best-effort` | **Must match the publisher.** See below |
+| `--transient-local` | off | For latched topics that publish a map once |
+| `--odom` / `--pose` | — | `nav_msgs/Odometry` or `geometry_msgs/PoseStamped` topic to drive the pose marker and trajectory |
+| `--intensity-max` | `0` (auto) | Intensity value that maps to full brightness |
+| `--compress` | `1` | zlib level for the wire payload (`0` = off) |
+| `--token` | — | Required when the server sets `WPC_LIVE_TOKEN` |
+
+**If nothing shows up, check QoS first.** A `RELIABLE` subscriber receives *nothing at all* from a `BEST_EFFORT` publisher — no error, no warning — and most sensor drivers publish best-effort. That is why the default here is `best-effort`; a latched map topic may need `--qos reliable --transient-local` instead. `ros2 topic info -v <topic>` shows what the publisher offers.
+
+### Publishing from something other than ROS
+
+The relay knows nothing about ROS, so anything that can POST can feed it:
+
+```
+POST /api/live/publish?stream=<name>&layer=cur&points=<n>&compressed=0
+body: n × 7 little-endian float32 — x, y, z, intensity, r, g, b
+```
+
+Intensity and RGB are `0..1` (the shaders read them as normalized values), and coordinates are float32 metres in whatever frame you choose. With `compressed=1` the body is a 4-byte little-endian original length followed by a zlib stream of the same data. Poses go to `/api/live/pose` as `{"matrix": [16 column-major floats]}`.
+
+### Notes and limits
+
+- **Frames are not queued** for `cur`/`raw`/`map`: only the newest is held, so a browser that cannot keep up skips frames rather than falling behind. The `kfrm` layer does queue (bounded by `WPC_LIVE_QUEUE_MB`), because a dropped frame there is a permanent hole in the accumulated map.
+- Live layers coexist with a loaded file, but the **analysis tools operate on the file cloud**, not on streamed points.
+- The transport is HTTP polling, not WebSocket — sized for a LAN, where a poll costs a couple of milliseconds.
+- A publisher that goes quiet for `WPC_LIVE_STALE_SEC` (15 s) is dropped, so a stale cloud does not sit on screen pretending to be live.
+
 ## Classification Coloring
 
 LAS/LAZ point classification (ground, vegetation, building, water, …) is carried through the whole pipeline — direct loads, COPC conversion, and streaming — and can be used as a color mode:
@@ -159,6 +218,11 @@ Notes:
 | `WPC_COPC_MIN_NODE` | `2000` | COPC converter: collapse octree leaves below this point count |
 | `WPC_COPC_PARALLEL_MIN` | `2000000` | COPC converter: point count below which the build stays single-process |
 | `WPC_COPC_SPLIT_DEPTH` | `3` | COPC converter: octree depth at which subtrees fan out to worker processes |
+| `WPC_LIVE_TOKEN` | *(unset)* | Shared secret for live publishing; **required** when `WPC_PUBLIC=1` |
+| `WPC_LIVE_MAX_FRAME_MB` | `32` | Maximum size of one live frame |
+| `WPC_LIVE_QUEUE_MB` | `64` | Backlog held for an accumulating (`kfrm`) live stream |
+| `WPC_LIVE_MAX_STREAMS` | `8` | Maximum concurrent live publishers |
+| `WPC_LIVE_STALE_SEC` | `15` | Silence after which a live publisher is considered gone |
 
 ## Security
 
@@ -167,7 +231,7 @@ WebPointCloud is built as a **LAN / workstation tool**, not as an internet-facin
 The server binds `0.0.0.0:6001` so other machines on your network can reach it, and two `before_request` checks guard it:
 
 - **IP whitelist** — requests are accepted only from loopback and private ranges: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` (CGNAT / Tailscale), `::1`, `fe80::/10`. Anything else gets `403`.
-- **Rate limit** — 60 requests per 60 seconds per IP, then `429`. `/api/copc/*` is exempt, since octree streaming issues many node fetches per camera move; the IP whitelist still applies to it. `/static/` skips both checks.
+- **Rate limit** — 60 requests per 60 seconds per IP, then `429`. `/api/copc/*` and `/api/live/*` are exempt, since octree streaming and live polling both run far above that rate; the IP whitelist still applies to them. `/static/` skips both checks.
 
 Two settings deliberately weaken this, and both are off by default:
 
@@ -181,6 +245,7 @@ Also worth knowing:
 - `python app.py` runs Flask's **development server**. For anything beyond a trusted LAN, put it behind a production WSGI server (gunicorn, uWSGI) and a reverse proxy.
 - `FLASK_SECRET_KEY` is read from the environment; if unset, a random key is generated and persisted to `~/.mapper_secret_key` with mode `0600`. Set it explicitly for any multi-instance or long-lived deployment.
 - Upload size is capped at `WPC_MAX_UPLOAD_MB` (default 5 GB), and map filenames are constrained to paths inside the maps directory.
+- **Live publishing writes into what every viewer sees.** Behind the IP whitelist that is fine, but `WPC_PUBLIC=1` removes that gate — so with it set, `/api/live/publish` refuses everything unless `WPC_LIVE_TOKEN` is configured and sent as `X-Live-Token`. Reading a live stream never needs a token.
 
 ## Development
 
@@ -189,18 +254,19 @@ pip install -r requirements-dev.txt   # requirements.txt + pytest
 pytest
 ```
 
-The suite covers path-traversal handling and rotation math in `api.py`, the rate limiter, and 3DGS parsing / binary packing in `pointcloud_io.py`. No server or sample data is required — the tests run standalone from the repository root.
+The suite covers path-traversal handling and rotation math in `api.py`, the rate limiter, 3DGS parsing / binary packing in `pointcloud_io.py`, the live relay's publish/poll contract in `live.py`, and `PointCloud2` decoding in `tools/ros2_bridge.py`. No server, sample data, or ROS install is required — the tests run standalone from the repository root.
 
 `tests/make_utm_test_data.py` is a helper, not a test: run it to generate large-coordinate UTM sample files under `sample/` for manually checking float64 centering in the viewer.
 
 ## Architecture
 
 ```
-Browser ──── HTTP ────── Flask (Python)
-  │                        │
+Browser ──── HTTP ────── Flask (Python) ◀──POST── ros2_bridge.py
+  │                        │                       (ROS 2 side, optional)
   ├─ Three.js 3D viewer    ├─ REST API (/api/*)
   ├─ WebGL shaders         ├─ LAS read/write (laspy)
   ├─ Analysis UI           ├─ Analysis (numpy, scipy)
+  ├─ Live stream client    ├─ Live relay (/api/live/*)
   └─ Web Workers           └─ File management
 ```
 
