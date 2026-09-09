@@ -151,6 +151,36 @@ def gaussians_to_binary(x, y, z, r, g, b, sx, sy, sz, r0, r1, r2, r3, opacity, n
 #  LAS / LAZ
 # ══════════════════════════════════════════════════════
 
+def _normalize_rgb(r, g, b):
+    """Scale colour channels to the 0..1 the viewer's shaders expect.
+
+    Three encodings turn up in the wild and none of them is declared in the
+    file: floats already in 0..1, 8-bit 0..255, and 16-bit 0..65535 (PLY
+    `property ushort red`, and anything round-tripped through LAS, which is
+    16-bit by spec). Guessing from the observed maximum is the only option.
+
+    Guessing wrong is not merely cosmetic: dividing 16-bit values by 255 leaves
+    them around 200, so every point saturates to white in the shader, and
+    write_las then multiplies by 65535 again on export — the error is baked
+    into the written file.
+
+    The maximum is taken across all three channels, not just red: a scene with
+    no red in it (r.max() == 0) would otherwise be classified from a channel
+    that carries no signal.
+    """
+    r = np.asarray(r, dtype=np.float32)
+    g = np.asarray(g, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    peak = max(float(r.max(initial=0)), float(g.max(initial=0)),
+               float(b.max(initial=0)))
+    if peak > 255.0:
+        scale = 65535.0
+    elif peak > 1.0:
+        scale = 255.0
+    else:
+        return r, g, b            # already normalized floats
+    return r / scale, g / scale, b / scale
+
 def _read_las(path):
     import laspy
     las = laspy.read(path)
@@ -173,11 +203,7 @@ def _read_las(path):
         r = np.array(las.red, dtype=np.float32)
         g = np.array(las.green, dtype=np.float32)
         b = np.array(las.blue, dtype=np.float32)
-        rmax = max(r.max(), 1)
-        if rmax > 255:
-            r /= 65535.0; g /= 65535.0; b /= 65535.0
-        else:
-            r /= 255.0; g /= 255.0; b /= 255.0
+        r, g, b = _normalize_rgb(r, g, b)
     else:
         r = np.full(n, 0.5, dtype=np.float32)
         g = np.full(n, 0.5, dtype=np.float32)
@@ -354,9 +380,7 @@ def _read_ply(path):
     b = _col(['blue', 'b', 'diffuse_blue'])
     has_rgb = r is not None and g is not None and b is not None
     if has_rgb:
-        rmax = max(r.max(), 1)
-        if rmax > 1.0:
-            r /= 255.0; g /= 255.0; b /= 255.0
+        r, g, b = _normalize_rgb(r, g, b)
     else:
         r = np.full(n, 0.5, dtype=np.float32)
         g = np.full(n, 0.5, dtype=np.float32)
@@ -591,9 +615,7 @@ def _read_xyz(path):
         r = data[:, 4].astype(np.float32)
         g = data[:, 5].astype(np.float32)
         b = data[:, 6].astype(np.float32)
-        rmax = max(r.max(), 1)
-        if rmax > 1.0:
-            r /= 255.0; g /= 255.0; b /= 255.0
+        r, g, b = _normalize_rgb(r, g, b)
         has_rgb = True
     elif cols >= 6:
         # x y z r g b
@@ -601,9 +623,7 @@ def _read_xyz(path):
         r = data[:, 3].astype(np.float32)
         g = data[:, 4].astype(np.float32)
         b = data[:, 5].astype(np.float32)
-        rmax = max(r.max(), 1)
-        if rmax > 1.0:
-            r /= 255.0; g /= 255.0; b /= 255.0
+        r, g, b = _normalize_rgb(r, g, b)
         has_rgb = True
     elif cols >= 4:
         # x y z intensity
@@ -755,10 +775,7 @@ def _read_pcd(path):
         g_raw = _col(['g', 'green'])
         b_raw = _col(['b', 'blue'])
         if r_raw is not None and g_raw is not None and b_raw is not None:
-            rmax = max(r_raw.max(), 1)
-            if rmax > 1.0:
-                r_raw /= 255.0; g_raw /= 255.0; b_raw /= 255.0
-            r, g, b = r_raw, g_raw, b_raw
+            r, g, b = _normalize_rgb(r_raw, g_raw, b_raw)
             has_rgb = True
         else:
             r = np.full(n, 0.5, dtype=np.float32)
@@ -838,9 +855,7 @@ def _read_pts(path):
         r = data[:, 4].astype(np.float32)
         g = data[:, 5].astype(np.float32)
         b = data[:, 6].astype(np.float32)
-        rmax = max(r.max(), 1)
-        if rmax > 1.0:
-            r /= 255.0; g /= 255.0; b /= 255.0
+        r, g, b = _normalize_rgb(r, g, b)
         has_rgb = True
     elif cols >= 4:
         intensity = data[:, 3].astype(np.float32)
