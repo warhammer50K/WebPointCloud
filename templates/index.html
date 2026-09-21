@@ -55,6 +55,10 @@
                 <input type="range" id="gamma-slider" min="0" max="1.0" step="0.05" value="0.6" style="flex:1">
                 <input type="number" id="gamma-spin" min="0" max="1.0" step="0.05" value="0.6" style="width:55px">
             </div>
+            <div class="ctrl-row"><label>Saturation (RGB)</label>
+                <input type="range" id="sat-slider" min="0" max="3.0" step="0.05" value="1.0" style="flex:1">
+                <input type="number" id="sat-spin" min="0" max="3.0" step="0.05" value="1.0" style="width:55px">
+            </div>
             <div class="ctrl-row"><label>View</label>
                 <select id="sel-view"><option value="free">Free</option><option value="top">Top</option><option value="xy">X-Y</option><option value="xz">X-Z</option><option value="yz">Y-Z</option></select>
             </div>
@@ -101,6 +105,7 @@
                 <span class="accordion-arrow">&#9660;</span>
             </div>
             <div class="accordion-body" data-accordion-body="view-postfilter">
+            <div class="ctrl-row compact"><input type="checkbox" id="ckb-gap-fill" checked><label for="ckb-gap-fill">Gap Fill (빈 틈 채우기)</label></div>
             <div class="ctrl-row compact"><input type="checkbox" id="ckb-edl"><label for="ckb-edl">EDL (Eye-Dome Lighting)</label></div>
             <div class="ctrl-row"><label class="narrow">Str</label>
                 <input type="range" id="edl-strength" min="0.1" max="5.0" step="0.1" value="1.0" class="flex-1">

@@ -69,18 +69,43 @@ Load, visualize, and analyze LAS/LAZ point cloud files directly in your browser 
 git clone https://github.com/warhammer50K/WebPointCloud.git
 cd WebPointCloud
 
+python3 app.py
+```
+
+The first run creates `.venv`, installs `requirements.txt` into it, and re-execs there; later runs skip straight to the server. `./run.sh` does the same thing from the shell side, and activating the venv yourself still works:
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-
 pip install -r requirements.txt
 python app.py
 ```
 
-The virtual environment is not just a nicety — Ubuntu 24.04, Debian 12, and recent Fedora ship a [PEP 668](https://peps.python.org/pep-0668/) marked interpreter, so installing into the system Python fails outright with `error: externally-managed-environment`.
+The virtual environment is not just a nicety — Ubuntu 24.04, Debian 12, and recent Fedora ship a [PEP 668](https://peps.python.org/pep-0668/) marked interpreter, so installing into the system Python fails outright with `error: externally-managed-environment`. That is why `app.py` builds one instead of asking pip to install anywhere. Set `WPC_NO_BOOTSTRAP=1` to turn the bootstrap off and manage the environment entirely yourself.
 
-Open **http://localhost:6001** in your browser, then drag & drop a point cloud file, or place files under the maps directory (default `~/maps`) and pick them from **Load Map**.
+Open **http://localhost:6001** in your browser and drag & drop a point cloud file. A sample is included at `sample/building_scan.las` (100k points) — drag it in to try the viewer out.
 
-A sample point cloud is included at `sample/building_scan.las` (100k points) — drag it into the viewer to try it out.
+For clouds you keep around, copy them into the **maps directory** and pick them from **Load Map** instead. New installs use `~/webpointcloud/maps`; if you already have a `~/maps`, that keeps being used. The startup banner prints the path it actually chose:
+
+```
+  Maps dir : /home/you/webpointcloud/maps
+```
+
+Both layouts show up in the list, so either works:
+
+```
+~/webpointcloud/maps/
+├── scan.las              ← a file on its own
+└── warehouse_run/        ← or a folder holding one or more clouds
+    ├── map.las
+    └── map.copc.laz      (the streaming conversion, built on first load)
+```
+
+Already have a collection somewhere else? Point the app at it — nothing is copied or moved:
+
+```bash
+WPC_MAPS_DIR=~/maps python3 app.py
+```
 
 ## Supported Formats
 
@@ -205,8 +230,8 @@ Notes:
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `WEB_PORT` | `6001` | HTTP server port |
-| `WPC_DATA_DIR` | `~/webpointcloud` | Data directory (maps + logs) |
-| `WPC_MAPS_DIR` | `~/maps` | Point cloud storage directory |
+| `WPC_DATA_DIR` | `~/webpointcloud` | Everything the app owns: maps, logs, caches, session secret |
+| `WPC_MAPS_DIR` | `~/maps` if it exists, else `$WPC_DATA_DIR/maps` | Where point clouds are read from — set it to use a collection you already have |
 | `FLASK_DEBUG` | `0` | Enable Flask debug mode (forces the bind address to `127.0.0.1` — see [Security](#security)) |
 | `WPC_ALLOW_REMOTE_DEBUG` | `0` | Set to `1` to let debug mode bind `0.0.0.0`. **Exposes the Werkzeug debugger — remote code execution for anyone who can reach the port.** |
 | `FLASK_SECRET_KEY` | auto-generated | Flask session secret key |
@@ -223,6 +248,15 @@ Notes:
 | `WPC_LIVE_QUEUE_MB` | `64` | Backlog held for an accumulating (`kfrm`) live stream |
 | `WPC_LIVE_MAX_STREAMS` | `8` | Maximum concurrent live publishers |
 | `WPC_LIVE_STALE_SEC` | `15` | Silence after which a live publisher is considered gone |
+
+### Upgrading from an earlier version
+
+**Existing installs and forks keep working unchanged — nothing is moved, renamed, or deleted.** The defaults used to spread four directories across `$HOME` (`~/maps`, `~/webpointcloud`, `~/.webpointcloud`, `~/.mapper_secret_key`), and a fresh install now puts everything under `WPC_DATA_DIR` instead. The old locations still win where they already exist:
+
+- **Maps.** An existing `~/maps` stays the default, so your clouds are where they were. Only a machine that has never had one gets `$WPC_DATA_DIR/maps`. Either way the startup banner prints the path in use.
+- **Session secret.** An existing `~/.mapper_secret_key` is read where it is and left alone; sessions are unaffected. New installs write `$WPC_DATA_DIR/secret_key` instead. To consolidate, move the file yourself and it will be picked up from the new path.
+
+For forks, the only API change is additive: `/api/maps` entries gained an `is_file` flag and now include loose files as single-file entries. `name`, `path` and `las_files` keep their meaning, and `path` + `las_files[0]` still resolves to the cloud for both layouts.
 
 ## Security
 
@@ -243,7 +277,7 @@ Two settings deliberately weaken this, and both are off by default:
 Also worth knowing:
 
 - `python app.py` runs Flask's **development server**. For anything beyond a trusted LAN, put it behind a production WSGI server (gunicorn, uWSGI) and a reverse proxy.
-- `FLASK_SECRET_KEY` is read from the environment; if unset, a random key is generated and persisted to `~/.mapper_secret_key` with mode `0600`. Set it explicitly for any multi-instance or long-lived deployment.
+- `FLASK_SECRET_KEY` is read from the environment; if unset, a random key is generated and persisted to `$WPC_DATA_DIR/secret_key` with mode `0600`. Set it explicitly for any multi-instance or long-lived deployment.
 - Upload size is capped at `WPC_MAX_UPLOAD_MB` (default 5 GB), and map filenames are constrained to paths inside the maps directory.
 - **Live publishing writes into what every viewer sees.** Behind the IP whitelist that is fine, but `WPC_PUBLIC=1` removes that gate — so with it set, `/api/live/publish` refuses everything unless `WPC_LIVE_TOKEN` is configured and sent as `X-Live-Token`. Reading a live stream never needs a token.
 
@@ -254,7 +288,7 @@ pip install -r requirements-dev.txt   # requirements.txt + pytest
 pytest
 ```
 
-The suite covers path-traversal handling and rotation math in `api.py`, the rate limiter, 3DGS parsing / binary packing in `pointcloud_io.py`, the live relay's publish/poll contract in `live.py`, and `PointCloud2` decoding in `tools/ros2_bridge.py`. No server, sample data, or ROS install is required — the tests run standalone from the repository root.
+The suite covers the maps listing / rename / delete endpoints and path-traversal handling in `api.py`, rotation math, the rate limiter, 3DGS parsing / binary packing in `pointcloud_io.py`, the live relay's publish/poll contract in `live.py`, and `PointCloud2` decoding in `tools/ros2_bridge.py`. No server, sample data, or ROS install is required — the tests run standalone from the repository root.
 
 `tests/make_utm_test_data.py` is a helper, not a test: run it to generate large-coordinate UTM sample files under `sample/` for manually checking float64 centering in the viewer.
 

@@ -136,6 +136,8 @@ function parseBinary(buffer) {
     // fpp=8 carries LAS classification as the 8th float; zeros otherwise.
     const classifications = new Float32Array(numPoints);
     const hasClass = fpp >= 8;
+    // fpp=9 adds each point's footprint in metres (photo-baked maps); 0 = unknown.
+    const splats = fpp >= 9 ? new Float32Array(numPoints) : null;
 
     for (let i = 0; i < numPoints; i++) {
         const b = i * fpp;
@@ -147,8 +149,9 @@ function parseBinary(buffer) {
         colors[i * 3 + 1]    = raw[b + 5];
         colors[i * 3 + 2]    = raw[b + 6];
         if (hasClass) classifications[i] = raw[b + 7];
+        if (splats) splats[i] = raw[b + 8];
     }
-    return { positions, intensities, colors, classifications, bounds, numPoints, offset };
+    return { positions, intensities, colors, classifications, splats, bounds, numPoints, offset };
 }
 
 /* ── COPC multi-blob: merge many node payloads into ONE geometry buffer ──
@@ -179,6 +182,7 @@ function parseMultiblob(buffer) {
     const intensities = new Float32Array(totalN);
     const colors = new Float32Array(totalN * 3);
     const classifications = new Float32Array(totalN);
+    const splats = new Float32Array(totalN);    // footprint (m), 0 = unknown
     const nodeKeys = [];
     const nodeCounts = [];
     let w = 0;
@@ -192,12 +196,13 @@ function parseMultiblob(buffer) {
             intensities[w] = raw[s + 3];
             colors[o] = raw[s + 4]; colors[o + 1] = raw[s + 5]; colors[o + 2] = raw[s + 6];
             if (hasClass) classifications[w] = raw[s + 7];
+            if (b.fpp >= 9) splats[w] = raw[s + 8];
             w++;
         }
         nodeKeys.push(b.key);
         nodeCounts.push(b.n);
     }
-    return { positions, intensities, colors, classifications, numPoints: totalN, nodeKeys, nodeCounts };
+    return { positions, intensities, colors, classifications, splats, numPoints: totalN, nodeKeys, nodeCounts };
 }
 
 /* ── Point-in-polygon (ray casting) ── */
@@ -216,6 +221,7 @@ function isPointInPoly2D(px, py, poly) {
 /* ── Polygon Filter (runs in worker to avoid UI freeze) ── */
 function filterPoints(data) {
     const { positions, intensities, colors, classifications, mvpMatrix, viewportW, viewportH, polyPoints, keep } = data;
+    const extras = data.extras || [];           // per-point scalars carried through (Float32Array each)
     const n = positions.length / 3;
     const mvp = mvpMatrix; // Float64Array(16), column-major
 
@@ -226,6 +232,7 @@ function filterPoints(data) {
     const newInt = new Float32Array(n);
     const newRgb = colors ? new Float32Array(n * 3) : null;
     const newCls = classifications ? new Float32Array(n) : null;
+    const newExtras = extras.map(() => new Float32Array(n));
     let w = 0;
 
     const takePoint = (i, x, y, z) => {
@@ -234,6 +241,7 @@ function filterPoints(data) {
         newInt[w] = intensities[i];
         if (newRgb) { newRgb[w3] = colors[i*3]; newRgb[w3+1] = colors[i*3+1]; newRgb[w3+2] = colors[i*3+2]; }
         if (newCls) newCls[w] = classifications[i];
+        for (let k = 0; k < newExtras.length; k++) newExtras[k][w] = extras[k][i];
         w++;
     };
 
@@ -278,7 +286,8 @@ function filterPoints(data) {
     const bounds = computeBounds(outPositions, outN);
 
     return { positions: outPositions, intensities: outIntensities, colors: outColors,
-             classifications: outClassifications, bounds, numPoints: outN };
+             classifications: outClassifications, extras: newExtras.map(a => a.slice(0, outN)),
+             bounds, numPoints: outN };
 }
 
 importScripts('/static/vendor/pako_inflate.min.js');
@@ -313,6 +322,8 @@ self.onmessage = function(e) {
     if (result.intensities) transferables.push(result.intensities.buffer);
     if (result.colors) transferables.push(result.colors.buffer);
     if (result.classifications) transferables.push(result.classifications.buffer);
+    if (result.splats) transferables.push(result.splats.buffer);
+    if (result.extras) for (const a of result.extras) transferables.push(a.buffer);
     if (result.scales) transferables.push(result.scales.buffer);
     if (result.rotations) transferables.push(result.rotations.buffer);
     if (result.opacities) transferables.push(result.opacities.buffer);

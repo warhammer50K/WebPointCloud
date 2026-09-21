@@ -1,8 +1,10 @@
 /* ═══════════════════════════════════════════════════════
    COPC Octree LOD streaming manager
    — owns one COPC map's streaming lifecycle: fetch the octree
-     hierarchy, pick a view-dependent cut (frustum cull + screen-
-     space error), and stream the nodes on that cut.
+     hierarchy, pick a cut through it (frustum cull, a uniform
+     coarse floor, then the budget spent where the camera looks,
+     skipping what is hidden behind drawn surfaces), and stream
+     the nodes on that cut.
 
    Nodes are fetched and rendered in CHUNKS: each request's nodes
    are merged into ONE BufferGeometry / THREE.Points, so a big map
@@ -13,9 +15,16 @@
    COPC/EPT stores each point at exactly one level, so the visible
    set is the cut PLUS its ancestors (coarse overview + added
    detail) — they accumulate without duplicates.
+
+   Point footprint: a photo-baked point (HandheldSLAM maps) is drawn
+   as large as its own texel, so a coarse photo tile reads as a
+   surface. Gaps left between points are filled in screen space
+   (viewer-post.js gap fill), not by inflating points: inflating to
+   the LOD level spacing painted metre-wide discs next to fine detail.
    ═══════════════════════════════════════════════════════ */
 import * as THREE from 'three';
 import { workerParseMultiblob, workerFilterPoints } from './data.js';
+import { SPLAT_COVER } from './shaders.js';
 
 const NODES_PER_REQUEST = 24;          // nodes merged into one chunk / request
 // The server decodes nodes under one Python GIL (lazrs releases it but the numpy
@@ -24,7 +33,31 @@ const NODES_PER_REQUEST = 24;          // nodes merged into one chunk / request
 // small pool: enough to hide HTTP round-trips, not enough to fight the GIL.
 const REQUEST_CONCURRENCY = 6;
 const UPDATE_INTERVAL_MS = 50;         // ~20 Hz LOD re-selection while the camera moves
-const DEFAULT_SSE_THRESHOLD = 4.0;     // pixels: descend while node error exceeds this
+// Detail finer than this many pixels is invisible — the node's PARENT already
+// resolves below a pixel there — so the walk stops instead of spending budget on
+// it.
+const MIN_NODE_SSE = 0.5;              // pixels
+// Fetch ORDER and the detail phase of the cut: a node's projected spacing is
+// divided by (1 + off-axis angle / this), so what you're looking at fills first.
+// 10° roughly halves the priority of a node at a 16:9 screen's side edge vs.
+// dead centre.
+const CENTER_FALLOFF_DEG = 10;
+// Share of the point budget spent on a UNIFORM floor: whole octree levels across
+// the view, so distant parts never vanish. The rest goes to the nodes with the
+// largest on-screen spacing (near, central) — a whole-budget uniform cut made the
+// spot you look at as coarse as the horizon.
+const FLOOR_FRACTION = 0.3;
+// Occlusion: the loaded points' depth is rendered at this resolution when the
+// camera comes to rest; detail nodes whose box lies entirely behind it are not
+// loaded (the far side of a building).
+const OCC_W = 160;
+const OCC_H = 90;
+const OCC_MARGIN = 0.10;               // box must be this far (fraction) behind the surface
+const OCC_MIN_MARGIN = 1.0;            // ... and at least this many metres
+// While the camera moves the depth pass is re-rendered at most this often (it
+// costs one more draw of the resident points at 160×90); selects in between
+// run without occlusion.
+const OCC_MOVING_INTERVAL_MS = 300;
 // How long a chunk may stay resident after it leaves the cut before it's dropped.
 // Dropping fine detail that's no longer wanted reveals the coarser ANCESTOR (always
 // kept in the cut), so the view thins out instead of blanking — and only after this
@@ -34,6 +67,68 @@ const COARSEN_DELAY_MS = 500;
 // node keys for this long — avoids hammering a persistently failing server.
 const FAIL_BACKOFF_MS = 5000;
 
+const OCC_VERT = `
+uniform float uPointSize;
+uniform float uFocal;
+uniform float uScale;
+attribute float aSize;
+varying float vDist;
+void main() {
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mv;
+    vDist = -mv.z;
+    // Same size as the main pass (shaders.js VERT), scaled to the small target.
+    gl_PointSize = clamp(max(uPointSize * 400.0, aSize * uFocal) / -mv.z * uScale, 1.0, 64.0);
+}
+`;
+// View distance / uFar packed into RGB8 (24 bits: sub-mm over kilometres).
+const OCC_FRAG = `
+uniform float uFar;
+varying float vDist;
+void main() {
+    float v = clamp(vDist / uFar, 0.0, 0.99999);
+    vec3 enc = fract(v * vec3(1.0, 255.0, 65025.0));
+    enc -= enc.yzz * vec3(1.0 / 255.0, 1.0 / 255.0, 0.0);
+    gl_FragColor = vec4(enc, 1.0);
+}
+`;
+
+// Max-heap on .priority (the detail phase of the cut).
+class PriorityHeap {
+    constructor() { this.a = []; }
+    get size() { return this.a.length; }
+    push(x) {
+        const a = this.a;
+        a.push(x);
+        let i = a.length - 1;
+        while (i > 0) {
+            const p = (i - 1) >> 1;
+            if (a[p].priority >= a[i].priority) break;
+            [a[p], a[i]] = [a[i], a[p]];
+            i = p;
+        }
+    }
+    pop() {
+        const a = this.a;
+        const top = a[0];
+        const last = a.pop();
+        if (a.length) {
+            a[0] = last;
+            let i = 0;
+            for (;;) {
+                const l = 2 * i + 1, r = l + 1;
+                let m = i;
+                if (l < a.length && a[l].priority > a[m].priority) m = l;
+                if (r < a.length && a[r].priority > a[m].priority) m = r;
+                if (m === i) break;
+                [a[m], a[i]] = [a[i], a[m]];
+                i = m;
+            }
+        }
+        return top;
+    }
+}
+
 export class CopcLodManager {
     constructor(viewer, meta, path) {
         this.viewer = viewer;
@@ -41,14 +136,14 @@ export class CopcLodManager {
         this.path = path;
         this.coordOffset = meta.coordOffset;
         this.rootSpacing = meta.root.spacing;
-        this.sseThreshold = DEFAULT_SSE_THRESHOLD;
         this.pointBudget = meta.pointBudget || 25_000_000;
+        this.totalPoints = meta.point_count || 0;   // whole cloud, for the HUD
         this._disposed = false;
         this._abortCtrl = new AbortController();  // cancels in-flight fetches on dispose
 
         this.nodeByKey = new Map();                   // key -> {key,level,pointCount,box}
         this.rootKeys = [];                           // level-0 node keys
-        this.chunks = new Map();                      // chunkId -> {points, keys:Set, pointCount}
+        this.chunks = new Map();                      // chunkId -> {points, keys:Set, pointCount, splats}
         this.nodeToChunk = new Map();                 // node key -> chunkId (loaded)
         this.loading = new Set();                     // node keys with an in-flight fetch
         this.desired = new Set();                     // current cut
@@ -72,15 +167,38 @@ export class CopcLodManager {
         // One material shared by every chunk so color-mode / point-size / gamma /
         // EDL / SSAO controls update everything uniformly.
         this.material = viewer._makeMaterial();
+        this.material.uniforms.uUncoloredGray.value = !!meta.uncoloredBlack;
 
         this.lodGroup = new THREE.Group();            // positions pre-centered → no transform
         viewer.scene.add(this.lodGroup);
+
+        // Occlusion depth pass (see _renderOcclusion).
+        this._occScene = new THREE.Scene();
+        this._occMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                uPointSize: { value: viewer.pointSize },
+                uFocal: { value: 0.0 },
+                uScale: { value: 1.0 },
+                uFar: { value: 1.0 },
+            },
+            vertexShader: OCC_VERT,
+            fragmentShader: OCC_FRAG,
+        });
+        this._occScene.overrideMaterial = this._occMaterial;
+        this._occTarget = new THREE.WebGLRenderTarget(OCC_W, OCC_H, {
+            minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+            depthBuffer: true,
+        });
+        this._occPixels = new Uint8Array(OCC_W * OCC_H * 4);
+        this._occ = null;                              // {levels, view, viewProj} for one camera pose
+        this._occAt = 0;
 
         // Reused scratch objects (avoid per-frame allocation).
         this._frustum = new THREE.Frustum();
         this._projScreenMatrix = new THREE.Matrix4();
         this._tmpVec = new THREE.Vector3();
         this._tmpVec2 = new THREE.Vector3();
+        this._viewDir = new THREE.Vector3();
         this._lastUpdate = 0;
         this._forceUpdate = true;
         this._lastCamPos = new THREE.Vector3();
@@ -130,6 +248,17 @@ export class CopcLodManager {
         return out;
     }
 
+    _parentKey(key) {
+        const [l, x, y, z] = key.split('-').map(Number);
+        if (l === 0) return null;
+        return `${l - 1}-${x >> 1}-${y >> 1}-${z >> 1}`;
+    }
+
+    _inFrustum(key) {
+        const node = this.nodeByKey.get(key);
+        return !!node && this._frustum.intersectsBox(node.box);
+    }
+
     maybeUpdate() {
         if (this._disposed || this.rootKeys.length === 0) return;
         const now = performance.now();
@@ -163,6 +292,15 @@ export class CopcLodManager {
         this._haveLastCam = true;
         this._lastCamPos.copy(cam.position);
         this._lastTarget.copy(tgt);
+        // Cull what the loaded surfaces hide, with a depth pass rendered for THIS
+        // camera pose: always at rest, throttled while moving (a stale depth from
+        // another pose would hide the wrong nodes).
+        if (!moved || now - (this._occAt || 0) >= OCC_MOVING_INTERVAL_MS) {
+            this._occ = this._renderOcclusion();
+            this._occAt = now;
+        } else {
+            this._occ = null;
+        }
         this._select();
     }
 
@@ -177,41 +315,77 @@ export class CopcLodManager {
         const viewportH = this.viewer.renderer.domElement.clientHeight || 600;
         const fovRad = camera.fov * Math.PI / 180;
         const projFactor = viewportH / (2 * Math.tan(fovRad / 2));
+        const viewDir = camera.getWorldDirection(this._viewDir);
 
-        // Collect in-frustum candidates on the SSE cut, priority = screen size.
-        const candidates = [];
-        const visit = (key) => {
+        const metaByKey = new Map();
+        const candidate = (key) => {
             const node = this.nodeByKey.get(key);
-            if (!node || !this._frustum.intersectsBox(node.box)) return;
-            const nodeErr = this.rootSpacing / Math.pow(2, node.level);
             const closest = node.box.clampPoint(camPos, this._tmpVec);
             const dist = Math.max(camPos.distanceTo(closest), 1e-3);
-            const sse = nodeErr / dist * projFactor;
             const worldSize = node.box.getSize(this._tmpVec2).length();
-            candidates.push({ key, level: node.level, pointCount: node.pointCount,
-                              screenSize: worldSize / dist * projFactor });
-            if (sse > this.sseThreshold) {
-                for (const ck of this._childKeys(key)) visit(ck);
-            }
+            const toCenter = node.box.getCenter(this._tmpVec).sub(camPos);
+            const len = toCenter.length();
+            const offAxisDeg = len > 1e-6
+                ? THREE.MathUtils.radToDeg(Math.acos(
+                    THREE.MathUtils.clamp(toCenter.dot(viewDir) / len, -1, 1)))
+                : 0;
+            const sse = (this.rootSpacing / Math.pow(2, node.level)) / dist * projFactor;
+            const c = {
+                key, level: node.level, pointCount: node.pointCount,
+                screenSize: worldSize / dist * projFactor,
+                sse,
+                priority: sse / (1 + offAxisDeg / CENTER_FALLOFF_DEG),
+            };
+            metaByKey.set(key, c);
+            return c;
         };
-        for (const rk of this.rootKeys) visit(rk);
 
-        // Budget fill is COVERAGE-FIRST: spend the point budget level-by-level
-        // (coarse → fine) so the whole view refines uniformly. Sorting by raw
-        // screen size instead lets near/large nodes eat the budget, starving
-        // distant in-view nodes — which then fall back to a coarse ancestor and
-        // show up as patches of low resolution. Within a level, larger on-screen
-        // nodes win the remaining budget.
-        candidates.sort((a, b) =>
-            a.level !== b.level ? a.level - b.level : b.screenSize - a.screenSize);
+        // 1) UNIFORM FLOOR: whole octree levels breadth-first while they fit in
+        //    FLOOR_FRACTION of the budget. A complete level is a uniform downsample,
+        //    so every part of the view keeps at least this density.
         const desired = new Set();
         let used = 0;
-        for (const c of candidates) {
+        const floorBudget = this.pointBudget * FLOOR_FRACTION;
+        let frontier = this.rootKeys.filter(k => this._inFrustum(k)).map(candidate);
+        const heap = new PriorityHeap();
+        while (frontier.length) {
+            const levelTotal = frontier.reduce((s, c) => s + c.pointCount, 0);
+            if (used + levelTotal > floorBudget) {
+                for (const c of frontier) heap.push(c);   // detail phase picks from here
+                break;
+            }
+            const next = [];
+            for (const c of frontier) {
+                desired.add(c.key);
+                used += c.pointCount;
+                if (c.sse < MIN_NODE_SSE) continue;      // subpixel detail: not worth budget
+                for (const ck of this._childKeys(c.key)) {
+                    if (this._inFrustum(ck)) next.push(candidate(ck));
+                }
+            }
+            frontier = next;
+        }
+
+        // 2) DETAIL: the rest of the budget, largest on-screen spacing first (near,
+        //    central) — a node only after its parent, so no holes open under it.
+        //    Nodes entirely behind the drawn surfaces are skipped with their subtree.
+        let skippedOccluded = 0;
+        while (heap.size) {
+            const c = heap.pop();
+            if (c.sse < MIN_NODE_SSE) break;             // everything left is subpixel
             if (used + c.pointCount > this.pointBudget) continue;
+            if (this._occ && this._occluded(this.nodeByKey.get(c.key).box)) {
+                skippedOccluded++;
+                continue;
+            }
             desired.add(c.key);
             used += c.pointCount;
+            for (const ck of this._childKeys(c.key)) {
+                if (this._inFrustum(ck)) heap.push(candidate(ck));
+            }
         }
         this.desired = desired;
+        this._skippedOccluded = skippedOccluded;
 
         // Keep-alive: tag chunks touched by the current cut as recently wanted (seq +
         // timestamp). We DON'T unload here. Chunks that leave the cut are dropped by
@@ -236,8 +410,6 @@ export class CopcLodManager {
         // the queue every re-select means stale intermediate-zoom nodes stop being
         // fetched the moment they leave the cut, so bandwidth goes to what you're
         // looking at now — not where the camera was mid-zoom.
-        const metaByKey = new Map();
-        for (const c of candidates) metaByKey.set(c.key, c);
         const queue = [];
         for (const key of desired) {
             if (this.nodeToChunk.has(key) || this.loading.has(key)) continue;
@@ -248,19 +420,130 @@ export class CopcLodManager {
             }
             queue.push(key);
         }
-        // Load DEEPEST (finest) visible nodes first, then largest on screen. On a
-        // big map zoomed in, the coarse ancestor nodes are nearly empty in the
-        // visible region — fetching them first just shows black; the deep leaves
-        // carry the points that actually fill the view, so prioritize them.
+        // Biggest ON-SCREEN gap first, weighted toward the view centre. A node's
+        // projected spacing (sse) is the pixel gap it closes, so this still loads
+        // coarse before fine (a parent's sse is ~2× its children's) — but per
+        // region, not per level across the whole frustum. The old level-first order
+        // made a zoom fill every coarse node out to the horizon before the spot you
+        // zoomed into got its detail: measured on real maps, the view centre hit
+        // 90% only after 71-87% of the queue; this order gets it there at 20-36%,
+        // with the screen edges no later than before.
         queue.sort((a, b) => {
             const ca = metaByKey.get(a), cb = metaByKey.get(b);
-            const la = ca ? ca.level : 0, lb = cb ? cb.level : 0;
-            if (la !== lb) return lb - la;
-            return (cb ? cb.screenSize : 0) - (ca ? ca.screenSize : 0);
+            return (cb ? cb.priority : 0) - (ca ? ca.priority : 0);
         });
         this.queue = queue;
         this._evictOverBudget(seq);
         this._pump();
+    }
+
+    /* ── Occlusion ──────────────────────────────────────────────────────
+       Render the resident points' view distance at OCC_W×OCC_H, then build a
+       max-depth pyramid: a box is hidden if, over the pixels it covers, the
+       FARTHEST drawn surface is still clearly nearer than the box. Empty pixels
+       count as infinitely far, so gaps never hide anything. */
+    _renderOcclusion() {
+        if (this.chunks.size === 0) return null;
+        const viewer = this.viewer;
+        const renderer = viewer.renderer;
+        const camera = viewer.camera;
+        const bufferH = renderer.getDrawingBufferSize(new THREE.Vector2()).y || 600;
+        const far = camera.far;
+        const u = this._occMaterial.uniforms;
+        u.uPointSize.value = viewer.pointSize;
+        u.uFocal.value = viewer._focalPx();
+        u.uScale.value = OCC_H / bufferH;          // gl_PointSize is in framebuffer pixels
+        u.uFar.value = far;
+
+        const prevTarget = renderer.getRenderTarget();
+        const prevClear = renderer.getClearColor(new THREE.Color());
+        const prevAlpha = renderer.getClearAlpha();
+        const parent = this.lodGroup.parent;
+        this._occScene.add(this.lodGroup);
+        try {
+            renderer.setRenderTarget(this._occTarget);
+            renderer.setClearColor(0xffffff, 1);
+            renderer.clear(true, true, false);
+            renderer.render(this._occScene, camera);
+            renderer.readRenderTargetPixels(this._occTarget, 0, 0, OCC_W, OCC_H, this._occPixels);
+        } finally {
+            if (parent) parent.add(this.lodGroup);
+            renderer.setRenderTarget(prevTarget);
+            renderer.setClearColor(prevClear, prevAlpha);
+        }
+
+        // Level 0: metres per pixel (Infinity = nothing drawn). Row 0 is the bottom.
+        const px = this._occPixels;
+        let w = OCC_W, h = OCC_H;
+        let level = new Float32Array(w * h);
+        for (let i = 0; i < w * h; i++) {
+            const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
+            level[i] = (r === 255 && g === 255 && b === 255)
+                ? Infinity
+                : (r / 255 + g / (255 * 255) + b / (255 * 65025)) * far;
+        }
+        const levels = [{ w, h, d: level }];
+        while (w > 1 || h > 1) {
+            const nw = Math.max(1, Math.ceil(w / 2)), nh = Math.max(1, Math.ceil(h / 2));
+            const next = new Float32Array(nw * nh);
+            for (let y = 0; y < nh; y++) {
+                for (let x = 0; x < nw; x++) {
+                    let m = 0;
+                    for (let dy = 0; dy < 2; dy++) {
+                        for (let dx = 0; dx < 2; dx++) {
+                            const sx = Math.min(w - 1, 2 * x + dx), sy = Math.min(h - 1, 2 * y + dy);
+                            const v = level[sy * w + sx];
+                            if (v > m) m = v;
+                        }
+                    }
+                    next[y * nw + x] = m;
+                }
+            }
+            levels.push({ w: nw, h: nh, d: next });
+            level = next; w = nw; h = nh;
+        }
+        return {
+            levels,
+            view: camera.matrixWorldInverse.clone(),
+            viewProj: new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse),
+        };
+    }
+
+    _occluded(box) {
+        const occ = this._occ;
+        const corner = this._tmpVec;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        let near = Infinity;
+        for (let i = 0; i < 8; i++) {
+            corner.set(i & 1 ? box.max.x : box.min.x,
+                       i & 2 ? box.max.y : box.min.y,
+                       i & 4 ? box.max.z : box.min.z);
+            const e = occ.view.elements;
+            const vz = -(e[2] * corner.x + e[6] * corner.y + e[10] * corner.z + e[14]);
+            if (vz <= 0) return false;                  // straddles / behind the camera
+            near = Math.min(near, vz);
+            corner.applyMatrix4(occ.viewProj);          // NDC
+            minX = Math.min(minX, corner.x); maxX = Math.max(maxX, corner.x);
+            minY = Math.min(minY, corner.y); maxY = Math.max(maxY, corner.y);
+        }
+        // Pixel rect at level 0, clamped to the screen (off-screen parts can't hide).
+        const x0 = Math.max(0, Math.floor((minX * 0.5 + 0.5) * OCC_W));
+        const x1 = Math.min(OCC_W - 1, Math.floor((maxX * 0.5 + 0.5) * OCC_W));
+        const y0 = Math.max(0, Math.floor((minY * 0.5 + 0.5) * OCC_H));
+        const y1 = Math.min(OCC_H - 1, Math.floor((maxY * 0.5 + 0.5) * OCC_H));
+        if (x0 > x1 || y0 > y1) return false;
+        if (minX < -1 || maxX > 1 || minY < -1 || maxY > 1) return false;   // partly off-screen
+        // Pyramid level where the rect spans at most ~2 texels per axis.
+        let l = 0;
+        while (l + 1 < occ.levels.length && ((x1 >> l) - (x0 >> l) > 1 || (y1 >> l) - (y0 >> l) > 1)) l++;
+        const lv = occ.levels[l];
+        const threshold = near - Math.max(OCC_MIN_MARGIN, near * OCC_MARGIN);
+        for (let y = y0 >> l; y <= Math.min(lv.h - 1, y1 >> l); y++) {
+            for (let x = x0 >> l; x <= Math.min(lv.w - 1, x1 >> l); x++) {
+                if (!(lv.d[y * lv.w + x] < threshold)) return false;
+            }
+        }
+        return true;
     }
 
     // Drop least-recently-wanted chunks until resident points fit the budget. Never
@@ -362,15 +645,19 @@ export class CopcLodManager {
 
             // Node identity is fixed before filtering (the filter only thins points).
             const keySet = new Set(merged.nodeKeys);
+            // Photo footprints ride through any delete filtering.
+            merged.extras = [merged.splats || new Float32Array(merged.numPoints)];
 
             // Replay any polygon-delete edits onto this fresh chunk so deletions
             // survive eviction/refetch and apply uniformly across LOD levels.
             const filtered = await this._replayDeleteOps(merged);
             if (this._disposed) return;
             const chunkId = ++this._chunkSeq;
+            const splats = filtered.extras[0];
 
             let points = null;
             if (filtered.numPoints > 0) {
+                filtered.splats = splats;              // _buildGeometry sizes points from these
                 const geom = this.viewer._buildGeometry(filtered);
                 points = new THREE.Points(geom, this.material);
                 points.frustumCulled = false;
@@ -382,7 +669,7 @@ export class CopcLodManager {
             // they're rendered anyway, and tracking them avoids a duplicate refetch).
             // A chunk fully erased by edits is still registered (points: null) so its
             // nodes count as loaded and aren't re-fetched every cut.
-            this.chunks.set(chunkId, { points, keys: keySet, pointCount: filtered.numPoints,
+            this.chunks.set(chunkId, { points, keys: keySet, pointCount: filtered.numPoints, splats,
                                        lastWanted: this._selectSeq,
                                        lastWantedTime: performance.now() });
             for (const k of merged.nodeKeys) this.nodeToChunk.set(k, chunkId);
@@ -433,17 +720,17 @@ export class CopcLodManager {
 
     // Run every stored edit through the filter worker, threading the thinned
     // arrays from one op into the next. Returns the surviving {positions,
-    // intensities, colors, numPoints}. No-op (returns input) when no edits.
+    // intensities, colors, extras, numPoints}. No-op (returns input) when no edits.
     async _replayDeleteOps(data) {
         let cur = data;
         for (const op of this._deleteOps) {
             const res = await workerFilterPoints(
                 cur.positions, cur.intensities, cur.colors,
-                op.mvp, op.w, op.h, op.poly, op.keep, cur.classifications);
+                op.mvp, op.w, op.h, op.poly, op.keep, cur.classifications, cur.extras);
             if (this._disposed) return res;
             cur = { positions: res.positions, intensities: res.intensities,
                     colors: res.colors, classifications: res.classifications,
-                    numPoints: res.numPoints };
+                    extras: res.extras, numPoints: res.numPoints };
             if (cur.numPoints === 0) break;
         }
         return cur;
@@ -463,13 +750,15 @@ export class CopcLodManager {
             const intAttr = geom.getAttribute('intensity');
             const rgbAttr = geom.getAttribute('rgb');
             const clsAttr = geom.getAttribute('classification');
+            const sizeAttr = geom.getAttribute('aSize');
             const cnt = geom.drawRange.count === Infinity ? pos.count : geom.drawRange.count;
             const posArr = new Float32Array(pos.array.buffer.slice(0, cnt * 3 * 4));
             const intArr = new Float32Array(intAttr.array.buffer.slice(0, cnt * 4));
             const rgbArr = rgbAttr ? new Float32Array(rgbAttr.array.buffer.slice(0, cnt * 3 * 4)) : null;
             const clsArr = clsAttr ? new Float32Array(clsAttr.array.buffer.slice(0, cnt * 4)) : null;
+            const extras = [chunk.splats.slice(0, cnt)];
             const res = await workerFilterPoints(
-                posArr, intArr, rgbArr, op.mvp, op.w, op.h, op.poly, op.keep, clsArr);
+                posArr, intArr, rgbArr, op.mvp, op.w, op.h, op.poly, op.keep, clsArr, extras);
             if (this._disposed) return;
             // Evicted while the filter ran: _unloadChunk already settled the
             // point count; touching the stale entry would corrupt it.
@@ -485,6 +774,11 @@ export class CopcLodManager {
                 intAttr.array.set(res.intensities); intAttr.needsUpdate = true;
                 if (rgbAttr && res.colors) { rgbAttr.array.set(res.colors); rgbAttr.needsUpdate = true; }
                 if (clsAttr && res.classifications) { clsAttr.array.set(res.classifications); clsAttr.needsUpdate = true; }
+                chunk.splats = res.extras[0];
+                if (sizeAttr) {
+                    for (let i = 0; i < res.numPoints; i++) sizeAttr.array[i] = chunk.splats[i] * SPLAT_COVER;
+                    sizeAttr.needsUpdate = true;
+                }
                 geom.setDrawRange(0, res.numPoints);
             }
         }
@@ -523,10 +817,18 @@ export class CopcLodManager {
     _updateHud() {
         const el = document.getElementById('viewer-pts');
         if (!el) return;
-        const pts = `Points: ${this.loadedPointCount.toLocaleString()}`;
+        // Always show the denominator: the streamed count is a LOD subset of the
+        // cloud, and a bare number reads as "the whole file is on screen".
+        const pts = this.totalPoints
+            ? `Points: ${this.loadedPointCount.toLocaleString()}`
+              + ` / ${this.totalPoints.toLocaleString()} (LOD)`
+            : `Points: ${this.loadedPointCount.toLocaleString()}`;
         el.textContent = this._pending > 0
             ? `${pts}  ·  streaming ${this._pending} node${this._pending > 1 ? 's' : ''}…`
             : pts;
+        // The stats panel's total comes from loadedPointCount too, so refresh it
+        // on the same beat instead of leaving it at whatever the last load left.
+        this.viewer.updateStats();
     }
 
     dispose() {
@@ -545,5 +847,7 @@ export class CopcLodManager {
         this._pending = 0;
         if (this.lodGroup.parent) this.lodGroup.parent.remove(this.lodGroup);
         this.material.dispose();
+        this._occMaterial.dispose();
+        this._occTarget.dispose();
     }
 }

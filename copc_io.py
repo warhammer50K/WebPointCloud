@@ -116,6 +116,11 @@ def open_copc(path):
         dims = set(reader.header.point_format.dimension_names)
         has_rgb = {'red', 'green', 'blue'} <= dims
         intensity_max, rgb_scale = _estimate_norm_scales(reader, has_rgb)
+        # HandheldSLAM stores each photo-baked point's footprint (texel spacing,
+        # 0.1 mm units) in point_source_id and marks the file with its system id;
+        # elsewhere point_source_id is a flight line number and means nothing here.
+        splat = (str(reader.header.system_identifier).strip('\x00 ').startswith('HandheldSLAM')
+                 and 'point_source_id' in dims)
     except Exception as e:
         entry['error'] = e
         with _readers_lock:
@@ -127,6 +132,7 @@ def open_copc(path):
     entry['has_rgb'] = has_rgb
     entry['intensity_max'] = intensity_max
     entry['rgb_scale'] = rgb_scale
+    entry['splat'] = splat
     entry['ready'].set()
     return entry
 
@@ -273,6 +279,9 @@ def copc_meta(path):
         'has_rgb': bool(entry['has_rgb']),
         'intensityMax': float(entry['intensity_max']),
         'pointBudget': point_budget,
+        # HandheldSLAM writes returns the camera never saw as RGB (0,0,0); its photo
+        # pixels are never exactly black. The viewer shades those by intensity.
+        'uncoloredBlack': bool(entry.get('splat')),
         'mins': [float(v) for v in h.mins],
         'maxs': [float(v) for v in h.maxs],
         'root': {
@@ -291,7 +300,7 @@ def _cache_dir():
         import config
         base = config.DATA_DIR
     except Exception:
-        base = os.path.expanduser('~/.webpointcloud')
+        base = os.path.expanduser('~/webpointcloud')
     d = os.path.join(base, 'cache', 'octree')
     os.makedirs(d, exist_ok=True)
     return d
@@ -421,11 +430,14 @@ def _pack_node_points(pts, entry, center):
         b = np.full(n, 0.5, dtype=np.float32)
 
     classification = np.asarray(pts.classification, dtype=np.float32)
+    splat = (np.asarray(pts.point_source_id, dtype=np.float32) * 1e-4
+             if entry.get('splat') else None)
 
     return arrays_to_binary(
         x, y, z, intensity, r, g, b, n,
         offset=[float(center[0]), float(center[1]), float(center[2])],
         classification=classification,
+        splat=splat,
     )
 
 
@@ -540,8 +552,11 @@ def ensure_copc(src_path, dst_path=None, progress=None):
         if _pdal_has_copc_writer():
             import subprocess
             try:
+                # forward=all keeps the source header's scale/offset: writers.copc
+                # otherwise re-quantizes to its 0.01 default and merges mm-spaced points.
                 subprocess.run(
-                    ['pdal', 'translate', src_path, tmp_path, '-w', 'writers.copc'],
+                    ['pdal', 'translate', src_path, tmp_path, '-w', 'writers.copc',
+                     '--writers.copc.forward=all'],
                     check=True, capture_output=True,
                 )
                 converted = True

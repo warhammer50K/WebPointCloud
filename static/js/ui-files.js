@@ -71,7 +71,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
     $('btn-modal-close').addEventListener('click', closeModal);
     modalBg.addEventListener('click', e => { if (e.target === modalBg) closeModal(); });
 
-    // (Upload removed — maps are loaded from ~/maps via the list below.)
+    // (Upload removed — maps come from the maps directory via the list below.)
 
     // Refresh map list
     async function refreshMapList() {
@@ -84,7 +84,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             if (!Array.isArray(maps)) throw new Error('Invalid map list response');
             list.innerHTML = '';
             if (maps.length === 0) {
-                list.innerHTML = '<div style="color:var(--text-dim)">No maps found. Place a LAS/LAZ/COPC file in the maps directory.</div>';
+                list.innerHTML = '<div style="color:var(--text-dim)">No maps found. Copy a LAS/LAZ/COPC file into the maps directory (shown in the server startup log), or drag one into the viewer.</div>';
                 return;
             }
             for (const m of maps) {
@@ -94,7 +94,12 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                     const sizeStr = lasInfo ? formatFileSize(lasInfo.size) : '';
                     const ptsStr = lasInfo && lasInfo.num_points ? formatPoints(lasInfo.num_points) + ' pts' : '';
                     const dateStr = m.created ? formatDate(m.created) : '';
-                    const metaParts = [f, sizeStr, ptsStr, dateStr].filter(Boolean);
+                    // A loose file in the maps directory is its own entry, so its
+                    // name is already the heading — repeating it in the meta line
+                    // would read as 'map.las | map.las | 12 MB'.
+                    const isFile = !!m.is_file;
+                    const metaParts = (isFile ? [sizeStr, ptsStr, dateStr]
+                                              : [f, sizeStr, ptsStr, dateStr]).filter(Boolean);
                     const item = document.createElement('div');
                     item.className = 'modal-item';
                     const nameSpan = document.createElement('span');
@@ -114,6 +119,9 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                     item.appendChild(manageBtn);
                     const mapPath = m.path;
                     const mapName = m.name;
+                    // What to call this cloud in status text and logs: 'folder/file'
+                    // for a directory map, just the filename for a loose one.
+                    const label = isFile ? f : `${mapName}/${f}`;
 
                     item.querySelector('[data-manage]').addEventListener('click', (ev) => {
                         ev.stopPropagation();
@@ -130,7 +138,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                         if (isCompare) {
                             console.log('[Compare] Loading Map B:', fullPath);
                             console.log('[Compare] Map A pointCloud exists:', !!viewer.pointCloud);
-                            $('st-main').textContent = `Loading compare map: ${mapName}/${f}...`;
+                            $('st-main').textContent = `Loading compare map: ${label}...`;
                             showLoading(`Loading compare map...`);
                             try {
                                 // COPC maps stream via LOD and have no whole-cloud
@@ -156,11 +164,11 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                                     'compareCloud in scene:', viewer.compareCloud ? viewer.scene.children.includes(viewer.compareCloud) : false);
                                 uiState.compareBPath = fullPath;
                                 $('compare-panel').classList.remove('hidden');
-                                $('compare-b-name').textContent = `${mapName}/${f}`;
+                                $('compare-b-name').textContent = label;
                                 const ptsA = viewer.pointCloud ? viewer.cloudData?.numPoints?.toLocaleString() || '?' : 'none';
                                 const ptsB = data.numPoints.toLocaleString();
                                 $('st-main').textContent = `A: ${ptsA} pts | B: ${ptsB} pts`;
-                                appendLog(`Compare: A=${ptsA} pts, B=${ptsB} pts (${mapName}/${f})`, 'info');
+                                appendLog(`Compare: A=${ptsA} pts, B=${ptsB} pts (${label})`, 'info');
                                 showToast(`Map A: ${ptsA} pts + Map B: ${ptsB} pts loaded`, 'success');
                             } catch (err) {
                                 $('st-main').textContent = `Error: ${err.message}`;
@@ -171,20 +179,20 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                             return;
                         }
 
-                        $('st-main').textContent = `Loading ${mapName}/${f}...`;
-                        showLoading(`Loading ${mapName}/${f}...`);
+                        $('st-main').textContent = `Loading ${label}...`;
+                        showLoading(`Loading ${label}...`);
                         try {
                             const data = await loadLasFromPath(fullPath);
                             const info = await dispatchLoad(viewer, data, (pct, phase) => {
                                 updateLoading(convLabel(f, pct, phase));
                             });
                             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
-                            $('compare-a-name').textContent = `${mapName}/${f}`;
+                            $('compare-a-name').textContent = label;
                             // Set current path for analysis
                             const { setCurrentPath } = await import('./analysis.js');
                             setCurrentPath(fullPath);
                             $('no-data-msg').style.display = 'none';
-                            appendLog(`Map loaded: ${mapName}/${f} (${info.count.toLocaleString()} ${info.label})`, 'success');
+                            appendLog(`Map loaded: ${label} (${info.count.toLocaleString()} ${info.label})`, 'success');
                         } catch (err) {
                             $('st-main').textContent = `Error: ${err.message}`;
                             showToast(`Failed: ${err.message}`, 'error');

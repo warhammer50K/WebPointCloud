@@ -57,8 +57,35 @@ LIVE_TOKEN = os.environ.get('WPC_LIVE_TOKEN', '')
 PUBLIC_MODE = os.environ.get('WPC_PUBLIC', '0') == '1'
 
 # ── Paths ─────────────────────────────────────────────
+# Everything the app owns lives under one directory, so a fresh install adds a
+# single entry to $HOME instead of scattering maps, logs, caches and a secret
+# file across it.
 DATA_DIR = os.environ.get('WPC_DATA_DIR', os.path.expanduser('~/webpointcloud'))
-# Maps load directly from ~/maps by default (decoupled from DATA_DIR, which only
-# holds logs/cache). Override with WPC_MAPS_DIR.
-MAPS_DIR = os.environ.get('WPC_MAPS_DIR', os.path.expanduser('~/maps'))
+
+
+def _default_maps_dir():
+    """Where maps live when WPC_MAPS_DIR is unset.
+
+    A fresh install gets $DATA_DIR/maps, so everything the app owns sits in one
+    tree. Installs that predate that layout have their clouds in ~/maps, which
+    was the unconditional default — moving them to a new, empty directory would
+    look exactly like the maps had been deleted, and a fork carrying local
+    changes would hit it on the next merge. So an existing ~/maps keeps
+    winning, and only a machine that has never had one sees the new default.
+    Either way the startup banner prints the path that was chosen.
+    """
+    legacy = os.path.expanduser('~/maps')
+    if os.path.isdir(legacy):
+        return legacy
+    return os.path.join(DATA_DIR, 'maps')
+
+# Point WPC_MAPS_DIR at an existing collection (a NAS mount, a dataset
+# directory) to read from there instead — nothing is copied or moved, and the
+# app only writes into it when you save an analysis result.
+MAPS_DIR = os.environ.get('WPC_MAPS_DIR') or _default_maps_dir()
 LOG_DIR = os.path.join(DATA_DIR, 'logs')
+# Flask session secret for new installs, when FLASK_SECRET_KEY is not set.
+# Earlier versions used ~/.mapper_secret_key — a name inherited from a
+# predecessor project. security.py still reads that file where it is, so an
+# existing install is not relocated behind its owner's back.
+SECRET_KEY_PATH = os.path.join(DATA_DIR, 'secret_key')

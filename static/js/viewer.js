@@ -3,7 +3,7 @@
    ═══════════════════════════════════════════════════════ */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG, GAUSSIAN_VERT, GAUSSIAN_FRAG, CLASS_PALETTE, CLASS_NAMES } from './shaders.js';
+import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG, GAUSSIAN_VERT, GAUSSIAN_FRAG, CLASS_PALETTE, CLASS_NAMES, SPLAT_COVER } from './shaders.js';
 import { GaussianSplat } from './gaussian-splat.js';
 import { CopcLodManager } from './copc-lod.js';
 
@@ -64,6 +64,7 @@ export class Viewer {
         this.pointSize = 0.05;
         this.colorMode = 'intensity';
         this.gamma = 0.6;
+        this.saturation = 1.0;   // RGB-only saturation multiplier
         this.clipEnabled = false;
         this.clipZMin = -5;
         this.clipZMax = 5;
@@ -150,17 +151,24 @@ export class Viewer {
                 ? Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin) || dist
                 : dist;
 
+            // Scale by the wheel's own amount (one classic notch ≈ 100 px / 3 lines):
+            // high-resolution wheels and touchpads send many small events per notch,
+            // and counting each one as a full notch made the zoom race.
+            const px = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 800 : e.deltaY;
+            const notches = Math.max(-3, Math.min(3, px / 100));
+            const step = -dist * 0.06 * notches;
+
             if (e.shiftKey) {
                 // Fine dolly: move only the camera, changing the pivot distance.
-                const step = dist * 0.06 * (e.deltaY < 0 ? 1 : -1);
                 const minPivot = Math.max(sceneSize * 0.002, 0.05);
                 const maxPivot = sceneSize * 1.5;
                 const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
                 this.camera.position.copy(this.controls.target)
                     .addScaledVector(_zoomDir, -newDist);
             } else {
-                const step = dist * 0.06 * (e.deltaY < 0 ? 1 : -1);
-                const minPivot = Math.max(sceneSize * 0.05, 0.5);
+                // The floor is capped: 5% of a 370 m map is 18 m, so each notch
+                // still jumped over a metre right next to a sign.
+                const minPivot = Math.min(Math.max(sceneSize * 0.05, 0.5), 5);
                 const maxPivot = sceneSize * 1.5;
                 const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
                 this.camera.position.addScaledVector(_zoomDir, step);
@@ -299,6 +307,9 @@ export class Viewer {
         this.compareOpacity = 0.5;
 
         // Post-processing
+        // Screen-space fill of enclosed gaps between points (viewer-post.js).
+        this.gapFillEnabled = true;
+        this.gapFillRadius = 2;
         this.edlEnabled = false;
         this.edlStrength = 1.0;
         this.ssaoEnabled = false;
@@ -482,7 +493,13 @@ export class Viewer {
         if (this.gaussianSplat) this.gaussianSplat.update();
         if (this.copcManager) this.copcManager.maybeUpdate();
         if (this._dirty) {
-            const usePost = this.edlEnabled || this.ssaoEnabled;
+            const focal = this._focalPx();
+            for (const m of [this.copcManager && this.copcManager.material, this.pointCloud && this.pointCloud.material]) {
+                if (m && m.uniforms && m.uniforms.uFocal) m.uniforms.uFocal.value = focal;
+            }
+            const fill = this.gapFillEnabled && !!this._gapFillMaterial;
+            const lighting = this.edlEnabled || this.ssaoEnabled;
+            const usePost = fill || lighting;
             if (!usePost) {
                 this.renderer.setRenderTarget(null);
                 this.renderer.render(this.scene, this.camera);
@@ -492,6 +509,34 @@ export class Viewer {
 
                 let srcColor = this._rt.texture;
                 let srcDepth = this._rt.depthTexture;
+
+                if (fill) {
+                    if (lighting && !this._gapFillRt) {
+                        this._gapFillRt = new THREE.WebGLRenderTarget(this._rt.width, this._rt.height, {
+                            minFilter: THREE.NearestFilter,
+                            magFilter: THREE.NearestFilter,
+                            depthBuffer: true,
+                            depthTexture: new THREE.DepthTexture(this._rt.width, this._rt.height, THREE.UnsignedIntType),
+                        });
+                    }
+                    const u = this._gapFillMaterial.uniforms;
+                    u.uColor.value = srcColor;
+                    u.uDepth.value = srcDepth;
+                    u.uRadius.value = this.gapFillRadius;
+                    u.uNear.value = this.camera.near;
+                    u.uFar.value = this.camera.far;
+                    u.uPerspective.value = !!this.camera.isPerspectiveCamera;
+                    u.uPixelWorld.value = 2 / (this.camera.projectionMatrix.elements[5] * this._rt.height);
+                    this._postQuad.material = this._gapFillMaterial;
+                    const target = lighting ? this._gapFillRt : null;
+                    this.renderer.setRenderTarget(target);
+                    this.renderer.render(this._postScene, this._postCamera);
+                    if (target) {
+                        // Lighting reads the filled image, so filled pixels aren't shaded as background.
+                        srcColor = target.texture;
+                        srcDepth = target.depthTexture;
+                    }
+                }
 
                 if (this.edlEnabled) {
                     const target = this.ssaoEnabled ? this._rt2 : null;
@@ -523,6 +568,13 @@ export class Viewer {
     }
 
     /* ── Shader material factory ── */
+    // Framebuffer pixels per metre at 1 m depth: what a footprint (aSize) needs.
+    _focalPx() {
+        if (!this.renderer || !this.camera) return 0;
+        const h = this.renderer.getDrawingBufferSize(this._focalTmp || (this._focalTmp = new THREE.Vector2())).y;
+        return 0.5 * h * this.camera.projectionMatrix.elements[5];
+    }
+
     _colorModeInt() {
         return this.colorMode === 'height' ? 1
              : this.colorMode === 'rgb' ? 2
@@ -533,14 +585,17 @@ export class Viewer {
         return new THREE.ShaderMaterial({
             uniforms: {
                 uPointSize: { value: this.pointSize },
+                uFocal:     { value: this._focalPx() },
                 uColorMode: { value: this._colorModeInt() },
                 uMinVal:    { value: 0.0 },
                 uMaxVal:    { value: 1.0 },
                 uGamma:     { value: this.gamma },
+                uSaturation:{ value: this.saturation },
                 uOpacity:      { value: 1.0 },
                 uTintColor:    { value: new THREE.Vector3(1, 1, 1) },
                 uTintStrength: { value: 0.0 },
                 uClassPalette: { value: CLASS_PALETTE.map(c => new THREE.Vector3(...c)) },
+                uUncoloredGray: { value: false },
             },
             vertexShader: VERT,
             fragmentShader: FRAG,
@@ -560,6 +615,7 @@ export class Viewer {
             u.uMaxVal.value = this.bounds ? this.bounds.zMax : 1;
         }
         u.uGamma.value = this.gamma;
+        if (u.uSaturation) u.uSaturation.value = this.saturation;
     }
 
     _buildGeometry(data) {
@@ -571,6 +627,14 @@ export class Viewer {
         const cls = data.classifications && data.classifications.length === data.numPoints
             ? data.classifications : new Float32Array(data.numPoints);
         geom.setAttribute('classification', new THREE.Float32BufferAttribute(cls, 1));
+        // Footprint each point must cover (metres): given directly by the COPC
+        // stream, or from a photo-baked file's splat sizes; 0 = uPointSize only.
+        let size = data.sizes && data.sizes.length === data.numPoints ? data.sizes : null;
+        if (!size && data.splats && data.splats.length === data.numPoints) {
+            size = new Float32Array(data.numPoints);
+            for (let i = 0; i < size.length; i++) size[i] = data.splats[i] * SPLAT_COVER;
+        }
+        geom.setAttribute('aSize', new THREE.Float32BufferAttribute(size || new Float32Array(data.numPoints), 1));
         return geom;
     }
 
@@ -766,6 +830,18 @@ export class Viewer {
         if (this.mapCloud)   this.mapCloud.material.uniforms.uGamma.value = g;
         this.kfrmClouds.forEach(c => { c.material.uniforms.uGamma.value = g; });
         if (this.copcManager) this.copcManager.material.uniforms.uGamma.value = g;
+        this._dirty = true;
+    }
+
+    setSaturation(v) {
+        this.saturation = v;
+        const apply = c => { if (c && c.material.uniforms.uSaturation) c.material.uniforms.uSaturation.value = v; };
+        apply(this.pointCloud);
+        apply(this.mapCloud);
+        apply(this.curCloud);
+        apply(this.compareCloud);
+        this.kfrmClouds.forEach(apply);
+        if (this.copcManager) apply({ material: this.copcManager.material });
         this._dirty = true;
     }
 
@@ -1172,14 +1248,7 @@ export class Viewer {
             }
         }
 
-        let total = 0;
-        const drawCount = g => g.drawRange.count === Infinity ? g.getAttribute('position').count : g.drawRange.count;
-        if (this.cloudData) total += this.cloudData.numPoints;
-        if (this.mapCloud)  total += drawCount(this.mapCloud.geometry);
-        if (this.rawCloud)  total += drawCount(this.rawCloud.geometry);
-        if (this.curCloud)  total += drawCount(this.curCloud.geometry);
-        for (const c of this.kfrmClouds) total += drawCount(c.geometry);
-        { const pe = document.getElementById('viewer-pts'); if (pe) pe.textContent = `Points: ${total.toLocaleString()}`; }
+        this._updatePointsHud();
         this.updateStats();
         this._dirty = true;
     }
@@ -1591,6 +1660,12 @@ export class Viewer {
         for (const key of ['rawCloud', 'curCloud', 'mapCloud']) this.clearCloud(key);
         this.clearKfrmClouds();   // also clears the trajectory
         this.clearPoseMarker();
+        // Every arriving frame refreshes both readouts; without the same call
+        // here they keep reporting points that are no longer in the scene (and
+        // the header stays stuck on the live count) until the next camera move
+        // happens to redraw them — which reads as Clear having half worked.
+        this._updatePointsHud();
+        this.updateStats();
     }
 
     clearPoseMarker() {
@@ -1761,18 +1836,43 @@ export class Viewer {
 
     resetCamera() { this._fitCamera(); }
 
+    /** Points actually drawn right now, across every source that can put some
+     *  in the scene. One owner for the number: the header and the stats panel
+     *  disagreeing about how many points are on screen is worse than either
+     *  being slightly stale. */
+    _scenePointTotal() {
+        const dc = g => g.drawRange.count === Infinity ? g.getAttribute('position').count : g.drawRange.count;
+        let total = 0;
+        if (this.cloudData) total += this.cloudData.numPoints;
+        // COPC mode holds no cloudData — the points live in the LOD manager's
+        // streamed chunks, so read the count from there or the total reads 0.
+        if (this.copcManager) total += this.copcManager.loadedPointCount;
+        if (this.mapCloud) total += dc(this.mapCloud.geometry);
+        if (this.rawCloud) total += dc(this.rawCloud.geometry);
+        if (this.curCloud) total += dc(this.curCloud.geometry);
+        for (const c of this.kfrmClouds) total += dc(c.geometry);
+        return total;
+    }
+
+    /** Refresh the header point counter. */
+    _updatePointsHud() {
+        const liveLayers = (this.mapCloud ? 1 : 0) + (this.rawCloud ? 1 : 0)
+                         + (this.curCloud ? 1 : 0) + this.kfrmClouds.length;
+        // While a streamed map is the only thing on screen, the COPC HUD owns
+        // the readout — it adds the '/ total (LOD)' denominator that a bare
+        // number cannot convey. Once live layers are mixed in that format no
+        // longer describes what is drawn, so show the plain scene total.
+        if (this.copcManager && liveLayers === 0) { this.copcManager._updateHud(); return; }
+        const pe = document.getElementById('viewer-pts');
+        if (pe) pe.textContent = `Points: ${this._scenePointTotal().toLocaleString()}`;
+    }
+
     updateStats() {
         const el = document.getElementById('viewer-stats');
         if (!el) return;
         if (!this.bounds) { el.style.display = 'none'; return; }
         const b = this.bounds;
-        let total = 0;
-        const dc = g => g.drawRange.count === Infinity ? g.getAttribute('position').count : g.drawRange.count;
-        if (this.cloudData) total += this.cloudData.numPoints;
-        if (this.mapCloud) total += dc(this.mapCloud.geometry);
-        if (this.rawCloud) total += dc(this.rawCloud.geometry);
-        if (this.curCloud) total += dc(this.curCloud.geometry);
-        for (const c of this.kfrmClouds) total += dc(c.geometry);
+        const total = this._scenePointTotal();
         const ox = this.coordOffset ? this.coordOffset[0] : 0;
         const oy = this.coordOffset ? this.coordOffset[1] : 0;
         const oz = this.coordOffset ? this.coordOffset[2] : 0;
