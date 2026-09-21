@@ -27,6 +27,10 @@ export function initToolControls(viewer, legend, deps, uiState) {
         if (e.target.checked) {
             $('ckb-measure').checked = false;
             viewer.enableMeasureMode(false);
+            // The lasso is drawn in screen pixels and applied with the camera of
+            // the moment it is applied, so the camera is frozen while it is open.
+            // Say so, or the dead wheel reads as a bug.
+            showToast('Selection mode: camera locked so the lasso stays on the points it outlines', 'info', 3500);
         }
     });
     $('btn-sel-delete').addEventListener('click', async () => {

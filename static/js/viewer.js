@@ -127,60 +127,97 @@ export class Viewer {
         this._lookDir = new THREE.Vector3();
         this.lookSpeed = 0.004;              // radians per pixel of drag
 
-        // Wheel = adaptive dolly-drive. Each notch covers 6% of the pivot
-        // distance, so zoom is fast from an overview and fine-grained up close.
-        // The pivot (controls.target) shrinks with the camera like a plain dolly,
-        // but bottoms out at a floor — from there camera and pivot advance
-        // TOGETHER, so the wheel keeps a usable speed for flying through the map
-        // instead of freezing at the pivot (pan, which OrbitControls scales by
-        // pivot distance, stays alive too). Zooming out grows the pivot back up
-        // to a cap, beyond which it becomes a straight backward drive.
-        //   • Shift+wheel → fine dolly with a much smaller floor, for getting
-        //     right up to detail.
+        // Wheel = adaptive dolly-drive ALONG THE CURSOR RAY. The camera travels
+        // toward the point the pointer is over, not toward the screen centre, so
+        // whatever is under the cursor stays under the cursor and zooming in no
+        // longer pushes the thing you are inspecting off-screen.
+        //
+        // Speed is a fixed fraction of the distance to the content the cursor is
+        // over (nearest loaded octree node ahead; the pivot when the cursor is on
+        // empty sky), so a notch is a big move from an overview and a small one up
+        // close. The pivot (controls.target) follows that distance and keeps the
+        // view direction, but bottoms out at a floor — from there camera and pivot
+        // advance TOGETHER, so the wheel keeps a usable speed for flying through
+        // the map instead of freezing at the pivot (pan, which OrbitControls
+        // scales by pivot distance, stays alive too). Zooming out grows the pivot
+        // back up to a cap, beyond which it becomes a straight backward drive.
+        //   • Shift+wheel → precision zoom: a quarter of the step, and it STOPS
+        //     at the surface it is aimed at instead of flying through it.
+        // In and out are exact inverses (a geometric factor per notch), so
+        // scrolling back always lands on the view you came from.
         const _zoomDir = new THREE.Vector3();
+        const _zoomRay = new THREE.Ray();
         this.renderer.domElement.addEventListener('wheel', (e) => {
             e.preventDefault();
             e.stopImmediatePropagation();
+            // Drawing a lasso freezes the camera. The polygon is stored in screen
+            // pixels but applied with the camera of the moment it is APPLIED, so a
+            // zoom mid-selection deletes something other than what was outlined.
+            if (!this.controls.enabled) return;
+            // Any wheel input takes over a running fly-to, which would otherwise
+            // lerp the camera back over it on the very next frame.
+            this._cameraAnim = null;
+
             _zoomDir.subVectors(this.controls.target, this.camera.position);
-            let dist = _zoomDir.length();
-            if (dist < 1e-6) return;
-            _zoomDir.divideScalar(dist);                 // forward unit vector
+            const pivot = _zoomDir.length();
+            if (pivot < 1e-6) return;
+            _zoomDir.divideScalar(pivot);                // forward unit vector
 
             const b = this.bounds;
             const sceneSize = b
-                ? Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin) || dist
-                : dist;
+                ? Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin) || pivot
+                : pivot;
 
             // Scale by the wheel's own amount (one classic notch ≈ 100 px / 3 lines):
             // high-resolution wheels and touchpads send many small events per notch,
             // and counting each one as a full notch made the zoom race.
-            const px = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 800 : e.deltaY;
+            // Chrome and Edge deliver a shift+wheel as a HORIZONTAL wheel (deltaX
+            // set, deltaY zero), so reading deltaY alone made the precision zoom a
+            // silent no-op there.
+            const raw = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+            const px = e.deltaMode === 1 ? raw * 33 : e.deltaMode === 2 ? raw * 800 : raw;
             const notches = Math.max(-3, Math.min(3, px / 100));
-            const step = -dist * 0.06 * notches;
+            if (notches === 0) return;
 
-            if (e.shiftKey) {
-                // Fine dolly: move only the camera, changing the pivot distance.
-                const minPivot = Math.max(sceneSize * 0.002, 0.05);
-                const maxPivot = sceneSize * 1.5;
-                const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
-                this.camera.position.copy(this.controls.target)
-                    .addScaledVector(_zoomDir, -newDist);
-            } else {
-                // The floor is capped: 5% of a 370 m map is 18 m, so each notch
-                // still jumped over a metre right next to a sign.
-                const minPivot = Math.min(Math.max(sceneSize * 0.05, 0.5), 5);
-                const maxPivot = sceneSize * 1.5;
-                const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
-                this.camera.position.addScaledVector(_zoomDir, step);
-                this.controls.target.copy(this.camera.position)
-                    .addScaledVector(_zoomDir, newDist);
+            // Ray through the cursor. The camera moves along it, the view direction
+            // does not change, so the anchor point on the ray keeps its exact pixel.
+            this._cursorRay(e, _zoomRay);
+
+            // How far ahead the content under the cursor is — null on empty sky.
+            const anchor = this._rayContentDistance(_zoomRay);
+            const fine = e.shiftKey;
+            const rate = fine ? 0.015 : 0.06;                     // per notch
+            const minPivot = fine ? Math.max(sceneSize * 0.002, 0.05)
+                                  // The floor is capped: 5% of a 370 m map is 18 m,
+                                  // so each notch jumped over a metre next to a sign.
+                                  : Math.min(Math.max(sceneSize * 0.05, 0.5), 5);
+            const maxPivot = sceneSize * 1.5;
+            const ref = Math.min(Math.max(anchor != null ? anchor : pivot, minPivot), maxPivot);
+
+            // Geometric step: in and out are exact inverses of each other.
+            let step = ref * (1 - Math.pow(1 - rate, -notches));
+            // Precision zoom stops short of what it is aimed at; the plain wheel
+            // keeps its fly-through floor so a big map is still traversable with
+            // the wheel alone.
+            if (fine && anchor != null && step > 0) {
+                step = Math.min(step, Math.max(anchor - minPivot, 0));
             }
+
+            this.camera.position.addScaledVector(_zoomRay.direction, step);
+            // Keep looking the same way, with the pivot tracking what is in front.
+            const newPivot = Math.min(Math.max(ref - step, minPivot), maxPivot);
+            this.controls.target.copy(this.camera.position).addScaledVector(_zoomDir, newPivot);
+
             this._updatePanScale();          // pivot distance changed → re-scale pan
             this._dirty = true;
         }, { passive: false, capture: true });
 
-        // Keep pan in step with the view whenever a drag starts (mouse or touch).
-        this.renderer.domElement.addEventListener('pointerdown', () => this._updatePanScale());
+        // Keep pan in step with the view whenever a drag starts (mouse or touch),
+        // and let a drag take over from a running fly-to instead of fighting it.
+        this.renderer.domElement.addEventListener('pointerdown', () => {
+            this._cameraAnim = null;
+            this._updatePanScale();
+        });
 
         // First-person look: left-drag turns the view in place. Skipped while a
         // tool owns the left button (measure / polygon select / point info) or
@@ -189,6 +226,9 @@ export class Viewer {
         lookEl.addEventListener('pointerdown', (e) => {
             if (e.button !== 0 || !this.controls.enabled) return;
             if (this.measureMode || this.polySelectMode || this.pointInfoEnabled) return;
+            // Shift/Ctrl/Meta + left is OrbitControls' pan. Running the look on
+            // top of it panned and turned the view at the same time.
+            if (e.shiftKey || e.ctrlKey || e.metaKey) return;
             this._lookDragging = true;
             this._dragMode = this._isCameraInsideBounds() ? 'look' : 'orbit';
             this._lookLastX = e.clientX;
@@ -350,6 +390,47 @@ export class Viewer {
         return p.x > b.xMin - m && p.x < b.xMax + m
             && p.y > b.yMin - m && p.y < b.yMax + m
             && p.z > b.zMin - m && p.z < b.zMax + m;
+    }
+
+    // Ray from the camera through a pointer event's pixel, in world space.
+    _cursorRay(e, out) {
+        // unproject() reads camera.matrixWorld, which only refreshes at render
+        // time. A trackpad sends several wheel events per frame, so without this
+        // the second one in a frame unprojects against the camera's PREVIOUS
+        // position — the cursor point lands behind the camera and the ray flips,
+        // making the zoom jitter back and forth instead of moving.
+        this.camera.updateMatrixWorld();
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        this._cursorNdc = this._cursorNdc || new THREE.Vector3();
+        this._cursorNdc.set(
+            ((e.clientX - rect.left) / rect.width) * 2 - 1,
+            -((e.clientY - rect.top) / rect.height) * 2 + 1,
+            0.5,
+        ).unproject(this.camera);
+        out.origin.copy(this.camera.position);
+        out.direction.copy(this._cursorNdc).sub(this.camera.position).normalize();
+        return out;
+    }
+
+    // How far ahead the content along a ray is — the zoom anchor. Boxes the ray
+    // origin is already inside say nothing about what is in FRONT of the camera
+    // (the root node contains everything once you fly into the map), so they are
+    // skipped. Null when the ray meets nothing: the caller falls back to the
+    // pivot distance, which is what the wheel used to do everywhere.
+    _rayContentDistance(ray) {
+        if (this.copcManager && this.copcManager.rayNodeDistance) {
+            const d = this.copcManager.rayNodeDistance(ray);
+            if (d != null) return d;
+        }
+        const b = this.bounds;
+        if (!b) return null;
+        this._panBox = this._panBox || new THREE.Box3();
+        this._panHit = this._panHit || new THREE.Vector3();
+        this._panBox.min.set(b.xMin, b.yMin, b.zMin);
+        this._panBox.max.set(b.xMax, b.yMax, b.zMax);
+        if (this._panBox.containsPoint(ray.origin)) return null;
+        const hit = ray.intersectBox(this._panBox, this._panHit);
+        return hit ? hit.distanceTo(ray.origin) : null;
     }
 
     // Adaptive pan speed.

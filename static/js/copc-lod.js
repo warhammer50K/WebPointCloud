@@ -254,6 +254,25 @@ export class CopcLodManager {
         return `${l - 1}-${x >> 1}-${y >> 1}-${z >> 1}`;
     }
 
+    /** Distance from the ray origin to the nearest LOADED octree node the ray
+     *  enters — the viewer's zoom anchor, so the wheel knows how far the content
+     *  under the cursor is. Nodes the origin is already inside are skipped: an
+     *  ancestor box the camera sits in says nothing about what is in front of it.
+     *  Null when the ray meets nothing loaded. One AABB slab test per loaded
+     *  node, a few dozen to a few hundred in practice. */
+    rayNodeDistance(ray) {
+        this._rayHit = this._rayHit || new THREE.Vector3();
+        let best = Infinity;
+        for (const key of this.nodeToChunk.keys()) {
+            const node = this.nodeByKey.get(key);
+            if (!node || node.box.containsPoint(ray.origin)) continue;
+            if (!ray.intersectBox(node.box, this._rayHit)) continue;
+            const d = this._rayHit.distanceTo(ray.origin);
+            if (d < best) best = d;
+        }
+        return best === Infinity ? null : best;
+    }
+
     _inFrustum(key) {
         const node = this.nodeByKey.get(key);
         return !!node && this._frustum.intersectsBox(node.box);
