@@ -10,7 +10,7 @@ import { pollConvert } from './data.js';
 
 /** Conversion overlay label by phase. */
 export function convLabel(name, pct, phase) {
-    if (phase === 'reading') return `Reading ${name}…`;
+    if (phase === 'reading') return pct > 0 ? `Reading ${name}… ${pct}%` : `Reading ${name}…`;
     if (phase === 'building') return `Building octree… ${pct}%`;
     return `Converting ${name} to COPC… ${pct}%`;
 }

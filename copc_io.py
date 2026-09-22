@@ -19,6 +19,7 @@ per-node geometries share one coordinate frame (see arrays_to_binary's offset).
 
 import os
 import queue
+import shutil
 import contextlib
 import threading
 import uuid
@@ -508,10 +509,10 @@ def copc_nodes_multiblob(path, keys):
 def ensure_copc(src_path, dst_path=None, progress=None):
     """Convert a non-COPC cloud to .copc.laz, returning the output path.
 
-    Tool ladder: PDAL>=2.4 (writers.copc) → copclib builder → raise. Callers
-    should fall back to the legacy whole-cloud path if this raises.
-    ``progress(done, total)`` is called during the copclib build (PDAL path is
-    a single CLI call with no progress)."""
+    Tool ladder: untwine → PDAL>=2.4 (writers.copc) → copclib builder → raise.
+    Callers should fall back to the legacy whole-cloud path if this raises.
+    ``progress(done, total[, phase])`` is called during the untwine and copclib
+    builds (the PDAL path is a single CLI call with no progress)."""
     if is_copc(src_path):
         return src_path
     if dst_path is None:
@@ -534,23 +535,46 @@ def ensure_copc(src_path, dst_path=None, progress=None):
     # pid alone collides when two threads of the same process convert the same
     # source concurrently — add a random tail so each build gets its own temp.
     tmp_path = f'{dst_path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp.copc.laz'
+    threads = int(os.environ.get('WPC_COPC_THREADS', os.cpu_count() or 1))
     try:
-        # 1) PDAL CLI with writers.copc (PDAL >= 2.4)
         converted = False
-        if _pdal_has_copc_writer():
+        # 1) untwine: out-of-core (spills to a temp dir on disk), so RAM stays
+        #    bounded — the only tool here that survives clouds larger than RAM.
+        if shutil.which('untwine'):
+            _run_untwine(src_path, tmp_path, threads, progress)
+            converted = True
+        # 2) PDAL CLI with writers.copc (PDAL >= 2.4) — holds the whole cloud in RAM
+        if not converted and _pdal_has_copc_writer():
             import subprocess
-            try:
-                subprocess.run(
-                    ['pdal', 'translate', src_path, tmp_path, '-w', 'writers.copc'],
-                    check=True, capture_output=True,
-                )
-                converted = True
-            except subprocess.CalledProcessError:
-                # pdal accepted the drivers query but rejected the translate
-                # (arg parsing, version quirks) — fall through to copclib.
-                pass
+            # forward=all keeps the source header's scale/offset: writers.copc
+            # otherwise re-quantizes to its 0.01 default and merges mm-spaced points.
+            base_cmd = ['pdal', 'translate', src_path, tmp_path, '-w', 'writers.copc',
+                        '--writers.copc.forward=all']
+            # writers.copc runs near single-threaded by default; threads=ncpu
+            # is ~2.2x faster (7.8M pts: 13.8s -> 5.9s) for ~10% more RAM.
+            attempts = [base_cmd]
+            if threads > 1:
+                attempts.insert(0, base_cmd + [f'--writers.copc.threads={threads}'])
+            for cmd in attempts:
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True)
+                    converted = True
+                    break
+                except subprocess.CalledProcessError as e:
+                    if e.returncode < 0:
+                        # Killed by a signal — almost always the OOM killer.
+                        # copclib needs even more RAM, and running it in-process
+                        # would drag the whole server into swap: stop here.
+                        raise RuntimeError(
+                            f'PDAL COPC conversion was killed (signal {-e.returncode}, '
+                            'likely out of memory); install untwine for large clouds'
+                        ) from e
+                    # pdal accepted the drivers query but rejected the translate
+                    # (arg parsing, version quirks) — retry without threads,
+                    # then fall through to copclib.
         if not converted:
-            # 2) copclib octree builder (self-contained, bulk Unpack)
+            # 3) copclib octree builder (self-contained, bulk Unpack)
+            _check_fits_in_memory(src_path)
             try:
                 from tools.las_to_copc import las_to_copc
             except Exception:
@@ -560,7 +584,7 @@ def ensure_copc(src_path, dst_path=None, progress=None):
                     from las_to_copc import las_to_copc
                 except Exception as e:
                     raise RuntimeError(
-                        'COPC conversion unavailable: install PDAL>=2.4 '
+                        'COPC conversion unavailable: install untwine, PDAL>=2.4 '
                         '(writers.copc) or copclib'
                     ) from e
             las_to_copc(src_path, tmp_path, progress=progress)
@@ -572,6 +596,109 @@ def ensure_copc(src_path, dst_path=None, progress=None):
             except OSError:
                 pass
     return dst_path
+
+
+# untwine --progress_fd messages (native-endian, see untwine/generic/progress.hpp):
+#   1000 progress: int32 id, uint32 percent, uint32 len, bytes message
+#   1001 error:    int32 id, uint32 len, bytes message
+# Its 0-40% span is the distribute pass over the source; it reports that span
+# only on the fd (--progress_debug stays silent until 40%).
+_UNTWINE_MSG_PROGRESS = 1000
+_UNTWINE_MSG_ERROR = 1001
+_UNTWINE_DISTRIBUTE_PCT = 40
+
+
+def _read_exact(fp, n):
+    buf = fp.read(n)
+    return buf if len(buf) == n else None
+
+
+def _read_untwine_messages(fp, on_progress, on_error):
+    """Parse untwine's progress-fd stream until EOF (or a garbled header)."""
+    import struct
+    while True:
+        head = _read_exact(fp, 4)
+        if head is None:
+            return
+        (msg_id,) = struct.unpack('=i', head)
+        if msg_id == _UNTWINE_MSG_PROGRESS:
+            rest = _read_exact(fp, 8)
+            if rest is None:
+                return
+            percent, size = struct.unpack('=II', rest)
+        elif msg_id == _UNTWINE_MSG_ERROR:
+            rest = _read_exact(fp, 4)
+            if rest is None:
+                return
+            percent, (size,) = None, struct.unpack('=I', rest)
+        else:
+            return
+        text = _read_exact(fp, size)
+        if text is None:
+            return
+        text = text.decode('utf-8', 'replace')
+        if percent is None:
+            on_error(text)
+        else:
+            on_progress(percent, text)
+
+
+def _run_untwine(src_path, dst_path, threads, progress=None):
+    """Run the untwine CLI, forwarding its percent to *progress*. Its temp dir
+    sits beside the output (same disk) and needs about the source's size free."""
+    import subprocess
+    tmp_dir = dst_path + '.d'
+    read_fd, write_fd = os.pipe()
+    cmd = ['untwine', '-i', src_path, '-o', dst_path, '--temp_dir', tmp_dir,
+           '--threads', str(max(threads, 1)), '--progress_fd', str(write_fd)]
+    errors = []
+
+    def on_progress(percent, _text):
+        if progress is not None:
+            phase = 'reading' if percent < _UNTWINE_DISTRIBUTE_PCT else 'building'
+            progress(min(percent, 100), 100, phase)
+
+    try:
+        try:
+            proc = subprocess.Popen(cmd, pass_fds=(write_fd,), stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE)
+        finally:
+            # Parent's copy closed so the reader sees EOF once untwine exits.
+            os.close(write_fd)
+        # stderr drained on a side thread so neither pipe can fill and stall untwine.
+        stderr_tail = []
+
+        def drain_stderr():
+            for line in proc.stderr:
+                stderr_tail[:] = (stderr_tail + [line.decode('utf-8', 'replace').rstrip()])[-20:]
+        t = threading.Thread(target=drain_stderr, daemon=True)
+        t.start()
+        with os.fdopen(read_fd, 'rb') as fp:
+            read_fd = None
+            _read_untwine_messages(fp, on_progress, errors.append)
+        proc.wait()
+        t.join()
+        if proc.returncode != 0:
+            detail = ' | '.join(l for l in errors + stderr_tail if l)
+            raise RuntimeError(f'untwine failed (exit {proc.returncode}): {detail}')
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _check_fits_in_memory(src_path):
+    """Refuse the in-process copclib build when it would not fit in RAM: it
+    peaks at ~3x the source size, and swapping it would stall the server."""
+    try:
+        ram = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+    except (ValueError, OSError, AttributeError):
+        return
+    need = os.path.getsize(src_path) * 3
+    if need > ram:
+        raise RuntimeError(
+            f'COPC conversion needs ~{need / 2**30:.0f} GB RAM with copclib '
+            f'({ram / 2**30:.0f} GB available); install untwine for large clouds')
 
 
 def _pdal_has_copc_writer():
