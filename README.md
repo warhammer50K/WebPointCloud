@@ -144,12 +144,13 @@ COPC maps are never loaded whole. The viewer streams octree nodes on demand from
 
 ### Conversion backends
 
-Conversion tries two backends in order, so no extra setup is needed for the common case:
+Conversion tries three backends in order, so no extra setup is needed for the common case:
 
-1. **PDAL** (`pdal translate -w writers.copc`) — used automatically if PDAL **>= 2.4** is on `PATH`. Optional; typically the fastest option on large files.
-2. **copclib** — the bundled multiprocess octree builder in `tools/las_to_copc.py`. Installed by `requirements.txt`, so this path always works out of the box.
+1. **untwine** — used automatically if `untwine` is on `PATH`. Out-of-core: it spills to a temp directory next to the output (needs about the source size free on disk) and keeps RAM bounded, so it is the only backend that handles clouds larger than RAM. Build it from [hobuinc/untwine](https://github.com/hobuinc/untwine) against an installed PDAL (`cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build`) and put `build/bin/untwine` on `PATH`.
+2. **PDAL** (`pdal translate -w writers.copc`) — used if PDAL **>= 2.4** is on `PATH`. Holds the whole cloud in memory.
+3. **copclib** — the bundled multiprocess octree builder in `tools/las_to_copc.py`. Installed by `requirements.txt`, so this path always works out of the box, but it also holds the whole cloud in memory (~3x the file size) and refuses files that would not fit in RAM.
 
-If neither is available, conversion is skipped and the file falls back to the legacy whole-cloud load path.
+If PDAL is killed by the OOM killer, conversion stops rather than falling through to copclib. If no backend can convert the file, the file falls back to the legacy whole-cloud load path.
 
 `.copc.laz` files can also be produced offline with `tools/las_to_copc.py <input.las>` (multiprocess writer; see the `WPC_COPC_*` variables below).
 
@@ -241,6 +242,7 @@ Notes:
 | `WPC_COPC_BUDGET` | `25000000` | Resident point budget for COPC streaming (~28 B/point on GPU) |
 | `WPC_COPC_WRITE_PROCS` | `8` | COPC converter: parallel write processes |
 | `WPC_COPC_MIN_NODE` | `2000` | COPC converter: collapse octree leaves below this point count |
+| `WPC_COPC_THREADS` | CPU count | COPC converter: threads for untwine / PDAL `writers.copc` |
 | `WPC_COPC_PARALLEL_MIN` | `2000000` | COPC converter: point count below which the build stays single-process |
 | `WPC_COPC_SPLIT_DEPTH` | `3` | COPC converter: octree depth at which subtrees fan out to worker processes |
 | `WPC_LIVE_TOKEN` | *(unset)* | Shared secret for live publishing; **required** when `WPC_PUBLIC=1` |
@@ -315,7 +317,8 @@ Browser ──── HTTP ────── Flask (Python) ◀──POST── 
 | [NumPy](https://numpy.org/) | BSD-3 | Numerical computing |
 | [SciPy](https://scipy.org/) | BSD-3 | Spatial algorithms (KDTree, SOR) |
 | [copc-lib](https://github.com/RockRobotic/copc-lib) | BSD-3 | COPC octree writing (`copclib`) |
-| [PDAL](https://pdal.io/) *(optional)* | BSD-3 | Preferred COPC conversion backend when installed |
+| [untwine](https://github.com/hobuinc/untwine) *(optional)* | GPL-3 | Out-of-core COPC conversion backend when installed (run as a separate CLI) |
+| [PDAL](https://pdal.io/) *(optional)* | BSD-3 | COPC conversion backend when installed |
 
 ## Contributing
 

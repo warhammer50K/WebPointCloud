@@ -1424,6 +1424,7 @@ def _icp(pts_a, pts_b, max_iter=50, tolerance=1e-6, max_distance=None):
     R_total = np.eye(3)
     t_total = np.zeros(3)
     prev_error = np.inf
+    completed = 0          # iterations that actually ran, for honest reporting
 
     tree = cKDTree(pts_a)   # target never moves — build once, not per iteration
     for i in range(max_iter):
@@ -1433,6 +1434,11 @@ def _icp(pts_a, pts_b, max_iter=50, tolerance=1e-6, max_distance=None):
         if max_distance is not None and max_distance > 0:
             mask = distances < max_distance
             if mask.sum() < 10:
+                # Too few pairs to fit a transform. Breaking here on the FIRST
+                # iteration leaves prev_error at inf, which the caller has to
+                # notice — jsonify would otherwise emit a bare `Infinity`, which
+                # is not valid JSON and dies in the browser as a parse error
+                # instead of an explanation.
                 break
             matched_src = src[mask]
             matched_tgt = pts_a[indices[mask]]
@@ -1473,8 +1479,9 @@ def _icp(pts_a, pts_b, max_iter=50, tolerance=1e-6, max_distance=None):
         # Accumulate
         R_total = R_step @ R_total
         t_total = R_step @ t_total + t_step
+        completed = i + 1
 
-    return R_total, t_total, max_iter, prev_error, False
+    return R_total, t_total, completed, prev_error, False
 
 
 @api_bp.route('/api/analysis/icp', methods=['POST'])
@@ -1569,6 +1576,16 @@ def analysis_icp():
         # Back to the viewer's pivot convention:
         #   P' = R_final·(P − c_b) + c_b + t  ⇒  t = t_abs + R_final·c_b − c_b
         t = t_final_abs + R_final @ c_b - c_b
+
+        # An infinite mean distance means _icp broke out before completing a
+        # single iteration — it never found 10 pairs inside max_distance. There
+        # is no alignment to report, and `Infinity` is not representable in
+        # JSON, so say what actually went wrong.
+        if not np.isfinite(mean_dist):
+            return jsonify({'error':
+                f'ICP found fewer than 10 point pairs within Max Distance '
+                f'({max_distance}). Raise it, or rough-align the clouds with '
+                f'the offset controls before running ICP.'}), 400
 
         rx, ry, rz = _rotation_matrix_to_euler(R_final)
 

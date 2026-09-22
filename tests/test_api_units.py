@@ -141,3 +141,51 @@ def test_rate_limiter_prunes_stale_ips():
         rl._prune_locked(now)
         assert '1.2.3.4' not in rl._hits
         assert '5.6.7.8' in rl._hits
+
+
+# ═══════════════════════════════════════════════════
+#  ICP: a result the caller can actually serialise
+# ═══════════════════════════════════════════════════
+from api import _icp  # noqa: E402
+
+
+def _two_clouds(separation):
+    rng = np.random.default_rng(0)
+    a = rng.random((400, 3)) * 10.0
+    return a, a + separation
+
+
+def test_icp_reports_zero_iterations_when_it_never_ran():
+    # Too far apart for any pair to fall inside max_distance: the loop breaks on
+    # its first pass. Reporting max_iter here (the old behaviour) claimed 50
+    # iterations of work that never happened.
+    a, b = _two_clouds(1000.0)
+    _, _, iterations, mean_error, converged = _icp(a, b, max_iter=50, max_distance=0.5)
+    assert iterations == 0
+    assert not converged
+    # The caller keys on this to return a 400 instead of emitting `Infinity`,
+    # which is not valid JSON and dies in the browser as a parse error.
+    assert not np.isfinite(mean_error)
+
+
+def test_icp_error_is_finite_and_json_safe_on_a_normal_run():
+    import json
+    a, b = _two_clouds(0.05)
+    _, _, iterations, mean_error, converged = _icp(a, b, max_iter=50, max_distance=1.0)
+    assert 0 < iterations <= 50
+    assert np.isfinite(mean_error)
+    json.dumps({'mean_distance': round(mean_error, 6)}, allow_nan=False)
+
+
+def test_icp_iteration_count_never_exceeds_the_cap():
+    a, b = _two_clouds(0.5)
+    _, _, iterations, _, _ = _icp(a, b, max_iter=5, max_distance=10.0)
+    assert iterations <= 5
+
+
+def test_icp_without_max_distance_always_has_correspondences():
+    # No distance filter means the early break cannot trigger, so a finite error
+    # is guaranteed however far apart the clouds are.
+    a, b = _two_clouds(1000.0)
+    _, _, iterations, mean_error, _ = _icp(a, b, max_iter=10, max_distance=None)
+    assert iterations > 0 and np.isfinite(mean_error)

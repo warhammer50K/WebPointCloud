@@ -10,7 +10,7 @@ import { pollConvert } from './data.js';
 
 /** Conversion overlay label by phase. */
 export function convLabel(name, pct, phase) {
-    if (phase === 'reading') return `Reading ${name}…`;
+    if (phase === 'reading') return pct > 0 ? `Reading ${name}… ${pct}%` : `Reading ${name}…`;
     if (phase === 'building') return `Building octree… ${pct}%`;
     return `Converting ${name} to COPC… ${pct}%`;
 }
@@ -21,26 +21,34 @@ export function convLabel(name, pct, phase) {
  * converting to COPC, polls the job (reporting % via onConvertPct) first.
  * @returns {Promise<{bounds:Object, offsetZ:number, count:number, label:string}>}
  */
+/* Every caller needs to know which file ended up on screen, not just how many
+   points it had: the analysis endpoints work on a server-side path, and an
+   upload that converts to COPC ends up at a DIFFERENT path than the one that
+   was uploaded (the original is deleted after conversion). Returning `path`
+   from here is what lets a caller point analysis at the right file without
+   re-deriving that rule. */
 export async function dispatchLoad(viewer, data, onConvertPct) {
     if (data.mode === 'converting') {
         const { meta, path } = await pollConvert(data.job, onConvertPct);
         viewer.loadCopc(meta, path);
         return { bounds: viewer.bounds, offsetZ: meta.coordOffset[2],
-                 count: meta.point_count, label: 'pts' };
+                 count: meta.point_count, label: 'pts', path };
     }
     if (data.mode === 'copc') {
         viewer.loadCopc(data.meta, data.path);
         return { bounds: viewer.bounds, offsetZ: data.meta.coordOffset[2],
-                 count: data.meta.point_count, label: 'pts' };
+                 count: data.meta.point_count, label: 'pts', path: data.path };
     }
     if (data.type === 'gaussian') {
         viewer.loadGaussianSplat(data);
         return { bounds: data.bounds, offsetZ: data.offset ? data.offset[2] : 0,
-                 count: data.numPoints, label: 'gaussians' };
+                 count: data.numPoints, label: 'gaussians',
+                 path: data.path || data.savedPath || null };
     }
     viewer.loadPointCloud(data);
     return { bounds: data.bounds, offsetZ: data.offset ? data.offset[2] : 0,
-             count: data.numPoints, label: 'pts' };
+             count: data.numPoints, label: 'pts',
+             path: data.path || data.savedPath || null };
 }
 
 /**
@@ -159,6 +167,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                                     throw new Error('Gaussian splat files are not supported as a compare map');
                                 }
                                 viewer.loadCompareCloud(data);
+                                resetCompareTransformInputs();
                                 console.log('[Compare] After loadCompareCloud:',
                                     'pointCloud in scene:', viewer.pointCloud ? viewer.scene.children.includes(viewer.pointCloud) : false,
                                     'compareCloud in scene:', viewer.compareCloud ? viewer.scene.children.includes(viewer.compareCloud) : false);
@@ -349,6 +358,13 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             });
             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
             $('compare-a-name').textContent = file.name;
+            // Without this the analysis panel keeps pointing at whatever was
+            // loaded before — every statistic and export would silently describe
+            // the previous cloud while this one is on screen.
+            if (info.path) {
+                const { setCurrentPath } = await import('./analysis.js');
+                setCurrentPath(info.path);
+            }
             $('no-data-msg').style.display = 'none';
             $('st-main').textContent = `Loaded ${info.count.toLocaleString()} ${info.label}`;
             appendLog(`Loaded ${file.name} (${info.count.toLocaleString()} ${info.label})`, 'success');
@@ -367,9 +383,36 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         $('modal-file').classList.add('open');
         refreshMapList();
     });
+    /* The compare overlay's transform lives in these inputs, and "Save Merged"
+       reads them straight back — so a value left over from a previous Map B (an
+       ICP solution, a manual nudge) describes a pose the current cloud is not
+       in, and writes a displaced LAS without anything on screen looking wrong.
+       loadCompareCloud() rebuilds the overlay with identity rotation, so the
+       inputs have to come back to zero with it. */
+    function resetCompareTransformInputs() {
+        for (const id of ['compare-ox', 'compare-oy', 'compare-oz',
+                          'compare-rx', 'compare-ry', 'compare-rz']) {
+            const el = $(id);
+            if (el) el.value = '0';
+        }
+        const icpResult = $('icp-result');
+        if (icpResult) icpResult.textContent = '';
+    }
+
+    /* Tearing down the overlay has to clear compareBPath too: analysis.js reads
+       it to decide whether C2C Distance can run, so leaving it set means C2C
+       computes against a cloud that is no longer on screen and reports the
+       numbers as current. */
+    function clearCompareState() {
+        viewer.clearCompare();
+        uiState.compareBPath = null;
+        $('compare-b-name').textContent = '-';
+        resetCompareTransformInputs();
+    }
+
     $('compare-close-btn').addEventListener('click', () => {
         $('compare-panel').classList.add('hidden');
-        viewer.clearCompare();
+        clearCompareState();
     });
     $('compare-opacity').addEventListener('input', e => viewer.setCompareOpacity(parseFloat(e.target.value)));
 
@@ -541,9 +584,5 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         }
     });
 
-    $('btn-compare-clear').addEventListener('click', () => {
-        viewer.clearCompare();
-        uiState.compareBPath = null;
-        $('compare-b-name').textContent = '-';
-    });
+    $('btn-compare-clear').addEventListener('click', clearCompareState);
 }
