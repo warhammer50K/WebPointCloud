@@ -43,17 +43,29 @@ export function turbo(t) {
     return [Math.max(0, Math.min(1, r)), Math.max(0, Math.min(1, g)), Math.max(0, Math.min(1, b))];
 }
 
+// A round point covering its square texel cell needs a diameter of spacing × √2.
+export const SPLAT_COVER = 1.42;
+
 export const VERT = `
 uniform float uPointSize;
+// Framebuffer pixels one metre spans at 1 m depth (0.5 × buffer height × P[1][1]),
+// so aSize (metres) projects to its true on-screen size.
+uniform float uFocal;
 uniform int   uColorMode;   // 0=intensity  1=height  2=rgb  3=classification
 uniform float uMinVal;
 uniform float uMaxVal;
 uniform float uGamma;
+uniform float uSaturation;
 uniform vec3  uClassPalette[20];
+// RGB (0,0,0) means "no camera colour" (HandheldSLAM maps): shade by intensity instead.
+uniform bool  uUncoloredGray;
 
 attribute float intensity;
 attribute vec3  rgb;
 attribute float classification;
+// Footprint in metres a point must cover (photo texel spacing, or the COPC level
+// spacing where no finer level is loaded); 0 = just uPointSize.
+attribute float aSize;
 
 varying vec3 vColor;
 
@@ -71,7 +83,9 @@ void main() {
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     gl_Position = projectionMatrix * mvPosition;
 
-    gl_PointSize = uPointSize * (400.0 / -mvPosition.z);
+    // uPointSize keeps its historical 400/depth scale (the slider's feel); aSize is
+    // a real footprint and uses the true projection, or coverage falls short ~2×.
+    gl_PointSize = max(uPointSize * 400.0, aSize * uFocal) / -mvPosition.z;
     gl_PointSize = clamp(gl_PointSize, 1.0, 64.0);
 
     float range = max(uMaxVal - uMinVal, 0.001);
@@ -85,8 +99,14 @@ void main() {
         int c = int(classification + 0.5);
         if (c < 0 || c > 18) c = 19;
         vColor = uClassPalette[c];
+    } else if (uUncoloredGray && max(rgb.r, max(rgb.g, rgb.b)) < 0.5 / 255.0) {
+        // Never seen by the camera: grey by intensity, lifted so the geometry stays visible
+        // against the dark background (typical intensity ~0.09 would otherwise be ~RGB 40).
+        vColor = vec3(0.3 + 0.6 * pow(clamp(intensity, 0.0, 1.0), uGamma));
     } else {
-        vColor = rgb;
+        // saturation boost around luma (uSaturation: 0=gray, 1=original, >1=vivid)
+        float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        vColor = clamp(mix(vec3(luma), rgb, uSaturation), 0.0, 1.0);
     }
 
     #include <clipping_planes_vertex>
@@ -310,6 +330,85 @@ varying vec2 vUv;
 void main() {
     vUv = uv;
     gl_Position = vec4(position, 1.0);
+}
+`;
+
+// Screen-space gap fill (ported from HandheldSLAM's web viewer): a background
+// pixel enclosed by drawn points on two opposing axis pairs takes their
+// distance-weighted colour and depth, unless those neighbours disagree in depth
+// (an edge in front of the background). Existing samples are untouched and
+// reconstructed pixels never seed further filling.
+export const GAP_FILL_FRAG = `
+uniform sampler2D uColor;
+uniform sampler2D uDepth;
+uniform vec2 uResolution;
+uniform int uRadius;
+uniform float uNear;
+uniform float uFar;
+uniform bool uPerspective;
+uniform float uPixelWorld;
+varying vec2 vUv;
+
+float linearDepth(float d) {
+    return uPerspective ? uNear * uFar / (uFar - d * (uFar - uNear))
+                        : mix(uNear, uFar, d);
+}
+
+vec4 support(vec2 direction) {
+    for (int step = 1; step <= 3; step++) {
+        if (step > uRadius) break;
+        vec2 uv = vUv + direction * float(step) / uResolution;
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) break;
+        float d = texture2D(uDepth, uv).r;
+        if (d < 1.0) return vec4(uv, d, 1.0);
+    }
+    return vec4(0.0);
+}
+
+void main() {
+    vec4 original = texture2D(uColor, vUv);
+    float depth = texture2D(uDepth, vUv).r;
+    gl_FragColor = original;
+    gl_FragDepthEXT = depth;
+    if (depth < 1.0) return;
+
+    vec3 colorSum = vec3(0.0);
+    float depthSum = 0.0;
+    float weightSum = 0.0;
+    float minDepth = uFar;
+    float maxDepth = 0.0;
+    int pairs = 0;
+    for (int axis = 0; axis < 4; axis++) {
+        vec2 dir = axis == 0 ? vec2(1.0, 0.0) : axis == 1 ? vec2(0.0, 1.0)
+                 : axis == 2 ? vec2(1.0, 1.0) : vec2(1.0, -1.0);
+        vec4 a = support(dir);
+        vec4 b = support(-dir);
+        // One-sided foreground evidence also vetoes filling behind an edge.
+        if (a.w > 0.0) {
+            float z = linearDepth(a.z);
+            minDepth = min(minDepth, z);
+            maxDepth = max(maxDepth, z);
+        }
+        if (b.w > 0.0) {
+            float z = linearDepth(b.z);
+            minDepth = min(minDepth, z);
+            maxDepth = max(maxDepth, z);
+        }
+        if (a.w * b.w == 0.0) continue;
+        pairs++;
+        float wa = 1.0 / length((a.xy - vUv) * uResolution);
+        float wb = 1.0 / length((b.xy - vUv) * uResolution);
+        colorSum += texture2D(uColor, a.xy).rgb * wa + texture2D(uColor, b.xy).rgb * wb;
+        depthSum += a.z * wa + b.z * wb;
+        weightSum += wa + wb;
+    }
+    // Two opposing pairs (four samples) must enclose the pixel.
+    if (pairs < 2) return;
+    float footprint = uPixelWorld * (uPerspective ? minDepth : 1.0);
+    float tolerance = clamp(footprint * float(uRadius) * 2.0, 0.02, 0.10);
+    if (maxDepth - minDepth > tolerance) return;
+    gl_FragColor = vec4(colorSum / weightSum, 1.0);
+    gl_FragDepthEXT = depthSum / weightSum;
 }
 `;
 

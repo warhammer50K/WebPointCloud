@@ -47,6 +47,14 @@ export function initViewControls(viewer, legend, deps, uiState) {
     $('gamma-slider').addEventListener('input', () => syncGamma('gamma-slider', 'gamma-spin'));
     $('gamma-spin').addEventListener('change', () => syncGamma('gamma-spin', 'gamma-slider'));
 
+    // ── Saturation (RGB only) ──
+    const syncSaturation = (src, dst) => {
+        $(dst).value = $(src).value;
+        viewer.setSaturation(parseFloat($(src).value));
+    };
+    $('sat-slider').addEventListener('input', () => syncSaturation('sat-slider', 'sat-spin'));
+    $('sat-spin').addEventListener('change', () => syncSaturation('sat-spin', 'sat-slider'));
+
     // ── View preset ──
     $('sel-view').addEventListener('change', e => viewer.setView(e.target.value));
 
@@ -151,6 +159,14 @@ export function initViewControls(viewer, legend, deps, uiState) {
     uiState._refreshBookmarks = _refreshBookmarks;
 
     // ── Post filters ──
+    const gapFill = $('ckb-gap-fill');
+    if (gapFill) {
+        gapFill.checked = viewer.gapFillEnabled;
+        gapFill.addEventListener('change', () => {
+            viewer.gapFillEnabled = gapFill.checked;
+            viewer._dirty = true;
+        });
+    }
     $('ckb-edl').addEventListener('change', () => {
         viewer.edlEnabled = $('ckb-edl').checked;
         viewer._dirty = true;

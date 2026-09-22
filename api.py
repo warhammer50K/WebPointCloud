@@ -91,54 +91,92 @@ def _safe_path(base_dir, name):
 # ══════════════════════════════════════════════════════
 #  Maps API
 # ══════════════════════════════════════════════════════
+# Extensions that count as a map file. '.copc.laz' is covered by '.laz'.
+_MAP_EXTS = ('.las', '.laz')
+
+
+def _las_file_info(path):
+    """Name, size and point count for one LAS/LAZ file, without reading points.
+
+    The listing runs on every modal open, so the point count comes from the
+    header: byte 107 for LAS 1.2, and laspy only where that legacy field is
+    not filled in (LAS 1.4 / PDRF >= 6, and all LAZ).
+    """
+    info = {'name': os.path.basename(path)}
+    try:
+        info['size'] = os.path.getsize(path)
+        if path.lower().endswith('.las'):
+            # Fast path: LAS 1.2 legacy point count at byte 107.
+            with open(path, 'rb') as fh:
+                fh.seek(107)
+                info['num_points'] = struct.unpack('<I', fh.read(4))[0]
+            if info['num_points'] == 0:
+                # LAS 1.4 (PDRF>=6) leaves the legacy count 0 — fall back to
+                # the real header via laspy.
+                import laspy
+                with laspy.open(path) as fh:
+                    info['num_points'] = int(fh.header.point_count)
+        else:
+            # LAZ/COPC (often LAS 1.4): read header via laspy.
+            import laspy
+            with laspy.open(path) as fh:
+                info['num_points'] = int(fh.header.point_count)
+    except Exception:
+        info.setdefault('size', 0)
+        info['num_points'] = 0
+    return info
+
+
+def _created_time(path):
+    try:
+        return os.path.getctime(path)
+    except OSError:
+        return 0
+
+
 @api_bp.route('/api/maps')
 def list_maps():
+    """List the maps under MAPS_DIR.
+
+    Two layouts live side by side, because both are things people actually do:
+    a *directory* holding one or more clouds (what the analysis tools write,
+    and what a SLAM run produces), and a *loose file* copied straight into the
+    maps directory. Loose files used to be skipped entirely, so the obvious
+    first move — drop a .las into the maps directory — produced an empty list
+    with no explanation. They are returned as single-file entries flagged
+    `is_file` so the client can label them without inventing a parent folder.
+    """
     maps_dir = current_app.config['MAPS_DIR']
-    maps = []
+    dirs, files = [], []
     if os.path.isdir(maps_dir):
-        for d in sorted(os.listdir(maps_dir)):
-            p = os.path.join(maps_dir, d)
+        for entry in sorted(os.listdir(maps_dir)):
+            p = os.path.join(maps_dir, entry)
             if os.path.isdir(p):
                 # Include LAZ/COPC alongside LAS so COPC maps appear in the list.
                 las_files = sorted(glob.glob(os.path.join(p, '*.las'))
                                    + glob.glob(os.path.join(p, '*.laz')))
-                las_info = []
-                for lf in las_files:
-                    info = {'name': os.path.basename(lf)}
-                    try:
-                        info['size'] = os.path.getsize(lf)
-                        if lf.lower().endswith('.las'):
-                            # Fast path: LAS 1.2 legacy point count at byte 107.
-                            with open(lf, 'rb') as fh:
-                                fh.seek(107)
-                                info['num_points'] = struct.unpack('<I', fh.read(4))[0]
-                            if info['num_points'] == 0:
-                                # LAS 1.4 (PDRF>=6) leaves the legacy count 0 —
-                                # fall back to the real header via laspy.
-                                import laspy
-                                with laspy.open(lf) as fh:
-                                    info['num_points'] = int(fh.header.point_count)
-                        else:
-                            # LAZ/COPC (often LAS 1.4): read header via laspy.
-                            import laspy
-                            with laspy.open(lf) as fh:
-                                info['num_points'] = int(fh.header.point_count)
-                    except Exception:
-                        info.setdefault('size', 0)
-                        info['num_points'] = 0
-                    las_info.append(info)
-                try:
-                    created = os.path.getctime(p)
-                except Exception:
-                    created = 0
-                maps.append({
-                    'name': d,
+                dirs.append({
+                    'name': entry,
                     'path': p,
+                    'is_file': False,
                     'las_files': [os.path.basename(f) for f in las_files],
-                    'las_info': las_info,
-                    'created': created,
+                    'las_info': [_las_file_info(f) for f in las_files],
+                    'created': _created_time(p),
                 })
-    return jsonify(maps)
+            elif os.path.isfile(p) and entry.lower().endswith(_MAP_EXTS):
+                # 'path' is the maps directory itself: the client joins
+                # path + las_files[0], which lands on this file.
+                files.append({
+                    'name': entry,
+                    'path': maps_dir,
+                    'is_file': True,
+                    'las_files': [entry],
+                    'las_info': [_las_file_info(p)],
+                    'created': _created_time(p),
+                })
+    # Directories first — they are the richer entry, and a conversion sidecar
+    # (map.copc.laz beside map.las) would otherwise interleave with them.
+    return jsonify(dirs + files)
 
 
 @api_bp.route('/api/maps/<name>', methods=['DELETE'])
@@ -147,12 +185,20 @@ def delete_map(name):
     safe = _safe_path(maps_dir, name)
     if not safe:
         return jsonify({'error': 'Invalid name'}), 400
-    if not os.path.isdir(safe):
+    is_dir = os.path.isdir(safe)
+    if not is_dir and not os.path.isfile(safe):
         return jsonify({'error': 'Not found'}), 404
     lock = _get_map_lock(name)
     with lock:
         try:
-            shutil.rmtree(safe)
+            if is_dir:
+                shutil.rmtree(safe)
+            else:
+                # A loose file only. Any 'map.copc.laz' conversion beside it is
+                # a complete map in its own right and has its own row in the
+                # list, so deleting 'map.las' leaves it alone rather than
+                # removing something the caller did not name.
+                os.remove(safe)
         except Exception as e:
             return _error_response(e, 'delete_map')
     # Map is gone — drop its lock so _map_locks doesn't grow unboundedly.
@@ -174,7 +220,7 @@ def rename_map(name):
     new_safe = _safe_path(maps_dir, new_name)
     if not old_safe or not new_safe:
         return jsonify({'error': 'Invalid name'}), 400
-    if not os.path.isdir(old_safe):
+    if not os.path.exists(old_safe):
         return jsonify({'error': 'Not found'}), 404
     if os.path.exists(new_safe):
         return jsonify({'error': 'Name already exists'}), 409
@@ -185,9 +231,34 @@ def rename_map(name):
         with lock_b:
             try:
                 os.rename(old_safe, new_safe)
+                _move_copc_sidecar(old_safe, new_safe)
                 return jsonify({'status': 'ok'})
             except Exception as e:
                 return _error_response(e, 'rename_map')
+
+
+def _move_copc_sidecar(old_path, new_path):
+    """Carry a loose file's '<base>.copc.laz' along with a rename.
+
+    Renaming 'map.las' to 'scan.las' would otherwise strand 'map.copc.laz':
+    a stale row in the list, and a full re-conversion the next time the
+    renamed file is opened. Best effort — a failure here costs a re-convert,
+    not the rename that already succeeded.
+    """
+    if os.path.isdir(new_path):
+        return
+    # splitext('map.copc.laz') is ('map.copc', '.laz'), so deriving a sidecar
+    # from a COPC would aim at 'map.copc.copc.laz'. Check the suffix instead.
+    if (old_path.lower().endswith('.copc.laz')
+            or new_path.lower().endswith('.copc.laz')):
+        return                       # renaming the conversion itself
+    old_side = os.path.splitext(old_path)[0] + '.copc.laz'
+    new_side = os.path.splitext(new_path)[0] + '.copc.laz'
+    if os.path.isfile(old_side) and not os.path.exists(new_side):
+        try:
+            os.rename(old_side, new_side)
+        except OSError:
+            pass
 
 
 # ══════════════════════════════════════════════════════

@@ -9,15 +9,34 @@ from pathlib import Path
 
 from flask import request, abort
 
+import config
+
+# Where the key lives on installs that predate the DATA_DIR layout: a dotfile
+# dropped loose in $HOME, named after a predecessor project.
+_LEGACY_KEY_PATH = Path.home() / '.mapper_secret_key'
+
 
 def load_or_create_secret_key() -> str:
-    """Read SECRET_KEY from env, or persist in ~/.mapper_secret_key."""
+    """Read SECRET_KEY from the environment, else persist one under DATA_DIR.
+
+    An existing key is read where it already is and left there. Relocating it
+    would be a destructive edit to someone's $HOME on the strength of a version
+    bump — and a rollback to an older build would then find nothing and mint a
+    new key, logging every open session out. New installs get the DATA_DIR
+    path; old ones keep theirs until the owner decides otherwise.
+    """
     env_key = os.environ.get('FLASK_SECRET_KEY')
     if env_key:
         return env_key
-    key_path = Path.home() / '.mapper_secret_key'
+
+    if _LEGACY_KEY_PATH.exists():
+        return _LEGACY_KEY_PATH.read_text().strip()
+
+    key_path = Path(config.SECRET_KEY_PATH)
     if key_path.exists():
         return key_path.read_text().strip()
+
+    key_path.parent.mkdir(parents=True, exist_ok=True)
     new_key = os.urandom(24).hex()
     key_path.write_text(new_key)
     key_path.chmod(0o600)
@@ -101,6 +120,11 @@ def init_security(app, logger, rate_limiter=None):
         # polls), so they would trip a per-IP rate limit. Exempt them; the IP
         # whitelist check above still applies.
         if request.path.startswith('/api/copc/'):
+            return None
+        # Live streaming is the same story an order of magnitude worse: the
+        # bridge publishes at sensor rate and the viewer polls at frame rate,
+        # so a 60/minute limit would cut a working stream dead within seconds.
+        if request.path.startswith('/api/live/'):
             return None
         if not rate_limiter.is_allowed(client_ip):
             logger.warning(f"[Security] Rate limit exceeded for {client_ip}")

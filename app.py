@@ -2,13 +2,75 @@
 """WebPointCloud — Web-based 3D Point Cloud Viewer & Analysis Tool"""
 
 import os
+import sys
 import logging
 from logging.handlers import RotatingFileHandler
 
-from flask import Flask, render_template, request
 
-import config
-from security import load_or_create_secret_key, RateLimiter, init_security
+# ── Virtualenv bootstrap ──────────────────────────────
+def _bootstrap_venv():
+    """Make a bare `python3 app.py` work by re-execing inside .venv.
+
+    The dependencies cannot go into the system interpreter on any recent
+    distro — Ubuntu 24.04, Debian 12 and Fedora all ship a PEP 668 marked
+    Python that refuses `pip install` outright — so a venv is not optional
+    here. Failing with a raw ImportError would leave the reader to work that
+    out; instead create .venv, install requirements.txt into it, and hand the
+    process over. Set WPC_NO_BOOTSTRAP=1 to skip this and get the plain
+    ImportError back.
+    """
+    import importlib.util
+    import subprocess
+
+    required = ('flask', 'numpy', 'laspy', 'scipy', 'copclib')
+    if all(importlib.util.find_spec(m) is not None for m in required):
+        return
+    if os.environ.get('WPC_NO_BOOTSTRAP') == '1':
+        return
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    venv = os.path.join(here, '.venv')
+    py = (os.path.join(venv, 'Scripts', 'python.exe') if os.name == 'nt'
+          else os.path.join(venv, 'bin', 'python'))
+
+    # Already re-execed once and still short a module: installing again would
+    # only spin. Let the import below raise so the real name shows up.
+    if os.environ.get('WPC_BOOTSTRAPPED') == '1':
+        return
+
+    probe = 'import ' + ', '.join(required)
+    if os.path.exists(py):
+        # The venv is there — ask it, not us, whether anything is missing, so a
+        # ready environment goes straight to exec instead of paying for pip.
+        needs_install = subprocess.call(
+            [py, '-c', probe], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL) != 0
+    else:
+        print(f"Creating {venv} ...", flush=True)
+        try:
+            subprocess.check_call([sys.executable, '-m', 'venv', venv])
+        except subprocess.CalledProcessError:
+            sys.exit("Could not create a virtualenv. On Debian/Ubuntu: "
+                     "sudo apt install python3-venv")
+        needs_install = True
+
+    if needs_install:
+        print("Installing dependencies from requirements.txt ...", flush=True)
+        subprocess.check_call([py, '-m', 'pip', 'install', '--quiet', '--upgrade', 'pip'])
+        subprocess.check_call([py, '-m', 'pip', 'install', '-r',
+                               os.path.join(here, 'requirements.txt')])
+
+    env = dict(os.environ, WPC_BOOTSTRAPPED='1')
+    os.execve(py, [py, os.path.abspath(__file__)] + sys.argv[1:], env)
+
+
+if __name__ == '__main__':
+    _bootstrap_venv()
+
+from flask import Flask, render_template, request  # noqa: E402
+
+import config  # noqa: E402
+from security import load_or_create_secret_key, RateLimiter, init_security  # noqa: E402
 
 _rate_limiter = RateLimiter(config.RATE_LIMIT_MAX, config.RATE_LIMIT_WINDOW)
 
@@ -73,6 +135,9 @@ app.config['LOGGER'] = logger
 # ── Register Blueprint ────────────────────────────────
 from api import api_bp  # noqa: E402
 app.register_blueprint(api_bp)
+
+from live import live_bp  # noqa: E402
+app.register_blueprint(live_bp)
 
 # ── Security middleware (IP whitelist + rate limiting) ─
 init_security(app, logger, _rate_limiter)

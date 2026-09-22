@@ -43,7 +43,7 @@ def read_pointcloud(path):
 # ══════════════════════════════════════════════════════
 
 def arrays_to_binary(x, y, z, intensity, r, g, b, n, offset=None,
-                     classification=None):
+                     classification=None, splat=None):
     """Pack point cloud arrays into binary format for the web viewer.
 
     Coordinates are centered by subtracting the bounding-box midpoint in
@@ -59,6 +59,10 @@ def arrays_to_binary(x, y, z, intensity, r, g, b, n, offset=None,
     When ``classification`` is given (LAS sources), it rides as an 8th float
     per point and fpp becomes 8. The client keys on fpp, so 7-float payloads
     from formats without classification stay valid unchanged.
+
+    When ``splat`` is given (per-point footprint in metres, 0 = unknown), it
+    rides as a 9th float and fpp becomes 9 (classification is zero-filled if
+    absent, so the column index stays fixed).
 
     Format: header(8: n, fpp) + offset(24, 3×float64) + bounds(32, 8×float32)
             + data(n×fpp float32)
@@ -81,8 +85,11 @@ def arrays_to_binary(x, y, z, intensity, r, g, b, n, offset=None,
     zc = (z64 - oz).astype(np.float32)
 
     cols = [xc, yc, zc, intensity, r, g, b]
-    if classification is not None:
-        cols.append(np.asarray(classification, dtype=np.float32))
+    if classification is not None or splat is not None:
+        cols.append(np.asarray(classification, dtype=np.float32) if classification is not None
+                    else np.zeros(len(xc), dtype=np.float32))
+    if splat is not None:
+        cols.append(np.asarray(splat, dtype=np.float32))
     fpp = len(cols)
 
     if n > 0:

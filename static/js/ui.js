@@ -10,6 +10,7 @@ import { initToolControls } from './ui-tools.js';
 import { initKeyboardShortcuts } from './ui-keyboard.js';
 import { initFloatingPanel } from './ui-float-panel.js';
 import { initFileManagement } from './ui-files.js';
+import { initLiveControls } from './ui-live.js';
 import { initAnalysis } from './analysis.js';
 
 /* Re-export for app.js compatibility */
@@ -38,4 +39,5 @@ export function initUI(viewer, legend, deps) {
     initFileManagement(viewer, legend, deps, _uiState);
     initKeyboardShortcuts(viewer, legend, deps, _uiState);
     initAnalysis(viewer, legend, deps, _uiState);
+    initLiveControls(viewer, legend, deps, _uiState);
 }

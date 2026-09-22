@@ -1,8 +1,8 @@
 /* ═══════════════════════════════════════════════════════
-   Viewer Post-processing — EDL & SSAO
+   Viewer Post-processing — gap fill, EDL & SSAO
    ═══════════════════════════════════════════════════════ */
 import * as THREE from 'three';
-import { POST_VERT, EDL_FRAG, SSAO_FRAG } from './shaders.js';
+import { POST_VERT, GAP_FILL_FRAG, EDL_FRAG, SSAO_FRAG } from './shaders.js';
 
 
 export function initPostProcessing(viewer, w, h) {
@@ -25,6 +25,26 @@ export function initPostProcessing(viewer, w, h) {
     viewer._postScene = new THREE.Scene();
     viewer._postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     const quadGeom = new THREE.PlaneGeometry(2, 2);
+
+    viewer._gapFillMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+            uColor: { value: null },
+            uDepth: { value: null },
+            uResolution: { value: new THREE.Vector2(rw, rh) },
+            uRadius: { value: viewer.gapFillRadius },
+            uNear: { value: viewer.camera.near },
+            uFar: { value: viewer.camera.far },
+            uPerspective: { value: true },
+            uPixelWorld: { value: 0 },
+        },
+        extensions: { fragDepth: true },
+        vertexShader: POST_VERT,
+        fragmentShader: GAP_FILL_FRAG,
+        depthFunc: THREE.AlwaysDepth,
+    });
+    // Fill alone renders straight to the canvas; a lighting pass after it needs
+    // the filled colour AND depth, so that target is allocated on first use.
+    viewer._gapFillRt = null;
 
     viewer._edlMaterial = new THREE.ShaderMaterial({
         uniforms: {
@@ -75,4 +95,9 @@ export function resizePostTargets(viewer, w, h) {
     viewer._rt2.setSize(rw, rh);
     viewer._edlMaterial.uniforms.uResolution.value.set(rw, rh);
     viewer._ssaoMaterial.uniforms.uResolution.value.set(rw, rh);
+    viewer._gapFillMaterial.uniforms.uResolution.value.set(rw, rh);
+    if (viewer._gapFillRt) {
+        viewer._gapFillRt.dispose();
+        viewer._gapFillRt = null;
+    }
 }

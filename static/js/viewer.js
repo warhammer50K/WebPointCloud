@@ -3,7 +3,7 @@
    ═══════════════════════════════════════════════════════ */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG, GAUSSIAN_VERT, GAUSSIAN_FRAG, CLASS_PALETTE, CLASS_NAMES } from './shaders.js';
+import { turbo, VERT, FRAG, RAW_VERT, RAW_FRAG, KF0_FRAG, KF1_FRAG, GAUSSIAN_VERT, GAUSSIAN_FRAG, CLASS_PALETTE, CLASS_NAMES, SPLAT_COVER } from './shaders.js';
 import { GaussianSplat } from './gaussian-splat.js';
 import { CopcLodManager } from './copc-lod.js';
 
@@ -64,6 +64,7 @@ export class Viewer {
         this.pointSize = 0.05;
         this.colorMode = 'intensity';
         this.gamma = 0.6;
+        this.saturation = 1.0;   // RGB-only saturation multiplier
         this.clipEnabled = false;
         this.clipZMin = -5;
         this.clipZMax = 5;
@@ -126,53 +127,97 @@ export class Viewer {
         this._lookDir = new THREE.Vector3();
         this.lookSpeed = 0.004;              // radians per pixel of drag
 
-        // Wheel = adaptive dolly-drive. Each notch covers 6% of the pivot
-        // distance, so zoom is fast from an overview and fine-grained up close.
-        // The pivot (controls.target) shrinks with the camera like a plain dolly,
-        // but bottoms out at a floor — from there camera and pivot advance
-        // TOGETHER, so the wheel keeps a usable speed for flying through the map
-        // instead of freezing at the pivot (pan, which OrbitControls scales by
-        // pivot distance, stays alive too). Zooming out grows the pivot back up
-        // to a cap, beyond which it becomes a straight backward drive.
-        //   • Shift+wheel → fine dolly with a much smaller floor, for getting
-        //     right up to detail.
+        // Wheel = adaptive dolly-drive ALONG THE CURSOR RAY. The camera travels
+        // toward the point the pointer is over, not toward the screen centre, so
+        // whatever is under the cursor stays under the cursor and zooming in no
+        // longer pushes the thing you are inspecting off-screen.
+        //
+        // Speed is a fixed fraction of the distance to the content the cursor is
+        // over (nearest loaded octree node ahead; the pivot when the cursor is on
+        // empty sky), so a notch is a big move from an overview and a small one up
+        // close. The pivot (controls.target) follows that distance and keeps the
+        // view direction, but bottoms out at a floor — from there camera and pivot
+        // advance TOGETHER, so the wheel keeps a usable speed for flying through
+        // the map instead of freezing at the pivot (pan, which OrbitControls
+        // scales by pivot distance, stays alive too). Zooming out grows the pivot
+        // back up to a cap, beyond which it becomes a straight backward drive.
+        //   • Shift+wheel → precision zoom: a quarter of the step, and it STOPS
+        //     at the surface it is aimed at instead of flying through it.
+        // In and out are exact inverses (a geometric factor per notch), so
+        // scrolling back always lands on the view you came from.
         const _zoomDir = new THREE.Vector3();
+        const _zoomRay = new THREE.Ray();
         this.renderer.domElement.addEventListener('wheel', (e) => {
             e.preventDefault();
             e.stopImmediatePropagation();
+            // Drawing a lasso freezes the camera. The polygon is stored in screen
+            // pixels but applied with the camera of the moment it is APPLIED, so a
+            // zoom mid-selection deletes something other than what was outlined.
+            if (!this.controls.enabled) return;
+            // Any wheel input takes over a running fly-to, which would otherwise
+            // lerp the camera back over it on the very next frame.
+            this._cameraAnim = null;
+
             _zoomDir.subVectors(this.controls.target, this.camera.position);
-            let dist = _zoomDir.length();
-            if (dist < 1e-6) return;
-            _zoomDir.divideScalar(dist);                 // forward unit vector
+            const pivot = _zoomDir.length();
+            if (pivot < 1e-6) return;
+            _zoomDir.divideScalar(pivot);                // forward unit vector
 
             const b = this.bounds;
             const sceneSize = b
-                ? Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin) || dist
-                : dist;
+                ? Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin) || pivot
+                : pivot;
 
-            if (e.shiftKey) {
-                // Fine dolly: move only the camera, changing the pivot distance.
-                const step = dist * 0.06 * (e.deltaY < 0 ? 1 : -1);
-                const minPivot = Math.max(sceneSize * 0.002, 0.05);
-                const maxPivot = sceneSize * 1.5;
-                const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
-                this.camera.position.copy(this.controls.target)
-                    .addScaledVector(_zoomDir, -newDist);
-            } else {
-                const step = dist * 0.06 * (e.deltaY < 0 ? 1 : -1);
-                const minPivot = Math.max(sceneSize * 0.05, 0.5);
-                const maxPivot = sceneSize * 1.5;
-                const newDist = Math.min(Math.max(dist - step, minPivot), maxPivot);
-                this.camera.position.addScaledVector(_zoomDir, step);
-                this.controls.target.copy(this.camera.position)
-                    .addScaledVector(_zoomDir, newDist);
+            // Scale by the wheel's own amount (one classic notch ≈ 100 px / 3 lines):
+            // high-resolution wheels and touchpads send many small events per notch,
+            // and counting each one as a full notch made the zoom race.
+            // Chrome and Edge deliver a shift+wheel as a HORIZONTAL wheel (deltaX
+            // set, deltaY zero), so reading deltaY alone made the precision zoom a
+            // silent no-op there.
+            const raw = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+            const px = e.deltaMode === 1 ? raw * 33 : e.deltaMode === 2 ? raw * 800 : raw;
+            const notches = Math.max(-3, Math.min(3, px / 100));
+            if (notches === 0) return;
+
+            // Ray through the cursor. The camera moves along it, the view direction
+            // does not change, so the anchor point on the ray keeps its exact pixel.
+            this._cursorRay(e, _zoomRay);
+
+            // How far ahead the content under the cursor is — null on empty sky.
+            const anchor = this._rayContentDistance(_zoomRay);
+            const fine = e.shiftKey;
+            const rate = fine ? 0.015 : 0.06;                     // per notch
+            const minPivot = fine ? Math.max(sceneSize * 0.002, 0.05)
+                                  // The floor is capped: 5% of a 370 m map is 18 m,
+                                  // so each notch jumped over a metre next to a sign.
+                                  : Math.min(Math.max(sceneSize * 0.05, 0.5), 5);
+            const maxPivot = sceneSize * 1.5;
+            const ref = Math.min(Math.max(anchor != null ? anchor : pivot, minPivot), maxPivot);
+
+            // Geometric step: in and out are exact inverses of each other.
+            let step = ref * (1 - Math.pow(1 - rate, -notches));
+            // Precision zoom stops short of what it is aimed at; the plain wheel
+            // keeps its fly-through floor so a big map is still traversable with
+            // the wheel alone.
+            if (fine && anchor != null && step > 0) {
+                step = Math.min(step, Math.max(anchor - minPivot, 0));
             }
+
+            this.camera.position.addScaledVector(_zoomRay.direction, step);
+            // Keep looking the same way, with the pivot tracking what is in front.
+            const newPivot = Math.min(Math.max(ref - step, minPivot), maxPivot);
+            this.controls.target.copy(this.camera.position).addScaledVector(_zoomDir, newPivot);
+
             this._updatePanScale();          // pivot distance changed → re-scale pan
             this._dirty = true;
         }, { passive: false, capture: true });
 
-        // Keep pan in step with the view whenever a drag starts (mouse or touch).
-        this.renderer.domElement.addEventListener('pointerdown', () => this._updatePanScale());
+        // Keep pan in step with the view whenever a drag starts (mouse or touch),
+        // and let a drag take over from a running fly-to instead of fighting it.
+        this.renderer.domElement.addEventListener('pointerdown', () => {
+            this._cameraAnim = null;
+            this._updatePanScale();
+        });
 
         // First-person look: left-drag turns the view in place. Skipped while a
         // tool owns the left button (measure / polygon select / point info) or
@@ -181,6 +226,9 @@ export class Viewer {
         lookEl.addEventListener('pointerdown', (e) => {
             if (e.button !== 0 || !this.controls.enabled) return;
             if (this.measureMode || this.polySelectMode || this.pointInfoEnabled) return;
+            // Shift/Ctrl/Meta + left is OrbitControls' pan. Running the look on
+            // top of it panned and turned the view at the same time.
+            if (e.shiftKey || e.ctrlKey || e.metaKey) return;
             this._lookDragging = true;
             this._dragMode = this._isCameraInsideBounds() ? 'look' : 'orbit';
             this._lookLastX = e.clientX;
@@ -299,6 +347,9 @@ export class Viewer {
         this.compareOpacity = 0.5;
 
         // Post-processing
+        // Screen-space fill of enclosed gaps between points (viewer-post.js).
+        this.gapFillEnabled = true;
+        this.gapFillRadius = 2;
         this.edlEnabled = false;
         this.edlStrength = 1.0;
         this.ssaoEnabled = false;
@@ -339,6 +390,47 @@ export class Viewer {
         return p.x > b.xMin - m && p.x < b.xMax + m
             && p.y > b.yMin - m && p.y < b.yMax + m
             && p.z > b.zMin - m && p.z < b.zMax + m;
+    }
+
+    // Ray from the camera through a pointer event's pixel, in world space.
+    _cursorRay(e, out) {
+        // unproject() reads camera.matrixWorld, which only refreshes at render
+        // time. A trackpad sends several wheel events per frame, so without this
+        // the second one in a frame unprojects against the camera's PREVIOUS
+        // position — the cursor point lands behind the camera and the ray flips,
+        // making the zoom jitter back and forth instead of moving.
+        this.camera.updateMatrixWorld();
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        this._cursorNdc = this._cursorNdc || new THREE.Vector3();
+        this._cursorNdc.set(
+            ((e.clientX - rect.left) / rect.width) * 2 - 1,
+            -((e.clientY - rect.top) / rect.height) * 2 + 1,
+            0.5,
+        ).unproject(this.camera);
+        out.origin.copy(this.camera.position);
+        out.direction.copy(this._cursorNdc).sub(this.camera.position).normalize();
+        return out;
+    }
+
+    // How far ahead the content along a ray is — the zoom anchor. Boxes the ray
+    // origin is already inside say nothing about what is in FRONT of the camera
+    // (the root node contains everything once you fly into the map), so they are
+    // skipped. Null when the ray meets nothing: the caller falls back to the
+    // pivot distance, which is what the wheel used to do everywhere.
+    _rayContentDistance(ray) {
+        if (this.copcManager && this.copcManager.rayNodeDistance) {
+            const d = this.copcManager.rayNodeDistance(ray);
+            if (d != null) return d;
+        }
+        const b = this.bounds;
+        if (!b) return null;
+        this._panBox = this._panBox || new THREE.Box3();
+        this._panHit = this._panHit || new THREE.Vector3();
+        this._panBox.min.set(b.xMin, b.yMin, b.zMin);
+        this._panBox.max.set(b.xMax, b.yMax, b.zMax);
+        if (this._panBox.containsPoint(ray.origin)) return null;
+        const hit = ray.intersectBox(this._panBox, this._panHit);
+        return hit ? hit.distanceTo(ray.origin) : null;
     }
 
     // Adaptive pan speed.
@@ -482,7 +574,13 @@ export class Viewer {
         if (this.gaussianSplat) this.gaussianSplat.update();
         if (this.copcManager) this.copcManager.maybeUpdate();
         if (this._dirty) {
-            const usePost = this.edlEnabled || this.ssaoEnabled;
+            const focal = this._focalPx();
+            for (const m of [this.copcManager && this.copcManager.material, this.pointCloud && this.pointCloud.material]) {
+                if (m && m.uniforms && m.uniforms.uFocal) m.uniforms.uFocal.value = focal;
+            }
+            const fill = this.gapFillEnabled && !!this._gapFillMaterial;
+            const lighting = this.edlEnabled || this.ssaoEnabled;
+            const usePost = fill || lighting;
             if (!usePost) {
                 this.renderer.setRenderTarget(null);
                 this.renderer.render(this.scene, this.camera);
@@ -492,6 +590,34 @@ export class Viewer {
 
                 let srcColor = this._rt.texture;
                 let srcDepth = this._rt.depthTexture;
+
+                if (fill) {
+                    if (lighting && !this._gapFillRt) {
+                        this._gapFillRt = new THREE.WebGLRenderTarget(this._rt.width, this._rt.height, {
+                            minFilter: THREE.NearestFilter,
+                            magFilter: THREE.NearestFilter,
+                            depthBuffer: true,
+                            depthTexture: new THREE.DepthTexture(this._rt.width, this._rt.height, THREE.UnsignedIntType),
+                        });
+                    }
+                    const u = this._gapFillMaterial.uniforms;
+                    u.uColor.value = srcColor;
+                    u.uDepth.value = srcDepth;
+                    u.uRadius.value = this.gapFillRadius;
+                    u.uNear.value = this.camera.near;
+                    u.uFar.value = this.camera.far;
+                    u.uPerspective.value = !!this.camera.isPerspectiveCamera;
+                    u.uPixelWorld.value = 2 / (this.camera.projectionMatrix.elements[5] * this._rt.height);
+                    this._postQuad.material = this._gapFillMaterial;
+                    const target = lighting ? this._gapFillRt : null;
+                    this.renderer.setRenderTarget(target);
+                    this.renderer.render(this._postScene, this._postCamera);
+                    if (target) {
+                        // Lighting reads the filled image, so filled pixels aren't shaded as background.
+                        srcColor = target.texture;
+                        srcDepth = target.depthTexture;
+                    }
+                }
 
                 if (this.edlEnabled) {
                     const target = this.ssaoEnabled ? this._rt2 : null;
@@ -523,6 +649,13 @@ export class Viewer {
     }
 
     /* ── Shader material factory ── */
+    // Framebuffer pixels per metre at 1 m depth: what a footprint (aSize) needs.
+    _focalPx() {
+        if (!this.renderer || !this.camera) return 0;
+        const h = this.renderer.getDrawingBufferSize(this._focalTmp || (this._focalTmp = new THREE.Vector2())).y;
+        return 0.5 * h * this.camera.projectionMatrix.elements[5];
+    }
+
     _colorModeInt() {
         return this.colorMode === 'height' ? 1
              : this.colorMode === 'rgb' ? 2
@@ -533,14 +666,17 @@ export class Viewer {
         return new THREE.ShaderMaterial({
             uniforms: {
                 uPointSize: { value: this.pointSize },
+                uFocal:     { value: this._focalPx() },
                 uColorMode: { value: this._colorModeInt() },
                 uMinVal:    { value: 0.0 },
                 uMaxVal:    { value: 1.0 },
                 uGamma:     { value: this.gamma },
+                uSaturation:{ value: this.saturation },
                 uOpacity:      { value: 1.0 },
                 uTintColor:    { value: new THREE.Vector3(1, 1, 1) },
                 uTintStrength: { value: 0.0 },
                 uClassPalette: { value: CLASS_PALETTE.map(c => new THREE.Vector3(...c)) },
+                uUncoloredGray: { value: false },
             },
             vertexShader: VERT,
             fragmentShader: FRAG,
@@ -560,6 +696,7 @@ export class Viewer {
             u.uMaxVal.value = this.bounds ? this.bounds.zMax : 1;
         }
         u.uGamma.value = this.gamma;
+        if (u.uSaturation) u.uSaturation.value = this.saturation;
     }
 
     _buildGeometry(data) {
@@ -571,6 +708,14 @@ export class Viewer {
         const cls = data.classifications && data.classifications.length === data.numPoints
             ? data.classifications : new Float32Array(data.numPoints);
         geom.setAttribute('classification', new THREE.Float32BufferAttribute(cls, 1));
+        // Footprint each point must cover (metres): given directly by the COPC
+        // stream, or from a photo-baked file's splat sizes; 0 = uPointSize only.
+        let size = data.sizes && data.sizes.length === data.numPoints ? data.sizes : null;
+        if (!size && data.splats && data.splats.length === data.numPoints) {
+            size = new Float32Array(data.numPoints);
+            for (let i = 0; i < size.length; i++) size[i] = data.splats[i] * SPLAT_COVER;
+        }
+        geom.setAttribute('aSize', new THREE.Float32BufferAttribute(size || new Float32Array(data.numPoints), 1));
         return geom;
     }
 
@@ -766,6 +911,18 @@ export class Viewer {
         if (this.mapCloud)   this.mapCloud.material.uniforms.uGamma.value = g;
         this.kfrmClouds.forEach(c => { c.material.uniforms.uGamma.value = g; });
         if (this.copcManager) this.copcManager.material.uniforms.uGamma.value = g;
+        this._dirty = true;
+    }
+
+    setSaturation(v) {
+        this.saturation = v;
+        const apply = c => { if (c && c.material.uniforms.uSaturation) c.material.uniforms.uSaturation.value = v; };
+        apply(this.pointCloud);
+        apply(this.mapCloud);
+        apply(this.curCloud);
+        apply(this.compareCloud);
+        this.kfrmClouds.forEach(apply);
+        if (this.copcManager) apply({ material: this.copcManager.material });
         this._dirty = true;
     }
 
@@ -1172,14 +1329,7 @@ export class Viewer {
             }
         }
 
-        let total = 0;
-        const drawCount = g => g.drawRange.count === Infinity ? g.getAttribute('position').count : g.drawRange.count;
-        if (this.cloudData) total += this.cloudData.numPoints;
-        if (this.mapCloud)  total += drawCount(this.mapCloud.geometry);
-        if (this.rawCloud)  total += drawCount(this.rawCloud.geometry);
-        if (this.curCloud)  total += drawCount(this.curCloud.geometry);
-        for (const c of this.kfrmClouds) total += drawCount(c.geometry);
-        { const pe = document.getElementById('viewer-pts'); if (pe) pe.textContent = `Points: ${total.toLocaleString()}`; }
+        this._updatePointsHud();
         this.updateStats();
         this._dirty = true;
     }
@@ -1576,13 +1726,40 @@ export class Viewer {
     clearAll() {
         this.clearCloud('pointCloud');
         this.cloudData = null;
-        for (const key of ['rawCloud', 'curCloud', 'mapCloud']) this.clearCloud(key);
-        this.clearKfrmClouds();
+        this.clearLive();
         this.clearConstraintGraph();
         this.clearKfMarkers();
         this.clearCopc();
         this.clearGaussianSplat();
         this.clearCompare();
+    }
+
+    /* ── Live streaming ── */
+
+    /** Wipe everything a live stream put in the scene, file clouds untouched. */
+    clearLive() {
+        for (const key of ['rawCloud', 'curCloud', 'mapCloud']) this.clearCloud(key);
+        this.clearKfrmClouds();   // also clears the trajectory
+        this.clearPoseMarker();
+        // Every arriving frame refreshes both readouts; without the same call
+        // here they keep reporting points that are no longer in the scene (and
+        // the header stays stuck on the live count) until the next camera move
+        // happens to redraw them — which reads as Clear having half worked.
+        this._updatePointsHud();
+        this.updateStats();
+    }
+
+    clearPoseMarker() {
+        if (!this.poseMarker) return;
+        this.scene.remove(this.poseMarker);
+        // The marker is a Group of three axis cylinders — disposing the group
+        // itself frees nothing, so walk the children.
+        for (const child of this.poseMarker.children) {
+            child.geometry.dispose();
+            child.material.dispose();
+        }
+        this.poseMarker = null;
+        this._dirty = true;
     }
 
     clearKfMarkers() {
@@ -1740,18 +1917,43 @@ export class Viewer {
 
     resetCamera() { this._fitCamera(); }
 
+    /** Points actually drawn right now, across every source that can put some
+     *  in the scene. One owner for the number: the header and the stats panel
+     *  disagreeing about how many points are on screen is worse than either
+     *  being slightly stale. */
+    _scenePointTotal() {
+        const dc = g => g.drawRange.count === Infinity ? g.getAttribute('position').count : g.drawRange.count;
+        let total = 0;
+        if (this.cloudData) total += this.cloudData.numPoints;
+        // COPC mode holds no cloudData — the points live in the LOD manager's
+        // streamed chunks, so read the count from there or the total reads 0.
+        if (this.copcManager) total += this.copcManager.loadedPointCount;
+        if (this.mapCloud) total += dc(this.mapCloud.geometry);
+        if (this.rawCloud) total += dc(this.rawCloud.geometry);
+        if (this.curCloud) total += dc(this.curCloud.geometry);
+        for (const c of this.kfrmClouds) total += dc(c.geometry);
+        return total;
+    }
+
+    /** Refresh the header point counter. */
+    _updatePointsHud() {
+        const liveLayers = (this.mapCloud ? 1 : 0) + (this.rawCloud ? 1 : 0)
+                         + (this.curCloud ? 1 : 0) + this.kfrmClouds.length;
+        // While a streamed map is the only thing on screen, the COPC HUD owns
+        // the readout — it adds the '/ total (LOD)' denominator that a bare
+        // number cannot convey. Once live layers are mixed in that format no
+        // longer describes what is drawn, so show the plain scene total.
+        if (this.copcManager && liveLayers === 0) { this.copcManager._updateHud(); return; }
+        const pe = document.getElementById('viewer-pts');
+        if (pe) pe.textContent = `Points: ${this._scenePointTotal().toLocaleString()}`;
+    }
+
     updateStats() {
         const el = document.getElementById('viewer-stats');
         if (!el) return;
         if (!this.bounds) { el.style.display = 'none'; return; }
         const b = this.bounds;
-        let total = 0;
-        const dc = g => g.drawRange.count === Infinity ? g.getAttribute('position').count : g.drawRange.count;
-        if (this.cloudData) total += this.cloudData.numPoints;
-        if (this.mapCloud) total += dc(this.mapCloud.geometry);
-        if (this.rawCloud) total += dc(this.rawCloud.geometry);
-        if (this.curCloud) total += dc(this.curCloud.geometry);
-        for (const c of this.kfrmClouds) total += dc(c.geometry);
+        const total = this._scenePointTotal();
         const ox = this.coordOffset ? this.coordOffset[0] : 0;
         const oy = this.coordOffset ? this.coordOffset[1] : 0;
         const oz = this.coordOffset ? this.coordOffset[2] : 0;
