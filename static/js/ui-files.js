@@ -15,6 +15,16 @@ export function convLabel(name, pct, phase) {
     return `Converting ${name} to COPC… ${pct}%`;
 }
 
+/* Main-map loads overlap: a slow conversion or an analysis result can land
+   after the user has opened another map. Each load takes a generation; one
+   that is no longer the latest is dropped instead of replacing the newer map. */
+let _loadGen = 0;
+export function beginLoad() { return ++_loadGen; }
+export function currentLoadGen() { return _loadGen; }
+export class SupersededLoad extends Error {
+    constructor() { super('superseded by a newer load'); }
+}
+
 /**
  * Route loaded data to the right viewer mode (COPC stream / gaussian / point
  * cloud) and return display info for legend + logging. For large uploads still
@@ -27,9 +37,12 @@ export function convLabel(name, pct, phase) {
    was uploaded (the original is deleted after conversion). Returning `path`
    from here is what lets a caller point analysis at the right file without
    re-deriving that rule. */
-export async function dispatchLoad(viewer, data, onConvertPct) {
+export async function dispatchLoad(viewer, data, onConvertPct, gen = null) {
+    const checkCurrent = () => { if (gen !== null && gen !== _loadGen) throw new SupersededLoad(); };
+    checkCurrent();
     if (data.mode === 'converting') {
         const { meta, path } = await pollConvert(data.job, onConvertPct);
+        checkCurrent();
         viewer.loadCopc(meta, path);
         return { bounds: viewer.bounds, offsetZ: meta.coordOffset[2],
                  count: meta.point_count, label: 'pts', path };
@@ -190,11 +203,12 @@ export function initFileManagement(viewer, legend, deps, uiState) {
 
                         $('st-main').textContent = `Loading ${label}...`;
                         showLoading(`Loading ${label}...`);
+                        const gen = beginLoad();
                         try {
                             const data = await loadLasFromPath(fullPath);
                             const info = await dispatchLoad(viewer, data, (pct, phase) => {
                                 updateLoading(convLabel(f, pct, phase));
-                            });
+                            }, gen);
                             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
                             $('compare-a-name').textContent = label;
                             // Set current path for analysis
@@ -203,6 +217,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
                             $('no-data-msg').style.display = 'none';
                             appendLog(`Map loaded: ${label} (${info.count.toLocaleString()} ${info.label})`, 'success');
                         } catch (err) {
+                            if (err instanceof SupersededLoad) return;
                             $('st-main').textContent = `Error: ${err.message}`;
                             showToast(`Failed: ${err.message}`, 'error');
                         } finally {
@@ -357,13 +372,14 @@ export function initFileManagement(viewer, legend, deps, uiState) {
         }
         $('st-main').textContent = `Loading ${file.name}...`;
         showLoading(`Loading ${file.name}...`);
+        const gen = beginLoad();
         try {
             const data = await uploadLasFile(file, pct => {
                 updateLoading(`Uploading ${file.name}… ${pct}%`);
             });
             const info = await dispatchLoad(viewer, data, (pct, phase) => {
                 updateLoading(convLabel(file.name, pct, phase));
-            });
+            }, gen);
             legend.update(viewer.colorMode, info.bounds, info.offsetZ);
             $('compare-a-name').textContent = file.name;
             // Without this the analysis panel keeps pointing at whatever was
@@ -377,6 +393,7 @@ export function initFileManagement(viewer, legend, deps, uiState) {
             $('st-main').textContent = `Loaded ${info.count.toLocaleString()} ${info.label}`;
             appendLog(`Loaded ${file.name} (${info.count.toLocaleString()} ${info.label})`, 'success');
         } catch (err) {
+            if (err instanceof SupersededLoad) return;
             $('st-main').textContent = `Error: ${err.message}`;
             showToast(`Failed: ${err.message}`, 'error');
         } finally {

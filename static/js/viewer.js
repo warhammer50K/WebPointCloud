@@ -575,7 +575,8 @@ export class Viewer {
         if (this.copcManager) this.copcManager.maybeUpdate();
         if (this._dirty) {
             const focal = this._focalPx();
-            for (const m of [this.copcManager && this.copcManager.material, this.pointCloud && this.pointCloud.material]) {
+            for (const m of [this.copcManager && this.copcManager.material, this.pointCloud && this.pointCloud.material,
+                             this.compareCloud && this.compareCloud.material]) {
                 if (m && m.uniforms && m.uniforms.uFocal) m.uniforms.uFocal.value = focal;
             }
             const fill = this.gapFillEnabled && !!this._gapFillMaterial;
@@ -780,7 +781,25 @@ export class Viewer {
 
         this._fitCamera();
         this.updateStats();
+        this._mainCloudChanged();
         this._dirty = true;
+    }
+
+    /**
+     * Everything tied to the previous main cloud is reset in one place, so a
+     * new map never inherits its measurements, its clip/transform inputs or
+     * its analysis results. UI modules listen for 'wpc:main-cloud-changed'.
+     */
+    _mainCloudChanged() {
+        _clearMeasurement(this);
+        _clearPolySelect(this);
+        // The compare overlay sits at (its offset - main offset): re-place it
+        // in the new main cloud's frame instead of leaving it km away.
+        if (this.compareCloud) {
+            const [x, y, z] = this._compareUserOffset || [0, 0, 0];
+            _setCompareOffset(this, x, y, z);
+        }
+        window.dispatchEvent(new CustomEvent('wpc:main-cloud-changed'));
     }
 
     /* ── Load a COPC map as a streaming octree LOD ── */
@@ -829,6 +848,7 @@ export class Viewer {
         _updateUndoRedoButtons(this);
         this._fitCamera();
         this.updateStats();
+        this._mainCloudChanged();
         this._dirty = true;
     }
 
@@ -885,6 +905,7 @@ export class Viewer {
         }
 
         this._fitCamera();
+        this._mainCloudChanged();
         this._dirty = true;
     }
 
@@ -900,6 +921,7 @@ export class Viewer {
         this.colorMode = mode;
         this._syncColorUniforms(this.pointCloud);
         this._syncColorUniforms(this.mapCloud);
+        this._syncColorUniforms(this.compareCloud);
         this.kfrmClouds.forEach(c => this._syncColorUniforms(c));
         if (this.copcManager) this._syncColorUniforms({ material: this.copcManager.material });
         this._dirty = true;
@@ -909,6 +931,7 @@ export class Viewer {
         this.gamma = g;
         if (this.pointCloud) this.pointCloud.material.uniforms.uGamma.value = g;
         if (this.mapCloud)   this.mapCloud.material.uniforms.uGamma.value = g;
+        if (this.compareCloud) this.compareCloud.material.uniforms.uGamma.value = g;
         this.kfrmClouds.forEach(c => { c.material.uniforms.uGamma.value = g; });
         if (this.copcManager) this.copcManager.material.uniforms.uGamma.value = g;
         this._dirty = true;
@@ -930,6 +953,7 @@ export class Viewer {
         this.pointSize = s;
         if (this.pointCloud) this.pointCloud.material.uniforms.uPointSize.value = s;
         if (this.mapCloud)   this.mapCloud.material.uniforms.uPointSize.value = s;
+        if (this.compareCloud) this.compareCloud.material.uniforms.uPointSize.value = s;
         if (this.rawCloud)   this.rawCloud.material.uniforms.uPointSize.value = s;
         if (this.curCloud)   this.curCloud.material.uniforms.uPointSize.value = s;
         this.kfrmClouds.forEach(c => { c.material.uniforms.uPointSize.value = s; });
@@ -954,6 +978,13 @@ export class Viewer {
         const colors = hasColor ? new Float32Array(outN * 3) : new Float32Array(0);
         const hasClass = data.classifications && data.classifications.length > 0;
         const classifications = hasClass ? new Float32Array(outN) : null;
+        // Per-point footprints: dropping them shrank photo-baked points to uPointSize.
+        const strided = a => {
+            if (!a || a.length !== srcN) return undefined;
+            const out = new Float32Array(outN);
+            for (let i = 0, o = 0; o < outN; i += step, o++) out[o] = a[i];
+            return out;
+        };
 
         for (let i = 0, o = 0; i < srcN && o < outN; i += step, o++) {
             const i3 = i * 3, o3 = o * 3;
@@ -968,7 +999,8 @@ export class Viewer {
             }
             if (hasClass) classifications[o] = data.classifications[i];
         }
-        return { positions, intensities, colors, classifications, numPoints: outN, bounds: data.bounds, offset: data.offset };
+        return { positions, intensities, colors, classifications, numPoints: outN, bounds: data.bounds, offset: data.offset,
+                 sizes: strided(data.sizes), splats: strided(data.splats) };
     }
 
     setDownsampleRatio(ratio) {
@@ -2048,6 +2080,13 @@ export class Viewer {
 
     _expandBounds(nb) {
         if (!nb) return;
+        if (!this.bounds) {
+            // e.g. a compare map opened before any main map
+            this.bounds = { ...nb };
+            this._updateGrid();
+            this._dirty = true;
+            return;
+        }
         const b = this.bounds;
         let changed = false;
         if (nb.xMin < b.xMin) { b.xMin = nb.xMin; changed = true; }
