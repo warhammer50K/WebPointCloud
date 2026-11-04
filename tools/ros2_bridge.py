@@ -25,6 +25,7 @@ Everything else has a sane default.
 """
 
 import argparse
+import collections
 import http.client
 import json
 import math
@@ -33,9 +34,13 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 import zlib
 
 import numpy as np
+
+# Layers whose frames merge into a growing map (see live.py): none may be lost.
+ACCUMULATE_LAYERS = ('kfrm',)
 
 # The decoding and downsampling below are plain numpy and are tested without a
 # ROS install, so a missing rclpy is not fatal at import time — only running the
@@ -93,13 +98,27 @@ def cloud_to_arrays(msg):
                       'offsets': offsets, 'itemsize': msg.point_step})
 
     n = msg.width * msg.height
+    packed_row = msg.width * msg.point_step
+    row_step = getattr(msg, 'row_step', 0) or packed_row
+    if row_step < packed_row or len(msg.data) < row_step * (msg.height - 1) + packed_row:
+        raise ValueError(f'truncated PointCloud2: {len(msg.data)} bytes for '
+                         f'{msg.height}x{msg.width} (row_step {row_step})')
+    data = msg.data
+    if msg.height > 1 and row_step != packed_row:
+        # Rows padded past width × point_step: reading the buffer as one run of
+        # records would shift every row after the first. Drop the padding.
+        buf = np.frombuffer(data, dtype=np.uint8,
+                            count=row_step * (msg.height - 1) + packed_row)
+        rows = np.lib.stride_tricks.as_strided(
+            buf, shape=(msg.height, packed_row), strides=(row_step, 1))
+        data = np.ascontiguousarray(rows)
     try:
         # rclpy hands over an array.array, which supports the buffer protocol —
         # so read it in place. bytes(msg.data) would copy the whole message
         # (64 MB for a dense 128-beam frame) before a single point is decoded.
-        raw = np.frombuffer(msg.data, dtype=dtype, count=n)
+        raw = np.frombuffer(data, dtype=dtype, count=n)
     except (TypeError, AttributeError, BufferError):
-        raw = np.frombuffer(bytes(msg.data), dtype=dtype, count=n)
+        raw = np.frombuffer(bytes(data), dtype=dtype, count=n)
 
     xyz = np.stack([raw['x'], raw['y'], raw['z']], axis=1).astype(np.float32)
 
@@ -199,6 +218,10 @@ class Publisher:
     connection safe.
     """
 
+    # An accumulate layer ('kfrm') must not lose frames: each one is a piece of
+    # the map. Those queue instead of sharing the slot, bounded by bytes.
+    QUEUE_BYTES = 256 * 1024 * 1024
+
     def __init__(self, url, token, timeout=5.0):
         parts = urllib.parse.urlsplit(url if '://' in url else 'http://' + url)
         self._host = parts.hostname or 'localhost'
@@ -209,6 +232,8 @@ class Publisher:
         self._conn = None
 
         self._slot = None
+        self._queue = collections.deque()   # accumulate frames, oldest first
+        self._queue_bytes = 0
         self._pose_slot = None
         self._cv = threading.Condition()
         self._stop = False
@@ -262,10 +287,21 @@ class Publisher:
 
     # ── frame queue ──
     def offer(self, payload, points, stream, layer, compressed):
+        # The frame id lets the server drop a resend of a frame it already
+        # stored (a timeout after the server answered), which would otherwise
+        # merge a keyframe into the map twice.
+        frame = (payload, points, stream, layer, compressed, uuid.uuid4().hex[:12])
         with self._cv:
-            if self._slot is not None:
-                self.dropped += 1
-            self._slot = (payload, points, stream, layer, compressed)
+            if layer in ACCUMULATE_LAYERS:
+                self._queue.append(frame)
+                self._queue_bytes += len(payload)
+                while len(self._queue) > 1 and self._queue_bytes > self.QUEUE_BYTES:
+                    self._queue_bytes -= len(self._queue.popleft()[0])
+                    self.dropped += 1
+            else:
+                if self._slot is not None:
+                    self.dropped += 1
+                self._slot = frame
             self._cv.notify()
 
     def offer_pose(self, matrix, stream):
@@ -276,11 +312,16 @@ class Publisher:
     def _run(self):
         while True:
             with self._cv:
-                while self._slot is None and self._pose_slot is None and not self._stop:
+                while (self._slot is None and not self._queue
+                       and self._pose_slot is None and not self._stop):
                     self._cv.wait(0.5)
-                if self._stop and self._slot is None:
+                if self._stop and self._slot is None and not self._queue:
                     return
-                frame, self._slot = self._slot, None
+                if self._queue:
+                    frame = self._queue.popleft()
+                    self._queue_bytes -= len(frame[0])
+                else:
+                    frame, self._slot = self._slot, None
                 pose, self._pose_slot = self._pose_slot, None
 
             if pose is not None:
@@ -293,9 +334,9 @@ class Publisher:
             if frame is None:
                 continue
 
-            payload, points, stream, layer, compressed = frame
+            payload, points, stream, layer, compressed, fid = frame
             query = urllib.parse.urlencode({
-                'stream': stream, 'layer': layer,
+                'stream': stream, 'layer': layer, 'fid': fid,
                 'points': points, 'compressed': '1' if compressed else '0'})
             ok, err = self._request('/api/live/publish?' + query, payload,
                                     {'Content-Type': 'application/octet-stream',
@@ -329,13 +370,17 @@ class BridgeNode(Node):
         self.pub = Publisher(args.url, args.token)
         self.stream = args.stream or args.topic.lstrip('/')
         self._last_sent = 0.0
-        self._min_period = 1.0 / args.rate if args.rate > 0 else 0.0
+        accumulate = args.layer in ACCUMULATE_LAYERS
+        # Keyframes are sparse and each is part of the map: never rate-limit them.
+        self._min_period = 1.0 / args.rate if args.rate > 0 and not accumulate else 0.0
         self._intensity_scale = 1.0
         self._frames = 0
         self._warned_no_intensity = False
 
         qos = QoSProfile(
-            depth=1,          # a live view wants the newest frame, never a backlog
+            # A live view wants the newest frame, never a backlog; keyframes
+            # arriving in a burst must all get through.
+            depth=100 if accumulate else 1,
             history=HistoryPolicy.KEEP_LAST,
             reliability=(ReliabilityPolicy.RELIABLE if args.qos == 'reliable'
                          else ReliabilityPolicy.BEST_EFFORT),
@@ -365,7 +410,12 @@ class BridgeNode(Node):
             return                          # rate limit: skip, don't queue
         self._last_sent = now
 
-        xyz, intensity, rgb = cloud_to_arrays(msg)
+        try:
+            xyz, intensity, rgb = cloud_to_arrays(msg)
+        except ValueError as exc:
+            # A malformed message must not take rclpy.spin (and the bridge) down.
+            self.get_logger().warn(str(exc), throttle_duration_sec=5.0)
+            return
         if xyz is None:
             self.get_logger().warn(
                 f"{self.args.topic} has no x/y/z fields — got "
@@ -417,10 +467,12 @@ class BridgeNode(Node):
         if self.args.intensity_max > 0:
             scale = self.args.intensity_max
         else:
-            frame_max = float(intensity.max(initial=1.0))
+            # NaN would stick in the running max and turn every later frame NaN.
+            finite = intensity[np.isfinite(intensity)]
+            frame_max = float(finite.max(initial=1.0))
             self._intensity_scale = max(frame_max, self._intensity_scale * 0.98, 1e-3)
             scale = self._intensity_scale
-        return np.clip(intensity / scale, 0.0, 1.0)
+        return np.clip(np.nan_to_num(intensity / scale, nan=0.0), 0.0, 1.0)
 
     # ── pose ──
     def _on_odom(self, msg):

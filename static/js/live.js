@@ -30,6 +30,9 @@ export class LiveClient {
         this._timer = null;
         this._epoch = null;
         this._seq = new Map();        // stream → last seq rendered
+        this._sids = new Map();       // stream → server id; a new id restarts its seq
+        this._layers = new Map();     // stream → layer, to clear a scan that went away
+        this._gen = 0;                // bumps on start/stop: older loops and fetches retire
         this._inFlight = new Set();   // streams whose frame is still being fetched/parsed
         this._poseSeq = 0;
         this._failures = 0;
@@ -52,20 +55,43 @@ export class LiveClient {
         this._failures = 0;
         this._error = null;
         this._windowStart = performance.now();
-        this._tick();
+        this._tick(++this._gen);
     }
 
-    /** @param {boolean} clear also wipe what is currently on screen */
+    /**
+     * What has been rendered is remembered across a stop, so reconnecting
+     * resumes after it: starting again from seq 0 re-merged the whole kfrm
+     * backlog onto the map still on screen.
+     * @param {boolean} clear also wipe what is currently on screen
+     */
     stop(clear = false) {
         this.running = false;
+        this._gen++;                  // an awaiting tick or fetch must not carry on
         clearTimeout(this._timer);
         this._timer = null;
         this._inFlight.clear();
-        this._seq.clear();
-        this._poseSeq = 0;
         this._streams = [];
-        if (clear) this.viewer.clearLive();
+        if (clear) {
+            this.viewer.clearLive();
+            this._forgetAll();
+        }
         this._emit();
+    }
+
+    _forgetAll() {
+        this._seq.clear();
+        this._sids.clear();
+        this._layers.clear();
+        this._poseSeq = 0;
+    }
+
+    /** True while a response fetched under `gen` still describes the current session. */
+    _current(gen, name, resp) {
+        if (gen !== this._gen || !this.running) return false;
+        const epoch = resp && resp.headers.get('X-Live-Epoch');
+        if (epoch && epoch !== this._epoch) return false;
+        const sid = resp && resp.headers.get('X-Live-Stream-Id');
+        return !sid || !this._sids.has(name) || sid === this._sids.get(name);
     }
 
     setPollInterval(ms) {
@@ -73,23 +99,25 @@ export class LiveClient {
     }
 
     /* ── poll loop ───────────────────────────────────── */
-    async _tick() {
-        if (!this.running) return;
+    async _tick(gen) {
+        if (!this.running || gen !== this._gen) return;
         try {
             const resp = await fetch('/api/live/state', { cache: 'no-store' });
             if (!resp.ok) throw new Error(`state: HTTP ${resp.status}`);
             const state = await resp.json();
+            // Stopped (or stopped and restarted) while waiting: that loop owns the timer now.
+            if (gen !== this._gen) return;
 
             // A new epoch means the server lost its stream state (restart, or
             // someone hit reset). Accumulated layers belong to the old session,
             // so keeping them would splice two unrelated maps together.
             if (this._epoch !== null && state.epoch !== this._epoch) {
                 this.viewer.clearLive();
-                this._seq.clear();
-                this._poseSeq = 0;
+                this._forgetAll();
             }
             this._epoch = state.epoch;
             this._streams = state.streams || [];
+            this._syncStreams();
             this._failures = 0;
             this._error = null;
 
@@ -108,7 +136,7 @@ export class LiveClient {
             for (const s of this._streams) {
                 if ((this._seq.get(s.name) || 0) >= s.seq) continue;
                 if (this._inFlight.has(s.name)) continue;   // still parsing the last one
-                this._fetchFrame(s);
+                this._fetchFrame(s, gen);
             }
         } catch (err) {
             this._failures++;
@@ -123,11 +151,39 @@ export class LiveClient {
             const delay = this._failures > 2
                 ? Math.min(this.pollMs * 4 * this._failures, MAX_BACKOFF_MS)
                 : this.pollMs;
-            this._timer = setTimeout(() => this._tick(), delay);
+            this._timer = setTimeout(() => this._tick(gen), delay);
         }
     }
 
-    async _fetchFrame(info) {
+    /* Reconcile what we hold with the server's stream list. */
+    _syncStreams() {
+        const seen = new Set();
+        for (const s of this._streams) {
+            seen.add(s.name);
+            const known = this._sids.get(s.name);
+            if (s.sid && known && known !== s.sid) {
+                // Same name, new stream (pruned while quiet, then back): its seq
+                // restarted at 1, so ours would hide every frame up to the old
+                // count. The kfrm map stays — a SLAM run resuming after a pause
+                // sends new keyframes, and clearing would throw the map away.
+                this._seq.delete(s.name);
+            }
+            if (s.sid) this._sids.set(s.name, s.sid);
+            this._layers.set(s.name, s.layer);
+        }
+        for (const [name, layer] of this._layers) {
+            if (seen.has(name)) continue;
+            // The server dropped a stream gone quiet. A scan's last frame would
+            // otherwise sit on screen forever; maps (map/kfrm) stay to be looked at.
+            if (layer === 'cur') this.viewer.clearCloud('curCloud');
+            else if (layer === 'raw') this.viewer.clearCloud('rawCloud');
+            this._layers.delete(name);
+            this._sids.delete(name);
+            this._seq.delete(name);
+        }
+    }
+
+    async _fetchFrame(info, gen) {
         const name = info.name;
         this._inFlight.add(name);
         try {
@@ -137,23 +193,25 @@ export class LiveClient {
             // falling permanently behind its publisher. The cap stops a long
             // backlog from starving the render loop in a single turn.
             for (let i = 0; i < MAX_DRAIN; i++) {
-                const queued = await this._fetchOne(name);
+                const queued = await this._fetchOne(name, gen);
                 if (queued <= 0) break;
             }
         } catch (err) {
             this._error = err.message;
         } finally {
-            this._inFlight.delete(name);
+            if (gen === this._gen) this._inFlight.delete(name);
         }
     }
 
     /** Fetch and render one frame. Returns how many remain queued after it. */
-    async _fetchOne(name) {
+    async _fetchOne(name, gen) {
         const since = this._seq.get(name) || 0;
         const url = `/api/live/frame?stream=${encodeURIComponent(name)}&since=${since}`;
         const resp = await fetch(url, { cache: 'no-store' });
         if (resp.status === 204) return 0;                   // nothing newer after all
         if (!resp.ok) throw new Error(`frame: HTTP ${resp.status}`);
+        // Requested before a reset, a restart or a stop: an old session's frame.
+        if (!this._current(gen, name, resp)) return 0;
 
         const seq = parseInt(resp.headers.get('X-Live-Seq') || '0', 10);
         const n = parseInt(resp.headers.get('X-Live-Points') || '0', 10);
@@ -168,7 +226,7 @@ export class LiveClient {
         this._windowBytes += buffer.byteLength;
 
         const data = await workerParseRealtime(buffer, n, compressed);
-        if (!this.running) return 0;                         // stopped mid-parse
+        if (!this._current(gen, name, resp)) return 0;       // stopped or reset mid-parse
         this.viewer.updateRealtimePoints(layer, data);
 
         this._windowFrames++;

@@ -40,12 +40,17 @@ export function initLiveControls(viewer, legend, deps, uiState) {
         // Also drop the server's held frames: clearing only the scene would
         // leave the newest frame to arrive again on the next poll, which looks
         // like the button did nothing.
+        // A refused reset (token required, WPC_PUBLIC) doesn't throw: check it,
+        // or the toast claims a server-side clear that never happened.
+        let refused = null;
         try {
-            await fetch('/api/live/reset', { method: 'POST' });
-        } catch {
-            /* server-side clear is best effort — the scene is already clear */
+            const resp = await fetch('/api/live/reset', { method: 'POST' });
+            if (!resp.ok) refused = `HTTP ${resp.status}`;
+        } catch (err) {
+            refused = err.message;
         }
-        showToast('Live layers cleared', 'info');
+        if (refused) showToast(`Live layers cleared here; the server kept its frames (${refused})`, 'warn');
+        else showToast('Live layers cleared', 'info');
     });
 
     /* ── Poll rate ── */
