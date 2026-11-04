@@ -213,22 +213,40 @@ def rename_map(name):
     if err:
         return err
     maps_dir = current_app.config['MAPS_DIR']
-    new_name = request.json.get('new_name', '').strip()
+    body = request.json
+    new_name = body.get('new_name', '') if isinstance(body, dict) else ''
+    new_name = new_name.strip() if isinstance(new_name, str) else ''
     if not new_name:
         return jsonify({'error': 'New name required'}), 400
     old_safe = _safe_path(maps_dir, name)
-    new_safe = _safe_path(maps_dir, new_name)
-    if not old_safe or not new_safe:
+    if not old_safe:
         return jsonify({'error': 'Invalid name'}), 400
     if not os.path.exists(old_safe):
         return jsonify({'error': 'Not found'}), 404
-    if os.path.exists(new_safe):
+    if os.path.isfile(old_safe):
+        # The map list only shows known extensions, so a loose file renamed
+        # without one would vanish from the UI. Keep it; refuse a different one.
+        old_ext = '.copc.laz' if name.lower().endswith('.copc.laz') else os.path.splitext(name)[1]
+        new_lower = new_name.lower()
+        if not new_lower.endswith(old_ext.lower()):
+            if os.path.splitext(new_name)[1].lower() in _MAP_EXTS:
+                return jsonify({'error': f'Extension must stay {old_ext}'}), 400
+            new_name += old_ext
+    new_safe = _safe_path(maps_dir, new_name)
+    if not new_safe:
+        return jsonify({'error': 'Invalid name'}), 400
+    if new_safe == old_safe:
+        # Also keeps the two locks below distinct: threading.Lock isn't reentrant.
         return jsonify({'error': 'Name already exists'}), 409
     names = sorted([name, new_name])
     lock_a = _get_map_lock(names[0])
     lock_b = _get_map_lock(names[1])
     with lock_a:
         with lock_b:
+            # Checked under both locks: os.rename silently replaces an existing
+            # file, so two renames onto one name must not both pass this.
+            if os.path.exists(new_safe):
+                return jsonify({'error': 'Name already exists'}), 409
             try:
                 os.rename(old_safe, new_safe)
                 _move_copc_sidecar(old_safe, new_safe)
@@ -272,13 +290,50 @@ def _upload_tmp_dir():
     import config
     d = os.path.join(config.DATA_DIR, 'uploads')
     os.makedirs(d, mode=0o700, exist_ok=True)
+    _prune_uploads(d, getattr(config, 'UPLOAD_TTL_HOURS', 24) * 3600)
     return d
+
+
+_UPLOAD_PRUNE_EVERY = 600                # seconds between sweeps of the upload dir
+_last_upload_prune = 0.0
+
+
+def _prune_uploads(upload_dir, ttl):
+    """Remove uploads nobody has read or written for *ttl* seconds.
+
+    Streamed COPC uploads and conversion outputs must outlive the request, so
+    they are aged out here instead. Reads keep a file alive through atime
+    (relatime still refreshes it daily); on noatime mounts mtime alone counts.
+    Only this server-owned temp dir is swept, never the maps tree."""
+    global _last_upload_prune
+    now = time.time()
+    if ttl <= 0 or now - _last_upload_prune < _UPLOAD_PRUNE_EVERY:
+        return
+    _last_upload_prune = now
+    with _convert_jobs_lock:
+        busy = set(_convert_src_jobs)
+    try:
+        entries = list(os.scandir(upload_dir))
+    except OSError:
+        return
+    for e in entries:
+        try:
+            if not e.is_file(follow_symlinks=False):
+                continue
+            st = e.stat(follow_symlinks=False)
+            if now - max(st.st_mtime, st.st_atime) < ttl:
+                continue
+            if os.path.realpath(e.path) in busy:
+                continue
+            os.remove(e.path)
+        except OSError:
+            pass
 
 
 @api_bp.route('/api/load_pointcloud', methods=['POST'])
 def load_pointcloud():
-    tmp_path = None
     is_upload = False
+    keep_upload = False      # set once the upload is streamed or handed to a job
     try:
         path = None
         saved_path = None
@@ -317,9 +372,9 @@ def load_pointcloud():
                 }), 507
             safe_name = orig_name.replace(os.sep, '_').replace('/', '_')
             saved_path = os.path.join(upload_dir, f'{uuid.uuid4().hex[:8]}_{safe_name}')
+            is_upload = True             # before save: a partial write is cleaned too
             f.save(saved_path)
             path = saved_path
-            is_upload = True
 
         if not path or not os.path.isfile(path):
             return jsonify({'error': 'File not found'}), 404
@@ -340,6 +395,7 @@ def load_pointcloud():
             if _point_count(path) >= threshold:
                 job_id = _start_convert_job(path, current_app.config.get('LOGGER'),
                                             cleanup_src=is_upload)
+                keep_upload = True       # the job removes it after converting
                 resp = jsonify({'mode': 'converting', 'job': job_id})
                 resp.status_code = 202
                 if saved_path:
@@ -349,6 +405,7 @@ def load_pointcloud():
         # COPC: stream via octree LOD (JSON meta) instead of a whole-cloud binary.
         # The frontend distinguishes by Content-Type and switches into copc mode.
         if file_is_copc:
+            keep_upload = True           # streamed from disk; aged out by _prune_uploads
             if preview_pts > 0:
                 binary = copc_io.copc_preview_binary(path, max_points=preview_pts)
                 resp = send_file(io.BytesIO(binary),
@@ -359,9 +416,7 @@ def load_pointcloud():
                 resp.headers['X-Saved-Path'] = urllib.parse.quote(saved_path)
             return resp
 
-        # Small upload fully read into memory below — drop the temp copy after.
-        if is_upload:
-            tmp_path = path
+        # Small upload fully read into memory below — the temp copy goes in finally.
         d = read_pointcloud(path)
         if d.get('type') == 'gaussian':
             binary = gaussians_to_binary(
@@ -381,8 +436,13 @@ def load_pointcloud():
     except Exception as e:
         return _error_response(e, 'load_pointcloud')
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        # Rejected, failed and fully-read uploads are dropped here, so only the
+        # ones still needed on disk outlive the request.
+        if is_upload and not keep_upload and saved_path and os.path.exists(saved_path):
+            try:
+                os.remove(saved_path)
+            except OSError:
+                pass
 
 
 # Backward-compatible alias
@@ -461,6 +521,12 @@ def _start_convert_job(src_path, logger=None, cleanup_src=False):
         except Exception as e:
             if logger:
                 logger.warning(f"COPC convert job {job_id} failed: {e}")
+            # A failed upload is of no further use; leaving it would pile up GBs.
+            if cleanup_src:
+                try:
+                    os.remove(src_path)
+                except OSError:
+                    pass
             with _convert_jobs_lock:
                 _convert_jobs[job_id].update(status='error', error=str(e),
                                              finished_at=time.monotonic())

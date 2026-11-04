@@ -186,8 +186,16 @@ def _borrow_reader(entry):
                 reader = CopcReader.open(open(entry['realpath'], 'rb'))
                 entry['pool_count'] += 1
                 entry['thread_readers'].append(reader)
-        if reader is None:           # at cap → wait for a busy handle to return
-            reader = pool.get()
+        # At cap → wait for a busy handle to return. Once the entry goes stale,
+        # borrowers close their handles instead of returning them, so nothing
+        # may ever arrive: poll, and fall back to a handle of our own (closed
+        # in the finally below, as every handle of a stale entry is).
+        while reader is None:
+            try:
+                reader = pool.get(timeout=0.5)
+            except queue.Empty:
+                if entry.get('stale'):
+                    reader = CopcReader.open(open(entry['realpath'], 'rb'))
     try:
         yield reader
     finally:
@@ -552,9 +560,18 @@ def ensure_copc(src_path, dst_path=None, progress=None):
         converted = False
         # 1) untwine: out-of-core (spills to a temp dir on disk), so RAM stays
         #    bounded — the only tool here that survives clouds larger than RAM.
+        untwine_error = None
         if shutil.which('untwine'):
-            _run_untwine(src_path, tmp_path, threads, progress)
-            converted = True
+            try:
+                _run_untwine(src_path, tmp_path, threads, progress)
+                converted = True
+            except _UntwineKilled:
+                raise            # OOM: the in-memory tools below would fare worse
+            except Exception as e:
+                # Odd input, full temp disk: the tools below may still manage.
+                untwine_error = e
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
         # 2) PDAL CLI with writers.copc (PDAL >= 2.4) — holds the whole cloud in RAM
         if not converted and _pdal_has_copc_writer():
             import subprocess
@@ -595,6 +612,8 @@ def ensure_copc(src_path, dst_path=None, progress=None):
                     sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tools'))
                     from las_to_copc import las_to_copc
                 except Exception as e:
+                    if untwine_error is not None:
+                        raise untwine_error from e
                     raise RuntimeError(
                         'COPC conversion unavailable: install untwine, PDAL>=2.4 '
                         '(writers.copc) or copclib'
@@ -655,6 +674,10 @@ def _read_untwine_messages(fp, on_progress, on_error):
             on_progress(percent, text)
 
 
+class _UntwineKilled(RuntimeError):
+    """untwine died from a signal (almost always the OOM killer)."""
+
+
 def _run_untwine(src_path, dst_path, threads, progress=None):
     """Run the untwine CLI, forwarding its percent to *progress*. Its temp dir
     sits beside the output (same disk) and needs about the source's size free."""
@@ -670,6 +693,7 @@ def _run_untwine(src_path, dst_path, threads, progress=None):
             phase = 'reading' if percent < _UNTWINE_DISTRIBUTE_PCT else 'building'
             progress(min(percent, 100), 100, phase)
 
+    proc = None
     try:
         try:
             proc = subprocess.Popen(cmd, pass_fds=(write_fd,), stdout=subprocess.DEVNULL,
@@ -692,10 +716,16 @@ def _run_untwine(src_path, dst_path, threads, progress=None):
         t.join()
         if proc.returncode != 0:
             detail = ' | '.join(l for l in errors + stderr_tail if l)
-            raise RuntimeError(f'untwine failed (exit {proc.returncode}): {detail}')
+            cls = _UntwineKilled if proc.returncode < 0 else RuntimeError
+            raise cls(f'untwine failed (exit {proc.returncode}): {detail}')
     finally:
         if read_fd is not None:
             os.close(read_fd)
+        # Leaving early (a progress callback raised, the thread was interrupted):
+        # stop untwine before its temp dir is removed under it, not orphan it.
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 

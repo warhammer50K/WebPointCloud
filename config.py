@@ -24,6 +24,10 @@ STATIC_MAX_AGE_PROD = 3600
 # Uploads with at least this many points are auto-converted to COPC and
 # streamed via the octree LOD path instead of being loaded whole.
 COPC_STREAM_MIN_POINTS = int(os.environ.get('WPC_COPC_MIN_POINTS', '2000000'))
+# Drag&drop uploads (and their COPC conversions) live under DATA_DIR/uploads
+# only while a viewer may still stream them; files untouched for this many
+# hours are removed. 0 keeps them forever.
+UPLOAD_TTL_HOURS = float(os.environ.get('WPC_UPLOAD_TTL_HOURS', '24'))
 # Soft cap on points kept resident on the GPU while streaming (Stage 4 LRU).
 # ~28 B/point on the GPU → 25M ≈ 700 MB. Raise via WPC_COPC_BUDGET if the GPU
 # has headroom and you want a denser zoomed-in view; lower it if VRAM is tight.
