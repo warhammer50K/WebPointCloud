@@ -334,6 +334,14 @@ export function initFileManagement(viewer, legend, deps, uiState) {
     const dropOverlay = $('drop-overlay');
     let dragCounter = 0;
 
+    // A file dropped anywhere outside the viewer (sidebar, header, loading
+    // overlay) would otherwise make the browser navigate to it and lose the session.
+    for (const type of ['dragover', 'drop']) {
+        document.addEventListener(type, e => {
+            if (!wrap.contains(e.target)) e.preventDefault();
+        });
+    }
+
     wrap.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dropOverlay.style.display = 'flex'; });
     wrap.addEventListener('dragleave', e => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dropOverlay.style.display = 'none'; } });
     wrap.addEventListener('dragover', e => e.preventDefault());
