@@ -78,11 +78,15 @@ class _Stream:
       bytes rather than by count so one enormous chunk cannot outweigh the cap.
     """
 
-    __slots__ = ('name', 'layer', 'queue', 'points', 'seq', 'updated',
-                 'frames', 'dropped', 'taken_seq', 'interval')
+    __slots__ = ('name', 'sid', 'layer', 'queue', 'points', 'seq', 'updated',
+                 'frames', 'dropped', 'taken_seq', 'interval', 'recent_fids')
 
     def __init__(self, name):
         self.name = name
+        # seq restarts at 1 when a pruned stream comes back under the same
+        # name; the id tells clients it is a new stream, not an old one rewound.
+        self.sid = uuid.uuid4().hex[:8]
+        self.recent_fids = deque(maxlen=64)   # publisher frame ids, for resend dedupe
         self.layer = 'cur'
         self.queue = deque()   # oldest first: [{seq, payload, points, compressed}]
         self.points = 0        # points in the newest frame
@@ -97,7 +101,12 @@ class _Stream:
     def accumulates(self):
         return self.layer == 'kfrm'
 
-    def store(self, payload, points, layer, compressed, now):
+    def store(self, payload, points, layer, compressed, now, fid=None):
+        """Queue a frame. False if *fid* was already stored (a resend)."""
+        if fid:
+            if fid in self.recent_fids:
+                return False
+            self.recent_fids.append(fid)
         if self.updated:
             gap = now - self.updated
             # EWMA: a single slow frame shouldn't make the reported rate jump.
@@ -107,9 +116,10 @@ class _Stream:
         self.frames += 1
         self.points = points
         self.updated = now
-        self.queue.append({'seq': self.seq, 'payload': payload,
+        self.queue.append({'seq': self.seq, 'payload': payload, 'layer': layer,
                            'points': points, 'compressed': compressed})
         self._trim()
+        return True
 
     def _drop(self):
         """Discard the oldest frame, counting it only if nobody ever got it.
@@ -151,6 +161,7 @@ class _Stream:
     def describe(self, now):
         return {
             'name': self.name,
+            'sid': self.sid,
             'layer': self.layer,
             'seq': self.seq,
             'points': self.points,
@@ -222,6 +233,9 @@ def live_publish():
         return jsonify({'error': f'layer must be one of {", ".join(LAYERS)}'}), 400
 
     compressed = request.args.get('compressed', '0') == '1'
+    # Refuse an oversized body before reading it, not after it is in memory.
+    if (request.content_length or 0) > config.LIVE_MAX_FRAME_BYTES:
+        return jsonify({'error': f'frame exceeds {config.LIVE_MAX_FRAME_BYTES} bytes'}), 413
     payload = request.get_data(cache=False)
     if not payload:
         return jsonify({'error': 'empty frame'}), 400
@@ -256,7 +270,8 @@ def live_publish():
             logger = current_app.config.get('LOGGER')
             if logger:
                 logger.info(f"[Live] stream '{name}' opened (layer={layer})")
-        stream.store(payload, points, layer, compressed, now)
+        fid = (request.args.get('fid') or '')[:32]
+        stream.store(payload, points, layer, compressed, now, fid)
         seq = stream.seq
 
     return jsonify({'ok': True, 'seq': seq, 'epoch': EPOCH})
@@ -336,7 +351,10 @@ def live_frame():
         frame = stream.take_after(since)
         if frame is None:
             return Response(status=204)
-        layer = stream.layer
+        # The frame's own layer: a stream restarted with another --layer may
+        # still have frames queued from before, and those must not be merged.
+        layer = frame.get('layer', stream.layer)
+        sid = stream.sid
         # How many more are waiting after this one, so a client draining an
         # accumulate backlog knows to come straight back instead of idling a
         # poll interval per frame.
@@ -350,6 +368,7 @@ def live_frame():
     resp.headers['X-Live-Compressed'] = '1' if frame['compressed'] else '0'
     resp.headers['X-Live-Queued'] = str(queued)
     resp.headers['X-Live-Epoch'] = EPOCH
+    resp.headers['X-Live-Stream-Id'] = sid
     resp.headers['Cache-Control'] = 'no-store'
     return resp
 

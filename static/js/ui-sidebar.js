@@ -23,8 +23,17 @@ export function initSidebarLayout(viewer, deps, uiState) {
             app.style.gridTemplateColumns = '0px 0px 1fr';
             if (resizeHandle) { resizeHandle.style.display = 'none'; }
         }
+        // Must match the max-width of the narrow-screen media query in style.css.
+        const narrow = window.matchMedia('(max-width: 768px)');
         if (toggleBtn) {
             toggleBtn.addEventListener('click', () => {
+                // Narrow screens show the sidebar as an overlay; the desktop
+                // collapsed state (and its saved preference) is left alone.
+                if (narrow.matches) {
+                    sidebar.classList.remove('collapsed');
+                    sidebar.classList.toggle('mobile-open');
+                    return;
+                }
                 const collapsed = sidebar.classList.toggle('collapsed');
                 if (collapsed) {
                     app.style.gridTemplateColumns = '0px 0px 1fr';
@@ -37,6 +46,9 @@ export function initSidebarLayout(viewer, deps, uiState) {
                 setTimeout(() => viewer._onResize(), 50);
             });
         }
+        // Tapping the viewer closes the overlay, as a drawer is expected to.
+        $('content').addEventListener('pointerdown', () => sidebar.classList.remove('mobile-open'));
+        narrow.addEventListener('change', e => { if (!e.matches) sidebar.classList.remove('mobile-open'); });
     }
 
     // ── Sidebar resize ──

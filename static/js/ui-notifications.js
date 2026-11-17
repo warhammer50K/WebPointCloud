@@ -46,13 +46,16 @@ export function customConfirm(message) {
             document.removeEventListener('keydown', onKey);
             resolve(result);
         };
+        // Confirms guard deletes: Enter activates the focused button, and focus
+        // starts on Cancel, so a stray Enter never confirms by itself.
         const onKey = e => {
-            if (e.key === 'Enter') { e.preventDefault(); cleanup(true); }
+            if (e.key === 'Enter') { e.preventDefault(); cleanup(document.activeElement === okBtn); }
             else if (e.key === 'Escape') { e.preventDefault(); cleanup(false); }
         };
         document.addEventListener('keydown', onKey);
         okBtn.onclick = () => cleanup(true);
         cancelBtn.onclick = () => cleanup(false);
+        cancelBtn.focus();
     });
 }
 

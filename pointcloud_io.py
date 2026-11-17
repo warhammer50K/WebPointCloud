@@ -23,19 +23,40 @@ def read_pointcloud(path):
     ext = os.path.splitext(path)[1].lower()
 
     if ext in ('.las', '.laz'):
-        return _read_las(path)
+        return _read_las(path)        # integer-quantized: always finite
     elif ext == '.ply':
-        return _read_ply(path)
+        d = _read_ply(path)
     elif ext in ('.xyz', '.txt', '.csv'):
-        return _read_xyz(path)
+        d = _read_xyz(path)
     elif ext == '.pcd':
-        return _read_pcd(path)
+        d = _read_pcd(path)
     elif ext == '.pts':
-        return _read_pts(path)
+        d = _read_pts(path)
     elif ext == '.splat':
-        return _read_splat(path)
+        d = _read_splat(path)
     else:
         raise ValueError(f'Unsupported format: {ext}')
+    return _drop_non_finite(d)
+
+
+def _drop_non_finite(d):
+    """Remove points whose x/y/z is NaN or Inf.
+
+    Organized clouds (depth cameras, is_dense=0 PCDs) mark invalid pixels with
+    NaN, and a single one turns the centering offset and bounds into NaN, so
+    nothing renders at all."""
+    n = d.get('n', 0)
+    if not n:
+        return d
+    finite = (np.isfinite(d['x']) & np.isfinite(d['y']) & np.isfinite(d['z']))
+    if finite.all():
+        return d
+    out = dict(d)
+    for k, v in d.items():
+        if isinstance(v, np.ndarray) and v.ndim >= 1 and len(v) == n:
+            out[k] = v[finite]
+    out['n'] = int(finite.sum())
+    return out
 
 
 # ══════════════════════════════════════════════════════

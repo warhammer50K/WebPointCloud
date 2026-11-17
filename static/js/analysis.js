@@ -4,7 +4,7 @@
 import { showToast, showLoading, hideLoading, updateLoading } from './ui-notifications.js';
 import { appendLog } from './ui-panels.js';
 import { $ } from './utils.js';
-import { dispatchLoad, convLabel } from './ui-files.js';
+import { dispatchLoad, convLabel, beginLoad, currentLoadGen, SupersededLoad } from './ui-files.js';
 
 let _viewer = null;
 let _currentPath = null;
@@ -28,17 +28,38 @@ export function initAnalysis(viewer, legend, deps, uiState) {
         if (!deps.loadLasFromPath) return;
         const name = savedPath.split('/').pop();
         showLoading(`Loading ${name}…`);
+        const gen = beginLoad();
         try {
             const data = await deps.loadLasFromPath(savedPath);
             const info = await dispatchLoad(viewer, data, (pct, phase) => {
                 updateLoading(convLabel(name, pct, phase));
-            });
+            }, gen);
             if (legend) legend.update(viewer.colorMode, info.bounds, info.offsetZ);
             setCurrentPath(savedPath);
+        } catch (e) {
+            if (!(e instanceof SupersededLoad)) throw e;
         } finally {
             hideLoading();
         }
     }
+
+    // A filter result replaces the map on screen only if it is still the map
+    // the filter ran on; otherwise it stays saved and the newer map stays put.
+    async function loadResultIfCurrent(savedPath, gen) {
+        if (gen !== currentLoadGen()) {
+            showToast(`Saved ${savedPath.split('/').pop()} (not opened: another map is loaded)`, 'info');
+            return;
+        }
+        await loadResult(savedPath);
+    }
+
+    // Results on screen describe the previous map once a new one is loaded.
+    window.addEventListener('wpc:main-cloud-changed', () => {
+        for (const id of ['stats-result', 'volume-result', 'c2c-result']) {
+            const el = $(id);
+            if (el) el.textContent = '';
+        }
+    });
 
     // ── Statistics ──
     const btnStats = $('btn-analysis-stats');
@@ -49,6 +70,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
                 return;
             }
             btnStats.disabled = true;
+            const gen = currentLoadGen();   // the map this analysis is about
             try {
                 const res = await fetch('/api/analysis/statistics', {
                     method: 'POST',
@@ -60,6 +82,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
                     showToast(data.error || 'Statistics failed', 'error');
                     return;
                 }
+                if (gen !== currentLoadGen()) return;   // another map opened meanwhile
                 _renderStatistics(data);
                 appendLog(`Statistics: ${data.num_points.toLocaleString()} pts, density ${data.density_per_m2}/m²`, 'info');
             } catch (e) {
@@ -81,6 +104,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
             const k = parseInt($('sor-k').value) || 20;
             const stdRatio = parseFloat($('sor-std').value) || 2.0;
             btnSor.disabled = true;
+            const gen = currentLoadGen();   // the map this analysis is about
             try {
                 const res = await fetch('/api/analysis/sor', {
                     method: 'POST',
@@ -94,7 +118,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
                 }
                 showToast(`SOR: removed ${data.removed_points.toLocaleString()} outliers`, 'success');
                 appendLog(`SOR filter: ${data.original_points} → ${data.remaining_points} pts (k=${k}, std=${stdRatio})`, 'info');
-                await loadResult(data.saved_path);
+                await loadResultIfCurrent(data.saved_path, gen);
             } catch (e) {
                 showToast(`SOR error: ${e.message}`, 'error');
             } finally {
@@ -115,6 +139,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
             const center = parseFloat($('section-center').value) || 0;
             const thickness = parseFloat($('section-thickness').value) || 1.0;
             btnSection.disabled = true;
+            const gen = currentLoadGen();   // the map this analysis is about
             try {
                 const res = await fetch('/api/analysis/cross-section', {
                     method: 'POST',
@@ -128,7 +153,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
                 }
                 showToast(`Section: ${data.selected_points.toLocaleString()} pts extracted`, 'success');
                 appendLog(`Cross-section ${axis}=${center}±${thickness / 2}: ${data.selected_points} pts`, 'info');
-                await loadResult(data.saved_path);
+                await loadResultIfCurrent(data.saved_path, gen);
             } catch (e) {
                 showToast(`Section error: ${e.message}`, 'error');
             } finally {
@@ -147,6 +172,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
             }
             const gridSize = parseFloat($('volume-grid').value) || 0.5;
             btnVolume.disabled = true;
+            const gen = currentLoadGen();   // the map this analysis is about
             try {
                 const res = await fetch('/api/analysis/volume', {
                     method: 'POST',
@@ -158,6 +184,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
                     showToast(data.error || 'Volume failed', 'error');
                     return;
                 }
+                if (gen !== currentLoadGen()) return;   // another map opened meanwhile
                 const volEl = $('volume-result');
                 if (volEl) {
                     volEl.textContent = `${data.volume_m3.toLocaleString()} m³ (${data.num_cells} cells, grid ${data.grid_size}m)`;
@@ -186,6 +213,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
                 return;
             }
             btnC2C.disabled = true;
+            const gen = currentLoadGen();   // the map this analysis is about
             try {
                 const res = await fetch('/api/analysis/c2c-distance', {
                     method: 'POST',
@@ -204,6 +232,7 @@ export function initAnalysis(viewer, legend, deps, uiState) {
                     mean: parseFloat(res.headers.get('X-C2C-Mean')),
                     std: parseFloat(res.headers.get('X-C2C-Std')),
                 };
+                if (gen !== currentLoadGen()) return;   // another map opened meanwhile
                 if ([stats.min, stats.max, stats.mean, stats.std].some(Number.isNaN)) {
                     showToast('C2C failed: missing result headers in response', 'error');
                     return;

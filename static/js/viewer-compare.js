@@ -20,6 +20,7 @@ export function loadCompareCloud(viewer, data) {
 
     // Apply offset difference so both clouds align in the same scene space
     viewer._compareOffset = data.offset || null;
+    viewer._compareUserOffset = [0, 0, 0];
     if (data.offset && viewer.coordOffset) {
         const dx = data.offset[0] - viewer.coordOffset[0];
         const dy = data.offset[1] - viewer.coordOffset[1];
@@ -53,6 +54,7 @@ export function setCompareOpacity(viewer, v) {
 
 export function setCompareOffset(viewer, x, y, z) {
     if (viewer.compareCloud) {
+        viewer._compareUserOffset = [x, y, z];   // re-applied when the main cloud changes
         let dx = 0, dy = 0, dz = 0;
         if (viewer._compareOffset && viewer.coordOffset) {
             dx = viewer._compareOffset[0] - viewer.coordOffset[0];

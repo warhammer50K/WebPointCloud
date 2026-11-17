@@ -167,3 +167,34 @@ def test_symlink_out_of_maps_dir_cannot_be_deleted(client, maps_dir, tmp_path):
     (maps_dir / 'link.las').symlink_to(outside)
     assert client.delete('/api/maps/link.las').status_code == 400
     assert outside.exists()
+
+
+# ═══════════════════════════════════════════════════
+#  Rename safety
+# ═══════════════════════════════════════════════════
+
+def test_rename_keeps_loose_file_extension(client, maps_dir):
+    """Typing a bare name used to drop '.las', and the file left the list."""
+    touch(maps_dir / 'a.las')
+    assert client.post('/api/maps/a.las/rename', json={'new_name': 'c'}).status_code == 200
+    assert sorted(os.listdir(maps_dir)) == ['c.las']
+
+
+def test_rename_refuses_a_different_extension(client, maps_dir):
+    touch(maps_dir / 'a.las')
+    assert client.post('/api/maps/a.las/rename', json={'new_name': 'a.laz'}).status_code == 400
+    assert os.listdir(maps_dir) == ['a.las']
+
+
+def test_rename_never_overwrites(client, maps_dir):
+    touch(maps_dir / 'a.las', 10)
+    touch(maps_dir / 'b.las', 20)
+    assert client.post('/api/maps/a.las/rename', json={'new_name': 'b.las'}).status_code == 409
+    assert client.post('/api/maps/a.las/rename', json={'new_name': 'a.las'}).status_code == 409
+    assert (maps_dir / 'b.las').stat().st_size == 20
+
+
+@pytest.mark.parametrize('body', [{'new_name': 5}, [1]])
+def test_rename_rejects_malformed_body(client, maps_dir, body):
+    touch(maps_dir / 'a.las')
+    assert client.post('/api/maps/a.las/rename', json=body).status_code == 400

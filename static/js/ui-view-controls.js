@@ -13,12 +13,15 @@ import { appendLog } from './ui-panels.js';
  * @param {Object} uiState
  */
 export function initViewControls(viewer, legend, deps, uiState) {
+    // A number box mid-edit (empty, '-', '1e') parses to NaN: ignore it rather
+    // than push NaN into the viewer or snap the paired slider.
+    const finite = el => Number.isFinite(parseFloat(el.value));
 
     // ── Point size ──
     const slider = $('pt-size-slider');
     const spin = $('pt-size-spin');
     slider.addEventListener('input', () => { spin.value = slider.value; viewer.setPointSize(parseFloat(slider.value)); });
-    spin.addEventListener('change', () => { slider.value = spin.value; viewer.setPointSize(parseFloat(spin.value)); });
+    spin.addEventListener('change', () => { if (!finite(spin)) { spin.value = slider.value; return; } slider.value = spin.value; viewer.setPointSize(parseFloat(spin.value)); });
 
     // ── Downsample ratio ──
     const dsSlider = $('ds-ratio-slider');
@@ -41,6 +44,7 @@ export function initViewControls(viewer, legend, deps, uiState) {
 
     // ── Gamma ──
     const syncGamma = (src, dst) => {
+        if (!finite($(src))) return;
         $(dst).value = $(src).value;
         viewer.setGamma(parseFloat($(src).value));
     };
@@ -49,6 +53,7 @@ export function initViewControls(viewer, legend, deps, uiState) {
 
     // ── Saturation (RGB only) ──
     const syncSaturation = (src, dst) => {
+        if (!finite($(src))) return;
         $(dst).value = $(src).value;
         viewer.setSaturation(parseFloat($(src).value));
     };
@@ -172,6 +177,7 @@ export function initViewControls(viewer, legend, deps, uiState) {
         viewer._dirty = true;
     });
     const syncEdlStr = (src, dst) => {
+        if (!finite($(src))) return;
         $(dst).value = $(src).value;
         viewer.edlStrength = parseFloat($(src).value);
         viewer._dirty = true;
@@ -179,11 +185,48 @@ export function initViewControls(viewer, legend, deps, uiState) {
     $('edl-strength').addEventListener('input', () => syncEdlStr('edl-strength', 'edl-strength-spin'));
     $('edl-strength-spin').addEventListener('input', () => syncEdlStr('edl-strength-spin', 'edl-strength'));
 
+    // Glow replaces the other post filters: show them as inactive while it is on,
+    // and its gain as inactive while it is off.
+    const GLOW_REPLACES = ['ckb-gap-fill', 'ckb-edl', 'edl-strength', 'edl-strength-spin',
+                           'ckb-ssao', 'ssao-radius', 'ssao-radius-spin'];
+    const syncGlowUi = () => {
+        const on = viewer.glowEnabled;
+        for (const id of GLOW_REPLACES) {
+            const el = $(id);
+            if (!el) continue;
+            el.disabled = on;
+            el.closest('.ctrl-row').classList.toggle('inactive', on);
+        }
+        for (const id of ['glow-gain', 'glow-gain-spin']) {
+            $(id).disabled = !on;
+            $(id).closest('.ctrl-row').classList.toggle('inactive', !on);
+        }
+    };
+    if (!viewer.glowSupported()) {
+        $('ckb-glow').disabled = true;
+        $('ckb-glow').closest('.ctrl-row').classList.add('inactive');
+        $('ckb-glow').closest('.ctrl-row').title = '이 GPU/브라우저는 float 렌더 타깃(EXT_color_buffer_float)을 지원하지 않습니다';
+    }
+    $('ckb-glow').addEventListener('change', () => {
+        viewer.setGlow($('ckb-glow').checked);
+        syncGlowUi();
+    });
+    syncGlowUi();
+    const syncGlowGain = (src, dst) => {
+        if (!finite($(src))) return;
+        $(dst).value = $(src).value;
+        viewer.glowGain = parseFloat($(src).value);
+        viewer._dirty = true;
+    };
+    $('glow-gain').addEventListener('input', () => syncGlowGain('glow-gain', 'glow-gain-spin'));
+    $('glow-gain-spin').addEventListener('input', () => syncGlowGain('glow-gain-spin', 'glow-gain'));
+
     $('ckb-ssao').addEventListener('change', () => {
         viewer.ssaoEnabled = $('ckb-ssao').checked;
         viewer._dirty = true;
     });
     const syncSsaoRad = (src, dst) => {
+        if (!finite($(src))) return;
         $(dst).value = $(src).value;
         viewer.ssaoRadius = parseFloat($(src).value);
         viewer._dirty = true;
@@ -203,6 +246,13 @@ export function initViewControls(viewer, legend, deps, uiState) {
             const el = $(id);
             if (el) { el.addEventListener('change', updateClipIndicator); }
         });
+        // Loading a map turns clipping off (viewer.resetClipping); the boxes
+        // must follow, or re-enabling takes an uncheck + check.
+        window.addEventListener('wpc:main-cloud-changed', () => {
+            clipCheckboxes.forEach(id => { if ($(id)) $(id).checked = false; });
+            updateClipIndicator();
+            if (dsSlider) { dsSlider.value = '1'; dsLabel.textContent = '100%'; }
+        });
     }
 
     // ── Transform panel ──
@@ -217,16 +267,21 @@ export function initViewControls(viewer, legend, deps, uiState) {
             spin.addEventListener('input', () => { slider.value = spin.value; applyTf(); });
         });
 
+        let warnedCopcTf = false;
         function applyTf() {
+            if (!viewer.pointCloud && viewer.copcManager && !warnedCopcTf) {
+                warnedCopcTf = true;
+                showToast('Streamed (COPC) maps show no preview: the transform applies on Apply & Save', 'info');
+            }
             viewer.setCloudOffset(
-                parseFloat($('tf-x').value) || 0,
-                parseFloat($('tf-y').value) || 0,
-                parseFloat($('tf-z').value) || 0
+                parseFloat($('tf-x-val').value) || 0,
+                parseFloat($('tf-y-val').value) || 0,
+                parseFloat($('tf-z-val').value) || 0
             );
             viewer.setCloudRotation(
-                parseFloat($('tf-rx').value) || 0,
-                parseFloat($('tf-ry').value) || 0,
-                parseFloat($('tf-rz').value) || 0
+                parseFloat($('tf-rx-val').value) || 0,
+                parseFloat($('tf-ry-val').value) || 0,
+                parseFloat($('tf-rz-val').value) || 0
             );
         }
 
@@ -235,16 +290,22 @@ export function initViewControls(viewer, legend, deps, uiState) {
             applyTf();
         });
 
+        // A new map starts untransformed; leftover inputs would be saved onto it.
+        window.addEventListener('wpc:main-cloud-changed', () => {
+            axes.forEach(id => { $(id).value = 0; $(`${id}-val`).value = 0; });
+            warnedCopcTf = false;
+        });
+
         $('btn-tf-apply').addEventListener('click', async () => {
             const { getCurrentPath } = await import('./analysis.js');
             const path = getCurrentPath();
             if (!path) { showToast('Load a point cloud first', 'warn'); return; }
-            const ox = parseFloat($('tf-x').value) || 0;
-            const oy = parseFloat($('tf-y').value) || 0;
-            const oz = parseFloat($('tf-z').value) || 0;
-            const rx = parseFloat($('tf-rx').value) || 0;
-            const ry = parseFloat($('tf-ry').value) || 0;
-            const rz = parseFloat($('tf-rz').value) || 0;
+            const ox = parseFloat($('tf-x-val').value) || 0;
+            const oy = parseFloat($('tf-y-val').value) || 0;
+            const oz = parseFloat($('tf-z-val').value) || 0;
+            const rx = parseFloat($('tf-rx-val').value) || 0;
+            const ry = parseFloat($('tf-ry-val').value) || 0;
+            const rz = parseFloat($('tf-rz-val').value) || 0;
             if (ox === 0 && oy === 0 && oz === 0 && rx === 0 && ry === 0 && rz === 0) {
                 showToast('No transform to apply', 'warn'); return;
             }

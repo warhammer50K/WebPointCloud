@@ -210,3 +210,38 @@ def test_big_endian_packed_rgb_keeps_channel_order():
     rec = struct.pack('>fffI', 0.0, 0.0, 0.0, packed)
     _, _, rgb = cloud_to_arrays(Cloud(fields, 16, rec, 1, is_bigendian=True))
     assert np.allclose(rgb[0], [1.0, 128 / 255, 64 / 255], atol=1e-6)
+
+
+# ═══════════════════════════════════════════════════
+#  Padded rows, truncation, keyframe queue
+# ═══════════════════════════════════════════════════
+
+def test_padded_rows_are_read_row_by_row():
+    """row_step > width*point_step: each row ends in padding bytes."""
+    fields = [Field('x', 0, 7), Field('y', 4, 7), Field('z', 8, 7)]
+    pad = b'\xee' * 4
+    rows = [struct.pack('<3f', 1, 2, 3) + struct.pack('<3f', 4, 5, 6) + pad,
+            struct.pack('<3f', 7, 8, 9) + struct.pack('<3f', 10, 11, 12) + pad]
+    cloud = Cloud(fields, 12, b''.join(rows), 2, height=2)
+    cloud.row_step = 28
+    xyz, _, _ = cloud_to_arrays(cloud)
+    np.testing.assert_array_equal(xyz[:, 0], [1, 4, 7, 10])
+
+
+def test_truncated_message_raises_valueerror():
+    fields = [Field('x', 0, 7), Field('y', 4, 7), Field('z', 8, 7)]
+    with pytest.raises(ValueError):
+        cloud_to_arrays(Cloud(fields, 12, struct.pack('<3f', 1, 2, 3), 2))
+
+
+def test_keyframes_queue_instead_of_overwriting(monkeypatch):
+    import ros2_bridge
+    monkeypatch.setattr(ros2_bridge.Publisher, '_run', lambda self: None)
+    pub = ros2_bridge.Publisher('http://localhost:1', '')
+    for i in range(3):
+        pub.offer(b'k%d' % i, 1, 's', 'kfrm', False)
+    pub.offer(b'c0', 1, 's', 'cur', False)
+    pub.offer(b'c1', 1, 's', 'cur', False)
+    assert [f[0] for f in pub._queue] == [b'k0', b'k1', b'k2']
+    assert pub._slot[0] == b'c1' and pub.dropped == 1
+    assert len({f[5] for f in pub._queue}) == 3      # distinct frame ids

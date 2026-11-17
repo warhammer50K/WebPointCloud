@@ -260,3 +260,43 @@ def test_replacing_a_delivered_frame_is_not_counted_as_dropped(client):
     client.get('/api/live/frame?stream=/scan&since=0')
     publish(client, frame(10, seed=9), stream='/scan')
     assert client.get('/api/live/state').get_json()['streams'][0]['dropped'] == 0
+
+
+# ═══════════════════════════════════════════════════
+#  Stream identity, resends, per-frame layer
+# ═══════════════════════════════════════════════════
+
+def test_resend_with_same_frame_id_is_stored_once(client):
+    """A bridge retrying after a timeout must not merge a keyframe twice."""
+    url = '/api/live/publish?stream=m&layer=kfrm&points=10&compressed=0&fid=abc'
+    payload = frame(10)
+    for _ in range(2):
+        assert client.post(url, data=payload, content_type='application/octet-stream').status_code == 200
+    (s,) = client.get('/api/live/state').get_json()['streams']
+    assert s['seq'] == 1 and s['queued'] == 1
+
+
+def test_recreated_stream_gets_a_new_id(client, monkeypatch):
+    """seq restarts at 1 after a prune; the id is how clients notice."""
+    publish(client, frame(10), stream='m')
+    sid = client.get('/api/live/state').get_json()['streams'][0]['sid']
+    assert client.get('/api/live/frame?stream=m&since=0').headers['X-Live-Stream-Id'] == sid
+    live._streams.clear()                      # what a prune does
+    publish(client, frame(10), stream='m')
+    assert client.get('/api/live/state').get_json()['streams'][0]['sid'] != sid
+
+
+def test_queued_frame_keeps_its_own_layer(client):
+    """Restarting a stream as kfrm must not hand out its queued cur frame
+    as a map piece, which merged a scan into the map."""
+    publish(client, frame(10), stream='m', layer='cur')
+    publish(client, frame(10), stream='m', layer='kfrm')
+    first = client.get('/api/live/frame?stream=m&since=0')
+    assert first.headers['X-Live-Layer'] == 'cur'
+    second = client.get(f"/api/live/frame?stream=m&since={first.headers['X-Live-Seq']}")
+    assert second.headers['X-Live-Layer'] == 'kfrm'
+
+
+def test_oversized_frame_is_refused_before_reading(client, monkeypatch):
+    monkeypatch.setattr(live.config, 'LIVE_MAX_FRAME_BYTES', 100)
+    assert publish(client, frame(10)).status_code == 413

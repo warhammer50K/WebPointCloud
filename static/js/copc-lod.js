@@ -314,7 +314,9 @@ export class CopcLodManager {
         // Cull what the loaded surfaces hide, with a depth pass rendered for THIS
         // camera pose: always at rest, throttled while moving (a stale depth from
         // another pose would hide the wrong nodes).
-        if (!moved || now - (this._occAt || 0) >= OCC_MOVING_INTERVAL_MS) {
+        if (this.viewer.glowEnabled) {
+            this._occ = null;                          // glow draws occluded nodes anyway
+        } else if (!moved || now - (this._occAt || 0) >= OCC_MOVING_INTERVAL_MS) {
             this._occ = this._renderOcclusion();
             this._occAt = now;
         } else {
