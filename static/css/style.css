@@ -265,6 +265,8 @@ html, body { height: 100%; overflow: hidden; font-family: 'Segoe UI', system-ui,
 .ctrl-row label.narrow { min-width: 1.7em; }
 .ctrl-row > * { min-width: 0; }
 .ctrl-row.compact { margin-bottom: 0.3em; }
+/* Settings that don't apply right now (e.g. EDL while Glow replaces it) */
+.ctrl-row.inactive { opacity: 0.45; }
 
 /* ── Point size row ──────────────────────────── */
 .pt-size-row { display: flex; align-items: center; gap: 8px; }

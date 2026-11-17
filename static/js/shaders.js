@@ -59,6 +59,13 @@ uniform float uSaturation;
 uniform vec3  uClassPalette[20];
 // RGB (0,0,0) means "no camera colour" (HandheldSLAM maps): shade by intensity instead.
 uniform bool  uUncoloredGray;
+uniform bool  uGlow;
+uniform float uGlowRange;
+uniform float uGlowMinSize;
+uniform float uGlowNear;        // metres over which near points fade in
+uniform float uGlowPixelScale;  // accumulation pixels per drawing-buffer pixel
+uniform float uGlowZLow;
+uniform float uGlowZSpan;
 
 attribute float intensity;
 attribute vec3  rgb;
@@ -68,8 +75,16 @@ attribute float classification;
 attribute float aSize;
 
 varying vec3 vColor;
+varying float vGlowWeight;
 
 #include <clipping_planes_pars_vertex>
+
+vec3 glowRamp(float t) {
+    vec3 a = vec3(0.102, 0.122, 0.431), b = vec3(0.122, 0.435, 0.839), c = vec3(0.153, 0.827, 0.878);
+    vec3 d = vec3(0.957, 0.969, 1.0), e = vec3(1.0, 0.702, 0.361);
+    t = clamp(t, 0.0, 1.0) * 4.0;
+    return t < 1.0 ? mix(a, b, t) : t < 2.0 ? mix(b, c, t - 1.0) : t < 3.0 ? mix(c, d, t - 2.0) : mix(d, e, t - 3.0);
+}
 
 vec3 turbo(float t) {
     t = clamp(t, 0.0, 1.0);
@@ -88,8 +103,23 @@ void main() {
     gl_PointSize = max(uPointSize * 400.0, aSize * uFocal) / -mvPosition.z;
     gl_PointSize = clamp(gl_PointSize, 1.0, 64.0);
 
+    vGlowWeight = 0.0;
+    if (uGlow) {
+        // Each point deposits the same energy whatever its size, so brightness
+        // follows point density and not the footprint of its LOD level.
+        float depth = -mvPosition.z;
+        // uFocal is in drawing-buffer pixels; the accumulation target is at CSS resolution.
+        gl_PointSize = clamp(gl_PointSize * uGlowPixelScale, uGlowMinSize, 2.0 * uGlowMinSize);
+        vGlowWeight = exp(-depth / uGlowRange * 2.2)
+                    * min(1.0, depth * depth / (uGlowNear * uGlowNear) + 0.05)
+                    / (gl_PointSize * gl_PointSize);
+    }
+
     float range = max(uMaxVal - uMinVal, 0.001);
-    if (uColorMode == 0) {
+    if (uGlow && uColorMode == 1) {
+        // zMin/zMax are outlier-driven: the ramp spans the robust height window instead.
+        vColor = glowRamp(pow(clamp((position.z - uGlowZLow) / uGlowZSpan, 0.0, 1.0), uGamma));
+    } else if (uColorMode == 0) {
         float t = clamp((intensity - uMinVal) / range, 0.0, 1.0);
         vColor = turbo(pow(t, uGamma));
     } else if (uColorMode == 1) {
@@ -117,10 +147,21 @@ export const FRAG = `
 uniform float uOpacity;
 uniform vec3  uTintColor;
 uniform float uTintStrength;
+uniform bool  uGlow;
 varying vec3 vColor;
+varying float vGlowWeight;
 #include <clipping_planes_pars_fragment>
 void main() {
     #include <clipping_planes_fragment>
+    if (uGlow) {
+        // Gaussian splat; 2.945 = 1 / its integral over the disc, so a point still
+        // deposits vGlowWeight per pixel of its square footprint.
+        vec2 g = gl_PointCoord - 0.5;
+        float g2 = dot(g, g);
+        if (g2 > 0.25) discard;
+        gl_FragColor = vec4(vColor * vGlowWeight * 2.945 * exp(-8.0 * g2), 1.0);
+        return;
+    }
     vec2 c = gl_PointCoord - 0.5;
     float r2 = dot(c, c);
     if (r2 > 0.25) discard;
@@ -330,6 +371,45 @@ varying vec2 vUv;
 void main() {
     vUv = uv;
     gl_Position = vec4(position, 1.0);
+}
+`;
+
+export const GLOW_TONE_FRAG = `
+#define GLOW_CONTRAST 64.0
+uniform sampler2D uColor;
+uniform float uPeak;
+uniform float uGain;
+varying vec2 vUv;
+void main() {
+    // Log compression: accumulated light spans orders of magnitude between pixels.
+    vec3 hdr = texture2D(uColor, vUv).rgb;
+    // Relative to the peak so the look doesn't depend on point count or resolution.
+    vec3 tone = log(1.0 + GLOW_CONTRAST * hdr / max(uPeak, 1e-6)) / log(1.0 + GLOW_CONTRAST);
+    gl_FragColor = vec4(min(tone * uGain, vec3(1.3)), 1.0);
+}
+`;
+
+// uStep (0,0) reads the texture as is: the exposure pass needs raw pixels.
+export const GLOW_BLUR_FRAG = `
+uniform sampler2D uColor;
+uniform vec2 uStep;
+varying vec2 vUv;
+void main() {
+    vec3 sum = texture2D(uColor, vUv).rgb * 0.2270;
+    sum += (texture2D(uColor, vUv + uStep * 1.3846).rgb + texture2D(uColor, vUv - uStep * 1.3846).rgb) * 0.3162;
+    sum += (texture2D(uColor, vUv + uStep * 3.2308).rgb + texture2D(uColor, vUv - uStep * 3.2308).rgb) * 0.0703;
+    gl_FragColor = vec4(sum, 1.0);
+}
+`;
+
+export const GLOW_COMPOSITE_FRAG = `
+uniform sampler2D uColor;
+uniform sampler2D uBloom;
+varying vec2 vUv;
+void main() {
+    vec3 col = texture2D(uColor, vUv).rgb + 0.55 * texture2D(uBloom, vUv).rgb;
+    vec2 p = vUv * 2.0 - 1.0;
+    gl_FragColor = vec4(clamp(col * (1.0 - 0.35 * dot(p, p)), 0.0, 1.0), 1.0);
 }
 `;
 

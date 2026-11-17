@@ -25,6 +25,7 @@ import {
 } from './viewer-tools.js';
 
 import { initPostProcessing, resizePostTargets } from './viewer-post.js';
+import { renderGlow, disposeGlowTargets, applyGlowToMaterial, setGlowEnabled, glowSupported } from './viewer-glow.js';
 
 import {
     loadCompareCloud as _loadCompareCloud,
@@ -351,6 +352,8 @@ export class Viewer {
         this.gapFillEnabled = true;
         this.gapFillRadius = 2;
         this.edlEnabled = false;
+        this.glowEnabled = false;
+        this.glowGain = 1.0;
         this.edlStrength = 1.0;
         this.ssaoEnabled = false;
         this.ssaoRadius = 1.0;
@@ -538,6 +541,7 @@ export class Viewer {
         this.camera.updateProjectionMatrix();
         this.renderer.setSize(w, h);
         resizePostTargets(this, w, h);
+        disposeGlowTargets(this);
         this._dirty = true;
     }
 
@@ -582,7 +586,10 @@ export class Viewer {
             const fill = this.gapFillEnabled && !!this._gapFillMaterial;
             const lighting = this.edlEnabled || this.ssaoEnabled;
             const usePost = fill || lighting;
-            if (!usePost) {
+            if (this.glowEnabled) {
+                // Exposure eases toward its target, so keep drawing until it arrives.
+                this._glowSettling = renderGlow(this);
+            } else if (!usePost) {
                 this.renderer.setRenderTarget(null);
                 this.renderer.render(this.scene, this.camera);
             } else {
@@ -645,7 +652,7 @@ export class Viewer {
                 }
             }
             _updateMeasureLabel(this);
-            this._dirty = false;
+            this._dirty = !!(this.glowEnabled && this._glowSettling);
         }
     }
 
@@ -663,8 +670,11 @@ export class Viewer {
              : this.colorMode === 'classification' ? 3 : 0;
     }
 
+    setGlow(on) { setGlowEnabled(this, on); }
+    glowSupported() { return glowSupported(this.renderer); }
+
     _makeMaterial() {
-        return new THREE.ShaderMaterial({
+        const material = new THREE.ShaderMaterial({
             uniforms: {
                 uPointSize: { value: this.pointSize },
                 uFocal:     { value: this._focalPx() },
@@ -678,12 +688,21 @@ export class Viewer {
                 uTintStrength: { value: 0.0 },
                 uClassPalette: { value: CLASS_PALETTE.map(c => new THREE.Vector3(...c)) },
                 uUncoloredGray: { value: false },
+                uGlow:      { value: false },
+                uGlowRange: { value: 150.0 },
+                uGlowMinSize: { value: 1.5 },
+                uGlowNear:  { value: 8.0 },
+                uGlowPixelScale: { value: 1.0 },
+                uGlowZLow:  { value: 0.0 },
+                uGlowZSpan: { value: 1.0 },
             },
             vertexShader: VERT,
             fragmentShader: FRAG,
             clipping: true,
             clippingPlanes: this._allClipPlanes,
         });
+        if (this.glowEnabled) applyGlowToMaterial(this, material);
+        return material;
     }
 
     _syncColorUniforms(cloud) {

@@ -185,6 +185,42 @@ export function initViewControls(viewer, legend, deps, uiState) {
     $('edl-strength').addEventListener('input', () => syncEdlStr('edl-strength', 'edl-strength-spin'));
     $('edl-strength-spin').addEventListener('input', () => syncEdlStr('edl-strength-spin', 'edl-strength'));
 
+    // Glow replaces the other post filters: show them as inactive while it is on,
+    // and its gain as inactive while it is off.
+    const GLOW_REPLACES = ['ckb-gap-fill', 'ckb-edl', 'edl-strength', 'edl-strength-spin',
+                           'ckb-ssao', 'ssao-radius', 'ssao-radius-spin'];
+    const syncGlowUi = () => {
+        const on = viewer.glowEnabled;
+        for (const id of GLOW_REPLACES) {
+            const el = $(id);
+            if (!el) continue;
+            el.disabled = on;
+            el.closest('.ctrl-row').classList.toggle('inactive', on);
+        }
+        for (const id of ['glow-gain', 'glow-gain-spin']) {
+            $(id).disabled = !on;
+            $(id).closest('.ctrl-row').classList.toggle('inactive', !on);
+        }
+    };
+    if (!viewer.glowSupported()) {
+        $('ckb-glow').disabled = true;
+        $('ckb-glow').closest('.ctrl-row').classList.add('inactive');
+        $('ckb-glow').closest('.ctrl-row').title = '이 GPU/브라우저는 float 렌더 타깃(EXT_color_buffer_float)을 지원하지 않습니다';
+    }
+    $('ckb-glow').addEventListener('change', () => {
+        viewer.setGlow($('ckb-glow').checked);
+        syncGlowUi();
+    });
+    syncGlowUi();
+    const syncGlowGain = (src, dst) => {
+        if (!finite($(src))) return;
+        $(dst).value = $(src).value;
+        viewer.glowGain = parseFloat($(src).value);
+        viewer._dirty = true;
+    };
+    $('glow-gain').addEventListener('input', () => syncGlowGain('glow-gain', 'glow-gain-spin'));
+    $('glow-gain-spin').addEventListener('input', () => syncGlowGain('glow-gain-spin', 'glow-gain'));
+
     $('ckb-ssao').addEventListener('change', () => {
         viewer.ssaoEnabled = $('ckb-ssao').checked;
         viewer._dirty = true;
